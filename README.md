@@ -6,6 +6,7 @@ Persistent IRC bouncer with a web client. Stay connected to multiple networks, r
 ![D: LDC 1.41](https://img.shields.io/badge/D-LDC%201.41-8B0000)
 ![Svelte 5](https://img.shields.io/badge/Frontend-Svelte%205-FF3E00)
 ![Docker](https://img.shields.io/badge/Docker-BuildKit-2496ED)
+[![Hits](https://hits.dwyl.com/kevinpostal/irc-fiber.svg)](https://hits.dwyl.com/kevinpostal/irc-fiber)
 
 <p align="center">
   <a href="https://github.com/user-attachments/assets/6720acd2-4c81-476f-ade8-c144bf9ada23">
