@@ -1,0 +1,200 @@
+{
+  "annotations": {"list": []},
+  "description": "IRC protocol events: JOIN, PART, KICK, QUIT, NICK, TOPIC, MODE, PRIVMSG, NOTICE, INVITE. Timeseries + per-channel/per-network breakdowns.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Overview",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "id": 100,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "title": "Event rates (per sec)",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 1},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "mean"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "spanNulls": false, "showPoints": "never"},
+          "color": {"mode": "palette-classic"}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (event) (rate({job=\"ircfiber_containers\", event=~\"join|part|kick|quit|nick_change|topic_change|mode_change|privmsg|notice|invite\"}[$__interval]))",
+          "legendFormat": "{{event}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Top channels by PRIVMSG volume (1h)",
+      "type": "table",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 10},
+      "options": {
+        "showHeader": true,
+        "sortBy": [{"displayName": "Volume", "desc": true}]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"align": "auto", "displayMode": "auto"}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "topk(20, sum by (channel, network) (count_over_time({job=\"ircfiber_containers\", event=\"privmsg\"}[1h])))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Joins / Parts balance per channel (1h)",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 10},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(rate({job=\"ircfiber_containers\", event=\"join\"}[$__interval])) - sum(rate({job=\"ircfiber_containers\", event=\"part\"}[$__interval]))",
+          "legendFormat": "Net joins/sec",
+          "queryType": "range",
+          "refId": "A"
+        },
+        {
+          "refId": "B",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(rate({job=\"ircfiber_containers\", event=\"join\"}[$__interval]))",
+          "legendFormat": "Joins/sec",
+          "queryType": "range",
+          "refId": "B",
+          "hide": false
+        },
+        {
+          "refId": "C",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(rate({job=\"ircfiber_containers\", event=\"part\"}[$__interval]))",
+          "legendFormat": "Parts/sec",
+          "queryType": "range",
+          "refId": "C",
+          "hide": false
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Moderation events",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 18},
+      "collapsed": false,
+      "id": 101,
+      "panels": []
+    },
+    {
+      "id": 4,
+      "title": "Kicks / Modes / Topics per network",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 19},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (event, network) (rate({job=\"ircfiber_containers\", event=~\"kick|mode_change|topic_change\"}[$__interval]))",
+          "legendFormat": "{{event}} ({{network}})",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Live stream",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 28},
+      "collapsed": false,
+      "id": 102,
+      "panels": []
+    },
+    {
+      "id": 5,
+      "title": "Live IRC protocol events",
+      "type": "logs",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 14, "w": 24, "x": 0, "y": 29},
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "{job=\"ircfiber_containers\", component=\"engine-ovh\", event=~\"join|part|kick|quit|nick_change|topic_change|mode_change|privmsg|notice|invite|ctcp\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["ircfiber", "irc", "protocol", "events"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "IRC Protocol Events",
+  "uid": "ircfiber-protocol-events",
+  "version": 1,
+  "weekStart": ""
+}

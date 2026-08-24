@@ -1,0 +1,305 @@
+---
+# Deploy the SigNoz MCP server sidecar to the IRC Fiber SigNoz stack.
+#
+# Flow:
+#   1. Create /etc/ircfiber/signoz-mcp/ state directory.
+#   2. Reuse the existing API key file if it exists and validates;
+#      otherwise provision a new service-account API key via SigNoz
+#      admin JWT (vault_signoz_admin_password) and persist it
+#      locally (mode 0600) for subsequent runs.
+#   3. Render docker-compose and bring the sidecar up.
+#   4. Allow the host firewall to accept inbound from the tailnet
+#      on the MCP port.
+#
+# Idempotent: re-running the playbook after the first deploy does
+# not re-provision the API key or recreate the service account.
+
+- name: Skip non-gateway hosts (SigNoz only runs on ircfiber_gw)
+  ansible.builtin.meta: end_host
+  when:
+    - groups.get('ircfiber_gw', []) | length > 0
+    - inventory_hostname not in groups['ircfiber_gw']
+
+- name: Ensure signoz-mcp state directory exists
+  ansible.builtin.file:
+    path: "{{ signoz_mcp_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Discover SigNoz org ID from SQLite database
+  block:
+    - name: Copy signoz.db from the running container
+      ansible.builtin.command:
+        cmd: docker cp ircfiber-signoz:/var/lib/signoz/signoz.db /tmp/signoz-mcp-orgid.db
+      changed_when: false
+      failed_when: false
+      register: signoz_mcp_db_copy
+
+    - name: Read org ID from signoz.db
+      ansible.builtin.command:
+        cmd: >
+          docker run --rm -v /tmp:/tmp alpine:3.19 sh -c '
+          apk add --no-cache sqlite >/dev/null 2>&1 &&
+          sqlite3 /tmp/signoz-mcp-orgid.db
+          "SELECT id FROM organizations ORDER BY created_at ASC LIMIT 1"'
+      changed_when: false
+      failed_when: false
+      register: signoz_mcp_orgid_result
+      when: signoz_mcp_db_copy is success
+
+    - name: Fall back to vault orgId if DB read failed
+      ansible.builtin.set_fact:
+        resolved_org_id: "{{ (signoz_mcp_orgid_result.stdout | trim) if (signoz_mcp_orgid_result is defined and signoz_mcp_orgid_result.stdout | trim | length > 0) else (signoz_mcp_admin_org_id | default('')) }}"
+  always:
+    - name: Clean up temp DB copy
+      ansible.builtin.file:
+        path: /tmp/signoz-mcp-orgid.db
+        state: absent
+      changed_when: false
+
+- name: Check if a previously provisioned API key exists
+  ansible.builtin.stat:
+    path: "{{ signoz_mcp_api_key_file }}"
+  register: signoz_mcp_existing_key
+
+- name: Read existing API key (if present)
+  ansible.builtin.slurp:
+    src: "{{ signoz_mcp_api_key_file }}"
+  register: signoz_mcp_existing_key_b64
+  when: signoz_mcp_existing_key.stat.exists
+
+- name: Validate existing API key against SigNoz
+  ansible.builtin.uri:
+    url: "http://{{ signoz_mcp_bind_address }}:{{ signoz_api_port | default(3003) }}/api/v1/user"
+    method: GET
+    headers:
+      X-Signoz-Email: "{{ signoz_mcp_admin_email }}"
+      X-Signoz-Org: "{{ resolved_org_id }}"
+      SIGNOZ-API-KEY: "{{ (signoz_mcp_existing_key_b64.content | b64decode | trim) }}"
+    status_code: [200, 401, 403]
+  register: signoz_mcp_key_validation
+  failed_when: false
+  when: signoz_mcp_existing_key.stat.exists
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Set fact — API key already valid, reuse it
+  ansible.builtin.set_fact:
+    signoz_mcp_api_key: "{{ signoz_mcp_existing_key_b64.content | b64decode | trim }}"
+    signoz_mcp_needs_provisioning: false
+  when:
+    - signoz_mcp_existing_key.stat.exists
+    - signoz_mcp_key_validation.status | default(0) == 200
+
+- name: Discover SigNoz API base URL
+  ansible.builtin.set_fact:
+    # Use the host-mapped port 8080 directly — not the Tailscale Caddy proxy
+    # address. Caddy can't serve SigNoz without an API key, creating a
+    # chicken-and-egg problem when provisioning the key for the first time.
+    signoz_mcp_api_base: "http://127.0.0.1:8080"
+
+- name: Log in as admin to provision API key
+  ansible.builtin.uri:
+    url: "{{ signoz_mcp_api_base }}/api/v2/sessions/email_password"
+    method: POST
+    body_format: json
+    body:
+      email: "{{ signoz_mcp_admin_email }}"
+      password: "{{ vault_signoz_admin_password }}"
+      orgId: "{{ resolved_org_id }}"
+    status_code: 200
+  register: signoz_mcp_admin_login
+  no_log: true
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Look up existing service accounts
+  ansible.builtin.uri:
+    url: "{{ signoz_mcp_api_base }}/api/v1/service_accounts"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ signoz_mcp_admin_login.json.data.accessToken }}"
+    status_code: 200
+  register: signoz_mcp_service_accounts
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Find signoz-mcp service account (if any)
+  ansible.builtin.set_fact:
+    signoz_mcp_existing_account: >-
+      {{
+        (signoz_mcp_service_accounts.json.data | default([]))
+        | selectattr('name', 'defined')
+        | selectattr('name', 'equalto', signoz_mcp_service_account_name)
+        | rejectattr('status', 'equalto', 'deleted')
+        | list
+        | first
+        | default(None)
+      }}
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+
+- name: Delete service account if role has changed
+  ansible.builtin.uri:
+    url: "{{ signoz_mcp_api_base }}/api/v1/service_accounts/{{ signoz_mcp_existing_account.id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ signoz_mcp_admin_login.json.data.accessToken }}"
+    status_code: [200, 204, 404]
+  register: signoz_mcp_deleted_account
+  when:
+    - not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+    - signoz_mcp_existing_account is not none
+    - signoz_mcp_existing_account.role | default('') != signoz_mcp_service_account_role
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Mark — fresh account needed (role changed or none existed)
+  ansible.builtin.set_fact:
+    signoz_mcp_needs_fresh_account: "{{ signoz_mcp_existing_account is none or (signoz_mcp_deleted_account.changed | default(false)) }}"
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+
+- name: Create signoz-mcp service account (idempotent via 409)
+  ansible.builtin.uri:
+    url: "{{ signoz_mcp_api_base }}/api/v1/service_accounts"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ signoz_mcp_admin_login.json.data.accessToken }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "{{ signoz_mcp_service_account_name }}"
+      role: "{{ signoz_mcp_service_account_role }}"
+    status_code: [200, 201, 409]
+  register: signoz_mcp_new_account
+  when:
+    - not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+    - signoz_mcp_needs_fresh_account | default(false)
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Resolve service account id
+  ansible.builtin.set_fact:
+    signoz_mcp_account_id: "{{ (signoz_mcp_new_account.json.data.id if (signoz_mcp_needs_fresh_account | default(false)) and (signoz_mcp_new_account.status | default(0) in [200, 201]) else signoz_mcp_existing_account.id) | trim }}"
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+
+- name: List existing keys for signoz-mcp service account
+  ansible.builtin.uri:
+    url: "{{ signoz_mcp_api_base }}/api/v1/service_accounts/{{ signoz_mcp_account_id }}/keys"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ signoz_mcp_admin_login.json.data.accessToken }}"
+    status_code: 200
+  register: signoz_mcp_existing_keys
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Delete stale keys (idempotent — loop over empty list is a no-op)
+  ansible.builtin.uri:
+    url: "{{ signoz_mcp_api_base }}/api/v1/service_accounts/{{ signoz_mcp_account_id }}/keys/{{ item.id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ signoz_mcp_admin_login.json.data.accessToken }}"
+    status_code: [200, 204]
+  loop: "{{ signoz_mcp_existing_keys.json.data | default([]) }}"
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Create fresh API key
+  ansible.builtin.uri:
+    url: "{{ signoz_mcp_api_base }}/api/v1/service_accounts/{{ signoz_mcp_account_id }}/keys"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ signoz_mcp_admin_login.json.data.accessToken }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "mcp-{{ ansible_date_time.epoch | default('manual') }}"
+    status_code: [200, 201]
+  register: signoz_mcp_new_key
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Persist API key to host-local file
+  ansible.builtin.copy:
+    content: "{{ signoz_mcp_new_key.json.data.key }}"
+    dest: "{{ signoz_mcp_api_key_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+
+- name: Set signoz_mcp_api_key fact
+  ansible.builtin.set_fact:
+    signoz_mcp_api_key: "{{ signoz_mcp_new_key.json.data.key }}"
+    signoz_mcp_needs_provisioning: true
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
+
+# Caddy reads SIGNOZ_API_KEY at startup and injects it as a header on
+# /signoz/* requests via its reverse_proxy. The caddy container needs
+# to be reloaded (or restarted) after a key rotation so the new value
+# takes effect. We reload rather than restart to avoid dropping active
+# HTTPS connections. If the caddy container is not present yet (first
+# deploy before the site role has run) the reload is a no-op skipped
+# below.
+- name: Check if ircfiber-caddy container is running
+  community.docker.docker_container_info:
+    name: ircfiber-caddy
+  register: caddy_container_info
+  ignore_errors: true
+
+- name: Reload caddy to pick up the new SIGNOZ_API_KEY
+  ansible.builtin.command:
+    cmd: docker exec ircfiber-caddy caddy reload --address localhost:2019 --config /etc/caddy/Caddyfile
+  register: caddy_reload
+  changed_when: caddy_reload.rc == 0
+  failed_when: false
+  when:
+    - caddy_container_info.exists | default(false)
+    - caddy_container_info.container.State.Running | default(false)
+  no_log: true
+
+- name: Allow SigNoz MCP port from Tailscale subnet (ufw)
+  community.general.ufw:
+    rule: allow
+    port: "{{ signoz_mcp_port }}"
+    proto: tcp
+    src: "{{ firewall_open_tailscale_subnet | default('100.64.0.0/10') }}"
+  when: signoz_mcp_open_firewall | bool
+
+- name: Reload ufw after rule changes
+  community.general.ufw:
+    state: reloaded
+  when: signoz_mcp_open_firewall | bool
+
+- name: Render docker-compose for signoz-mcp sidecar
+  ansible.builtin.template:
+    src: docker-compose.signoz-mcp.yml.j2
+    dest: "{{ signoz_mcp_state_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Deploy signoz-mcp stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ signoz_mcp_state_dir }}"
+    state: present
+    pull: missing
+    remove_orphans: true
+
+- name: Wait for signoz-mcp /livez to respond
+  ansible.builtin.uri:
+    url: "http://{{ signoz_mcp_bind_address }}:{{ signoz_mcp_port }}/livez"
+    method: GET
+    status_code: 200
+  register: signoz_mcp_health
+  retries: 12
+  delay: 5
+  until: signoz_mcp_health.status == 200
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Report deploy status
+  ansible.builtin.debug:
+    msg: |
+      SigNoz MCP server deployed.
+      Endpoint (tailnet): http://{{ signoz_mcp_bind_address }}:{{ signoz_mcp_port }}/mcp
+      Auth: API key provisioned as service account '{{ signoz_mcp_service_account_name }}' (role {{ signoz_mcp_service_account_role }}).
+      Key file: {{ signoz_mcp_api_key_file }} (mode 0600).

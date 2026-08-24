@@ -1,0 +1,18 @@
+---
+# Usage:
+#   ansible-playbook playbooks/restore.yml \
+#     -e restore_mongo_snapshot=mongo-20251201-120000-ircfiber.archive \
+#     -e restore_redis_snapshot=redis-20251201-120000-ircfiber.aof \
+#     -e restore_confirm=true
+#
+# -e restore_confirm=true is REQUIRED.
+# Run `ansible-playbook playbooks/backup.yml` first to see what snapshots exist.
+
+- name: Restore MongoDB and Redis
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: restore

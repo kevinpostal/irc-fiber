@@ -1,0 +1,168 @@
+---
+# IRC Fiber — full-stack deployment
+#
+# Run from the deploy/ directory:
+#
+#   # First time on a new host (creates the non-root 'deploy' user):
+#   ansible-playbook playbooks/bootstrap.yml --user root
+#
+#   # Then for every other deploy (gateway, engine, ops, etc.):
+#   ansible-playbook playbooks/site.yml
+#
+# The bootstrap step is included here as a no-op for hosts where the
+# 'deploy' user already exists. Re-running site.yml against a host that
+# has already been bootstrapped is safe and idempotent.
+
+- name: Preflight — ensure vault variables are defined
+  hosts: ircfiber
+  gather_facts: false
+  # ansible-core 2.20 has a known issue where the inventory directory is
+  # not auto-added to ansible_search_path when the inventory path contains
+  # spaces (or in some other cases). We explicitly load the vault file so
+  # every subsequent play in this run has access to the secrets.
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+    # Note: vault_redis_password is intentionally not asserted. The D
+    # redis client can't pass a password; redis is bound to the Tailscale
+    # interface only, so network isolation provides the security boundary.
+    - name: Compute which required vault variables are missing
+      ansible.builtin.set_fact:
+        missing_vault_vars: >-
+          {{
+            (
+              (['vault_tailscale_authkey']
+                if not (vault_tailscale_authkey | default('', true) | length > 0) else [])
+              +
+              (['vault_mongo_root_password']
+                if not (vault_mongo_root_password | default('', true) | length > 0) else [])
+              +
+              (['vault_mongo_app_password']
+                if not (vault_mongo_app_password | default('', true) | length > 0) else [])
+              +
+              (['vault_docker_registry_username']
+                if (docker_registry_url | length > 0)
+                  and not (vault_docker_registry_username | default('', true) | length > 0)
+                else [])
+              +
+              (['vault_docker_registry_password']
+                if (docker_registry_url | length > 0)
+                  and not (vault_docker_registry_password | default('', true) | length > 0)
+                else [])
+            )
+          }}
+
+    - name: Show missing vault variables
+      ansible.builtin.debug:
+        var: missing_vault_vars
+
+    - name: Verify all required vault variables are present
+      ansible.builtin.assert:
+        that: missing_vault_vars | length == 0
+        fail_msg: |
+          These vault variables are missing or empty in
+          inventories/production/group_vars/vault.yml:
+
+          {{ missing_vault_vars | to_nice_yaml }}
+
+          Re-run: ansible-vault edit inventories/production/group_vars/vault.yml
+          and fill them in. Compare against vault.example.yml for the full list.
+
+- name: Bootstrap — ensure the deploy user exists
+  hosts: ircfiber
+  become: true
+  gather_facts: true
+  roles:
+    - role: deploy_user
+      # Skipped automatically on hosts where the user already exists.
+
+- name: Base setup on all ircfiber hosts
+  hosts: ircfiber
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: common
+    - role: docker
+    - role: conntrack
+    - role: tailscale
+    - role: registry_login
+    - role: firewall
+
+- name: Build & push irc-fiber image
+  # When a registry is configured, the build runs on the control node
+  # (via delegate_to: localhost inside the role) and the target pulls.
+  # When no registry is configured, the build runs on the target host
+  # so the image ends up in the target's local docker daemon.
+  hosts: ircfiber
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: ircfiber_image
+
+- name: Manage Cloudflare DNS records pointing at the backend host(s)
+  # Runs BEFORE Caddy/LE so that ACME HTTP-01 challenges for the
+  # ircfiber_domain (and any caddy_extra_serve_hosts entries) resolve
+  # back to this host's public IP. Re-running with no changes is a no-op.
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: cloudflare
+
+- name: Deploy backend (mongo + redis + caddy) on backend host
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: ircfiber_network
+    - role: mongo
+    - role: redis
+    - role: caddy
+
+- name: Deploy Cloudflare Tunnel (cloudflared)
+  # Runs after Caddy so the tunnel target (ircfiber-caddy:80) is available.
+  # When using tunnel-only ingress (no direct A records), this is the primary
+  # public-facing ingress; firewall ports 80/443 can be closed after verifying
+  # the tunnel is operational.
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: cloudflared
+
+- name: Deploy gateway
+  hosts: ircfiber_gw
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: gateway
+
+- name: Deploy engines (one or more hosts)
+  hosts: ircfiber_engines
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: engine
+
+- name: Deploy IRC daemon (Ergo)
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: ircd

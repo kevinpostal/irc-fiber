@@ -1,0 +1,102 @@
+# {{ ansible_managed }}
+# IRC Fiber — Fluent Bit production config for SigNoz-native observability.
+#
+# Ships container logs to the SigNoz ingester via OTLP HTTP.
+# Pipeline:
+#   1. [INPUT] tail → reads Docker JSON logs, extracts container_id via
+#      Docker_Mode, assigns tag docker.*.
+#   2. [FILTER parser] engine_json → lifts structured fields (event, level,
+#      network, nick, channel) from the JSON log body into record attributes.
+#   3. [FILTER docker] → queries Docker socket (requires mount) for container
+#      metadata: container_name, container_image, container_id.
+#   4. [FILTER modify] → copies container_name to the OTel-compatible
+#      service.name attribute for uniform filtering in SigNoz.
+#   5. [OUTPUT opentelemetry] → ships via OTLP HTTP to signoz-ingester:4318.
+#   6. [OUTPUT stdout] — optional debug output, disabled by default.
+#
+# Precondition: Docker socket mount at /var/run/docker.sock (handled by
+# docker-compose template in w2-t2). Without it, step 3 (docker filter)
+# will fail to enrich container metadata.
+#
+# Recursion guard: Exclude_Path prevents Fluent Bit from reading its own
+# container logs, avoiding a read-loop amplification.
+
+[SERVICE]
+    Flush        {{ fluent_bit_flush | default('1') }}
+    Daemon       Off
+    # info includes per-batch "HTTP status=200" output — ~2/sec of noise.
+    # warn suppresses those while keeping errors visible.
+    Log_Level    {{ fluent_bit_log_level | default('warn') }}
+    Parsers_File {{ fluent_bit_parsers_file | default('/fluent-bit/etc/parsers.conf') }}
+
+# ────────────────────────────────────────────────────────────────────────────
+# INPUT: tail Docker container JSON logs
+# ────────────────────────────────────────────────────────────────────────────
+# Docker_Mode On extracts container_id from the file-path directory name,
+# making it available for the docker filter below. Without Docker_Mode,
+# the docker filter cannot query the Docker socket for metadata.
+[INPUT]
+    Name            tail
+    Path            /var/lib/docker/containers/*/*-json.log
+    Parser          docker
+    Tag             docker.*
+    Refresh_Interval {{ fluent_bit_refresh_interval | default('5') }}
+    Mem_Buf_Limit   {{ fluent_bit_mem_buf_limit | default('50MB') }}
+    Skip_Long_Lines On
+    # Recursion guard: exclude Fluent Bit's own container logs.
+    # Pattern matches the container name in the log path directory.
+    exclude_path    {{ fluent_bit_exclude_path | default('*ircfiber-fluent-bit*') }}
+
+# PARSERS are in parsers.conf (referenced by Parsers_File above).
+# See deploy/roles/logging/templates/parsers.conf.j2 for definitions.
+
+# ────────────────────────────────────────────────────────────────────────────
+# FILTERS
+# ────────────────────────────────────────────────────────────────────────────
+# 1. Parse engine JSON from the $log body into structured record fields.
+#    Reserve_Data keeps all other fields (container_id, stream, etc.).
+#    Preserve_Key retains the original $log field for the OTLP body.
+[FILTER]
+    Name        parser
+    Match       docker.*
+    Parser      engine_json
+    Key_Name    log
+    Reserve_Data On
+    Preserve_Key On
+
+# 2. Drop noisy SigNoz internal diagnostic logs. These are SigNoz's own
+#    request logging (~37% of signoz container logs), metrics metadata cache
+#    misses (~39%), and query cache diagnostics (~12%). They provide no
+#    operational value and fill ClickHouse storage.
+[FILTER]
+    Name    grep
+    Match   docker.*
+    Exclude $log (failed to get active license|failed to report stats|Creating shutdown snapshot failed|sql: database is closed|RECEIVED-REQUEST|cache miss for metric metadata|no bucket cache or fingerprint|time taken to run builder queries|number of non-overlapping cached)
+
+# Note: The `docker` filter plugin (for Docker metadata enrichment) is
+# not available in the standard fluent/fluent-bit:3.2 image. Container
+# metadata enrichment requires a custom Fluent Bit build or the full
+# fluent-bit-plugin-docker. Logs ship with body+timestamps intact;
+# container_name/service.name enrichment can be added later.
+
+# ────────────────────────────────────────────────────────────────────────────
+# OUTPUTS
+# ────────────────────────────────────────────────────────────────────────────
+# Primary: ship to SigNoz ingester via OTLP HTTP.
+# Logs_Body_Key log uses the original Docker log body as the OTLP log body;
+# all other fields (event, level, network, container_name, service.name, etc.)
+# become OTLP log record attributes.
+[OUTPUT]
+    Name            opentelemetry
+    Match           docker.*
+    Host            {{ fluent_bit_otlp_host | default('signoz-ingester') }}
+    Port            {{ fluent_bit_otlp_port | default('4318') }}
+    Logs_Body_Key   log
+
+# Optional: stdout debug output — disabled by default.
+# Enable with: fluent_bit_stdout_enabled=true in Ansible vars.
+{% if fluent_bit_stdout_enabled | default(false) | bool %}
+[OUTPUT]
+    Name    stdout
+    Match   docker.*
+{% endif %}

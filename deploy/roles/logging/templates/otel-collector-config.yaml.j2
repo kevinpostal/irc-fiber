@@ -1,0 +1,96 @@
+# {{ ansible_managed }}
+# Minimal OTel collector config for the SigNoz ingester.
+# Receives OTLP from Fluent Bit (logs) and from the bridge collector
+# (traces + metrics + logs) on 4317/4318, and exports via the OTel
+# clickhouse exporter to the EXTERNAL clickhouse service (not the
+# bundled one in the signoz image — we run a separate clickhouse in
+# the same compose so we can back it up / scale it independently).
+#
+# The health_check extension on 0.0.0.0:13133 is what the docker
+# healthcheck in docker-compose.logging.yml.j2 probes — without it
+# port 13133 doesn't listen and the container can never become
+# "healthy" by Docker's view even when the collector itself is fine.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+# SigNoz v0.131+ queries three SEPARATE databases (signoz_traces,
+# signoz_logs, signoz_metrics) and refuses to look anywhere else. The
+# OTel clickhouse exporter only writes to ONE database per exporter
+# instance, so we need three exporter instances — one per signal —
+# each pointing at its own database. Without this, all three signals
+# land in the database named below (signoz_traces), the other two
+# databases are never created, and the query service returns
+# "UNKNOWN_DATABASE" for every logs and metrics request.
+exporters:
+  clickhouse/traces:
+    endpoint: tcp://clickhouse:9000
+    database: signoz_traces
+    ttl: 72h
+    username: default
+    password: ""
+    traces_table_name: signoz_traces
+    # The OTel clickhouse exporter tries to CREATE DATABASE on startup
+    # so it can fail the whole collector process if ClickHouse isn't
+    # ready yet (Docker restart loop → unhealthy). retry_on_failure
+    # makes the exporter survive the transient race and start serving
+    # OTLP as soon as ClickHouse responds.
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 30s
+      max_elapsed_time: 300s
+  clickhouse/logs:
+    endpoint: tcp://clickhouse:9000
+    database: signoz_logs
+    ttl: 72h
+    username: default
+    password: ""
+    logs_table_name: signoz_logs
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 30s
+      max_elapsed_time: 300s
+  clickhouse/metrics:
+    endpoint: tcp://clickhouse:9000
+    database: signoz_metrics
+    ttl: 72h
+    username: default
+    password: ""
+    metrics_table_name: signoz_metrics
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [clickhouse/traces]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [clickhouse/metrics]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [clickhouse/logs]

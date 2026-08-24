@@ -1,0 +1,11 @@
+---
+redis_container_name: ircfiber-redis
+redis_bind_ip: "{{ host_tailscale_ip | default('0.0.0.0') }}"
+redis_healthcheck_interval: 10s
+redis_healthcheck_timeout: 3s
+redis_healthcheck_retries: 5
+redis_no_new_privileges: true
+redis_ulimits:
+  nofile:
+    soft: 65536
+    hard: 65536

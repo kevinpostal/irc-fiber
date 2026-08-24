@@ -1,0 +1,4 @@
+---
+restore_mongo_snapshot: ""   # e.g. "mongo-20251201-120000.archive"
+restore_redis_snapshot: ""   # e.g. "redis-20251201-120000.aof"
+restore_confirm: false       # must be set to true to actually run

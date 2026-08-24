@@ -1,0 +1,37 @@
+---
+# IRC Fiber — deploy the SigNoz MCP server sidecar.
+#
+# Runs after `playbooks/logging.yml` (formerly `signoz.yml`, removed
+# 2026-07) has bootstrapped the main stack and provisioned an admin
+# login. Provisions a dedicated service account API key (stored
+# locally, mode 0600) and brings up the signoz-mcp-server container
+# next to signoz-signoz on the shared ircfiber_logging Docker network.
+#
+# Usage:
+#   ansible-playbook playbooks/signoz_mcp.yml
+#
+# vault_signoz_admin_password is read from
+# inventories/production/group_vars/all/vault.yml (ansible-vault encrypted,
+# decrypted via deploy/.vault_pass.txt). On first run, copy
+# vault.example.yml → vault.yml, fill in the real password, and run
+# `ansible-vault encrypt vault.yml`. See vault.example.yml for details.
+#
+# To pass the password ad-hoc instead of using vault, override with:
+#   -e 'vault_signoz_admin_password=YOUR_PASSWORD'
+
+- name: Deploy SigNoz MCP server sidecar
+  hosts: ircfiber_gw
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Ensure ircfiber_logging Docker network exists
+      community.docker.docker_network:
+        name: ircfiber_logging
+        driver: bridge
+        state: present
+
+    - name: Deploy signoz-mcp sidecar
+      ansible.builtin.include_role:
+        name: signoz_mcp
+      when: vault_signoz_admin_password | default('') | length > 0

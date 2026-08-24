@@ -1,0 +1,87 @@
+---
+# Push pre-built alert rules + notification channel to SigNoz via API.
+# Idempotent: matches by compositeKey (or name) and PUTs.
+#
+# Requirements:
+#   - signoz-signoz reachable on ircfiber_logging network
+#   - sigNozApiURL=http://signoz-signoz:8080
+#   - admin JWT in env (SIGNOZ_API_TOKEN) or fetched via /api/v1/login
+
+- name: Discover sigNoz API URL
+  ansible.builtin.set_fact:
+    sigNozApiURL: "http://100.126.197.92:3003"   # Caddy on Tailscale port 3003 forwards to signoz-signoz:8080
+
+- name: Get admin JWT for SigNoz API
+  ansible.builtin.uri:
+    url: "{{ sigNozApiURL }}/api/v2/sessions/email_password"
+    method: POST
+    body_format: json
+    body:
+      email: "kevindpostal@gmail.com"
+      password: "{{ vault_signoz_admin_password }}"
+      orgId: "{{ vault_signoz_org_id | default('019f1235-79b1-787f-b4a9-370824295f2f') }}"
+    status_code: 200
+  register: signoz_login
+  no_log: true
+  when: vault_signoz_admin_password is defined and vault_signoz_admin_password | length > 0
+  delegate_to: ircfiber-ovh-1
+
+- name: Set fact for SigNoz JWT
+  ansible.builtin.set_fact:
+    signoz_jwt: "{{ signoz_login.json.data.accessToken }}"
+
+- name: Read alert rules file
+  ansible.builtin.slurp:
+    src: "{{ playbook_dir }}/../roles/signoz_alerts/files/alert_rules.yml"
+  register: alert_rules_raw
+  delegate_to: localhost
+  become: false
+
+- name: Parse alert rules (one object per `---` separator)
+  ansible.builtin.set_fact:
+    alert_rules_parsed: "{{ alert_rules_raw.content | b64decode | from_yaml_all }}"
+    # from_yaml_all returns a list of docs; flatten one level
+    alert_rules_list: "{{ (alert_rules_raw.content | b64decode | from_yaml_all) | flatten }}"
+
+- name: Push each alert rule to SigNoz
+  ansible.builtin.uri:
+    url: "{{ sigNozApiURL }}/api/v1/rules"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ signoz_jwt }}"
+      Content-Type: "application/json"
+    body_format: json
+    body: "{{ item }}"
+    status_code: [200, 201, 409]
+  loop: "{{ alert_rules_list }}"
+  loop_control:
+    label: "alert {{ item.name }}"
+  no_log: false
+  delegate_to: ircfiber-ovh-1
+
+- name: Upsert notification channel (webhook)
+  ansible.builtin.uri:
+    url: "{{ sigNozApiURL }}/api/v1/channels"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ signoz_jwt }}"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      name: "ircfiber-default-webhook"
+      type: "webhook"
+      webhook_configs:
+        - url: "{{ signoz_alert_webhook_default }}"
+          http_config:
+            authorization:
+              username: ""
+              password: ""
+            tls_config:
+              insecure_skip_verify: false
+          send_resolved: true
+          message: |
+            {{ .GroupLabels.SortedPairs }} {{ .CommonAnnotations.summary }}
+            {{ .CommonAnnotations.description }}
+          title: "[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})"
+    status_code: [200, 201, 409]
+  delegate_to: ircfiber-ovh-1

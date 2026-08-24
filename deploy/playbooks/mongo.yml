@@ -1,0 +1,9 @@
+---
+- name: Deploy MongoDB
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: mongo

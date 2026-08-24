@@ -1,0 +1,45 @@
+---
+- name: Show status of irc-fiber deployment
+  hosts: ircfiber
+  become: true
+  gather_facts: false
+  tasks:
+    - name: List irc-fiber containers
+      ansible.builtin.command: >
+        docker ps -a
+          --filter label=com.ircfiber.version
+          --format 'table {{ "{{" }}.Names{{ "}}" }}\t{{ "{{" }}.Status{{ "}}" }}\t{{ "{{" }}.Ports{{ "}}" }}\t{{ "{{" }}.Labels{{ "}}" }}'
+      register: docker_ps
+      changed_when: false
+
+    - name: Print irc-fiber container status
+      ansible.builtin.debug:
+        var: docker_ps.stdout_lines
+
+    - name: Curl public health (from gateway host only)
+      ansible.builtin.uri:
+        url: "https://{{ ircfiber_domain }}/health"
+        validate_certs: true
+        status_code: [200, 301, 302]
+        timeout: 10
+      register: public_health
+      failed_when: false
+      when: inventory_hostname in (groups['ircfiber_gw'] | default([]))
+
+    - name: Print public health
+      ansible.builtin.debug:
+        msg: "Public health: {{ public_health.status | default('n/a') }}"
+      when: public_health is defined
+
+    - name: Tailscale status
+      ansible.builtin.command: tailscale status --json
+      register: ts_status
+      changed_when: false
+      failed_when: false
+
+    - name: Show Tailscale summary
+      ansible.builtin.debug:
+        msg: >-
+          Tailscale: backend state {{ (ts_status.stdout | from_json).BackendState
+          | default('unknown') }}
+      when: ts_status.rc == 0

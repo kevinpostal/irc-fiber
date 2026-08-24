@@ -1,0 +1,102 @@
+---
+- name: Preflight — vault_tailscale_authkey must be set
+  ansible.builtin.assert:
+    that:
+      - vault_tailscale_authkey is defined
+      - vault_tailscale_authkey | length > 0
+      - vault_tailscale_authkey != "tskey-auth-REPLACE-ME"
+    fail_msg: "vault_tailscale_authkey is missing or still a placeholder. Edit group_vars/vault.yml."
+
+# Detect existing Tailscale install so we can avoid apt conflicts and
+# idempotently handle hosts that were set up manually.
+- name: Check if tailscale binary is already installed
+  ansible.builtin.stat:
+    path: /usr/bin/tailscale
+  register: tailscale_binary
+  changed_when: false
+
+- name: Look for conflicting apt source files from a previous install
+  ansible.builtin.find:
+    paths: /etc/apt/sources.list.d
+    patterns: "tailscale*"
+  register: existing_tailscale_sources
+  changed_when: false
+
+# If the system already has Tailscale installed and a working source, leave
+# the apt config alone. Otherwise, do a clean install.
+- name: Install Tailscale (clean apt setup)
+  when:
+    - not tailscale_binary.stat.exists
+      or existing_tailscale_sources.files | length == 0
+  block:
+    - name: Remove any existing Tailscale apt source list (legacy path)
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ existing_tailscale_sources.files }}"
+
+    - name: Ensure apt keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download Tailscale GPG key
+      ansible.builtin.get_url:
+        url: https://pkgs.tailscale.com/stable/{{ ansible_distribution | lower }}/{{ ansible_distribution_release }}.noarmor.gpg
+        dest: "{{ tailscale_apt_keyring }}"
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+
+    - name: Add Tailscale apt repository
+      ansible.builtin.apt_repository:
+        repo: "{{ tailscale_apt_repo }}"
+        filename: tailscale
+        state: present
+        update_cache: true
+
+    - name: Install tailscale package
+      ansible.builtin.apt:
+        name: "{{ tailscale_packages }}"
+        state: present
+
+- name: Ensure tailscale state dir exists
+  ansible.builtin.file:
+    path: "{{ tailscale_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Enable and start tailscaled
+  ansible.builtin.service:
+    name: tailscaled
+    state: started
+    enabled: true
+
+- name: Check if tailscale is already authenticated
+  ansible.builtin.command: tailscale status --json
+  register: ts_status
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Authenticate tailscale
+  ansible.builtin.command: >
+    tailscale up
+      --authkey={{ vault_tailscale_authkey }}
+      --hostname=ircfiber-{{ inventory_hostname_short }}
+      --advertise-tags={{ tailscale_tags }}
+      {{ tailscale_up_extra_args }}
+  when: ts_status.rc != 0
+  changed_when: true
+  notify: Refresh facts
+
+- name: Refresh ansible facts after tailscale up
+  ansible.builtin.setup:
+    filter: ansible_facts.tailscale0
+  when: ts_status.rc != 0

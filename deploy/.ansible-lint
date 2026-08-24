@@ -1,0 +1,10 @@
+---
+# ansible-lint config for IRC Fiber deployment
+exclude_paths:
+  - .cache/
+  - .github/
+skip_list:
+  - role-name  # roles use snake_case already; the default regex is too strict
+  - schema[meta]  # meta is optional for our internal roles
+  - var-naming[no-role-prefix]
+  - name[casing]  # we use sentence case in task names

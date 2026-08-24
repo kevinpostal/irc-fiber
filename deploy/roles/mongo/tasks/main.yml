@@ -1,0 +1,102 @@
+---
+# Preflight
+- name: Preflight — vault_mongo_root_password must be set
+  ansible.builtin.assert:
+    that:
+      - vault_mongo_root_password is defined
+      - vault_mongo_root_password | length > 0
+      - vault_mongo_root_password != 'REPLACE-WITH-STRONG-PASSWORD'
+    fail_msg: "vault_mongo_root_password is missing or still a placeholder."
+
+- name: Preflight — vault_mongo_app_password must be set
+  ansible.builtin.assert:
+    that:
+      - vault_mongo_app_password is defined
+      - vault_mongo_app_password | length > 0
+      - vault_mongo_app_password != 'REPLACE-WITH-STRONG-PASSWORD'
+    fail_msg: "vault_mongo_app_password is missing or still a placeholder."
+
+- name: Discover Tailscale IPv4 address on this host
+  ansible.builtin.command: tailscale ip -4
+  register: tailscale_ip_raw
+  changed_when: false
+  failed_when: tailscale_ip_raw.rc != 0
+  check_mode: false
+
+- name: Set host_tailscale_ip fact
+  ansible.builtin.set_fact:
+    host_tailscale_ip: "{{ tailscale_ip_raw.stdout | trim | split('\n') | first | trim }}"
+
+- name: Show Tailscale IP
+  ansible.builtin.debug:
+    msg: "Mongo/Redis will bind to Tailscale IP {{ host_tailscale_ip }}"
+
+# Volumes
+- name: Ensure mongo data volume exists
+  community.docker.docker_volume:
+    name: "{{ mongo_data_volume }}"
+    state: present
+
+# Config files
+- name: Render mongod.conf
+  ansible.builtin.template:
+    src: mongod.conf.j2
+    dest: /etc/ircfiber/mongod.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart mongo
+
+- name: Render mongo init script
+  ansible.builtin.template:
+    src: init.js.j2
+    dest: /etc/ircfiber/mongo-init.js
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart mongo
+
+# Container
+- name: Run ircfiber-mongo
+  community.docker.docker_container:
+    name: "{{ mongo_container_name }}"
+    image: "{{ mongo_image }}"
+    state: started
+    restart_policy: unless-stopped
+    network_mode: host
+    # We DO NOT publish ports — host network mode already exposes them
+    # But we DO tell docker the container binds only to tailscale IP via the entrypoint
+    command:
+      - "mongod"
+      - "--config"
+      - "/etc/mongod.conf"
+    env:
+      MONGO_INITDB_ROOT_USERNAME: "{{ vault_mongo_root_username }}"
+      MONGO_INITDB_ROOT_PASSWORD: "{{ vault_mongo_root_password }}"
+      MONGO_INITDB_DATABASE: "{{ mongo_initdb_database }}"
+    volumes:
+      - "{{ mongo_data_volume }}:/data/db"
+      - "/etc/ircfiber/mongod.conf:/etc/mongod.conf:ro"
+      - "/etc/ircfiber/mongo-init.js:/docker-entrypoint-initdb.d/00-init.js:ro"
+    security_opts:
+      - "no-new-privileges:true"
+    ulimits:
+      - "nofile:64000:64000"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          mongosh --quiet
+          --host {{ mongo_bind_ip }}
+          -u {{ vault_mongo_app_username }}
+          -p {{ vault_mongo_app_password }}
+          --authenticationDatabase {{ mongo_initdb_database }}
+          --eval 'db.adminCommand({ping:1}).ok'
+          | grep -q 1
+      interval: "{{ mongo_healthcheck_interval }}"
+      timeout: "{{ mongo_healthcheck_timeout }}"
+      retries: "{{ mongo_healthcheck_retries }}"
+      start_period: "{{ mongo_healthcheck_start_period }}"
+    labels:
+      com.ircfiber.component: "mongo"
+      com.ircfiber.version: "{{ ircfiber_version }}"

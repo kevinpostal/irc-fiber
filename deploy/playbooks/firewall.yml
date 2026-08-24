@@ -1,0 +1,7 @@
+---
+- name: Apply firewall rules
+  hosts: ircfiber
+  become: true
+  gather_facts: true
+  roles:
+    - role: firewall

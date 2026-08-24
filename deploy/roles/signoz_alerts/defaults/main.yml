@@ -1,0 +1,18 @@
+---
+# Pre-built SigNoz alert rules + notification channel.
+# Pushes JSON to SigNoz via /api/v1/{rules,channels} on each deploy.
+# Idempotent: re-running updates existing rules by compositeKey.
+
+# Default notification webhook (Slack-compatible, also works with Discord, Teams
+# via adapters, PagerDuty, etc.). Set this in your vault to a real URL once
+# you create the integration.
+signoz_alert_webhook_default: "https://example.com/signoreplace"
+signoz_alert_webhook_secret: ""
+
+# Threshold knobs (overridable in group_vars)
+signoz_alert_cpu_threshold: 85        # % sustained 5min
+signoz_alert_memory_threshold: 90    # %
+signoz_alert_disk_threshold: 85      # %
+signoz_alert_restart_count: 3        # in 10min
+signoz_alert_oom_window_min: 60      # minutes
+signoz_alert_eval_interval_sec: 60

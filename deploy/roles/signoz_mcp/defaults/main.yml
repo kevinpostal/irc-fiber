@@ -1,0 +1,54 @@
+---
+# SigNoz MCP server — sidecar to the IRC Fiber SigNoz stack.
+# Provides MCP (Model Context Protocol) access to SigNoz telemetry
+# for AI assistants and developers.
+#
+# The MCP server talks to signoz-signoz:8080 over the shared
+# ircfiber_logging Docker network and exposes its own HTTP listener
+# on the host's Tailscale IP only — not the public internet.
+#
+# Auto-provisions a dedicated service-account API key on first run
+# (stored in /etc/ircfiber/signoz-mcp/.api_key, mode 0600) and
+# reuses it on subsequent runs.
+
+# No versioned tags published by SigNoz; pinned by digest (2026-06-29 build).
+signoz_mcp_image: "signoz/signoz-mcp-server@sha256:be033303419d103fc8e334d9b7bab9e142809d07ec32630380c582a73d5b3e5b"
+signoz_mcp_container: "signoz-mcp-server"
+signoz_mcp_mem: 512m
+signoz_mcp_cpus: 0.25
+
+# Host port for the MCP endpoint. Bound to the Tailscale IP so
+# the service is reachable only via the tailnet. Override per
+# host in inventories/production/host_vars/<hostname>.yml.
+signoz_mcp_bind_address: "{{ caddy_tailscale_logging_address | default('198.51.100.1') }}"
+signoz_mcp_port: 3004
+signoz_mcp_container_port: 8000
+
+# Service-account role granted to the MCP server. VIEWER is the
+# safest default (read-only access to dashboards/alerts/logs/traces).
+#
+# NOTE: even with ADMIN role, /api/v2/users/me (called by the
+# SigNoz bundle during bootstrap) returns 401 because SigNoz
+# v0.130 only accepts session JWTs for user-context endpoints.
+# Changing the role from EDITOR to ADMIN therefore does NOT
+# make the embedded-iframe UI work; both roles return 401 for
+# the /users/me call. See deploy/roles/caddy/templates/Caddyfile.j2
+# and frontend/src/admin/pages/Logs.svelte for the long-term
+# fix path.
+signoz_mcp_service_account_role: "EDITOR"
+signoz_mcp_service_account_name: "signoz-mcp-{{ inventory_hostname_short | default('unknown') }}"
+
+# Admin login used to provision the service account + API key.
+# Pulled from existing signoz_alerts role conventions.
+signoz_mcp_admin_email: "kevindpostal@gmail.com"
+# orgId is discovered at runtime from the DB by signoz_mcp tasks (the
+# hardcoded default is a last-resort fallback that is almost certainly wrong).
+signoz_mcp_admin_org_id: "{{ vault_signoz_org_id | default('') }}"
+signoz_mcp_admin_password_var: "vault_signoz_admin_password"
+
+# Where to mount the API key on the host.
+signoz_mcp_state_dir: "/etc/ircfiber/signoz-mcp"
+signoz_mcp_api_key_file: "{{ signoz_mcp_state_dir }}/.api_key"
+
+# Toggle the firewall rule added by this role.
+signoz_mcp_open_firewall: true

@@ -1,0 +1,65 @@
+---
+caddy_container_name: ircfiber-caddy
+caddy_admin_port: 2019
+caddy_no_new_privileges: true
+# Path on host where the Caddyfile lives (mounted read-only)
+caddy_config_dir: /etc/ircfiber/caddy
+# Additional virtual-host names Caddy should serve in addition to
+# ircfiber_domain. Useful for exposing the web UI on a Tailscale MagicDNS
+# hostname (e.g. "<host>.tail<id>.ts.net") so tailnet members can reach the
+# app without going through the public domain. Override per host in
+# inventories/production/host_vars/<hostname>.yml.
+# When a *.ts.net entry is present, Caddy will obtain a real cert via the
+# built-in Tailscale cert manager (provided caddy_tailscale_socket points
+# at a working tailscaled.sock). No browser cert warning, no manual trust.
+# Example: caddy_extra_serve_hosts: ["ircfiber-prod-1.tail544547.ts.net"]
+caddy_extra_serve_hosts: []  # yamllint disable-line rule:line-length
+# Path on the HOST where tailscaled exposes its local API socket. Caddy
+# uses this to fetch TLS certificates for *.ts.net hostnames via Tailscale's
+# built-in ACME flow. Bind-mounted into the Caddy container at the same
+# path so the caddytls.Tailscale manager can reach it. Set to "" to skip
+# the mount (e.g. on hosts without Tailscale).
+caddy_tailscale_socket: "/var/run/tailscale/tailscaled.sock"
+# Internal port for Cloudflare Tunnel traffic. Caddy listens on this port
+# inside the container (no host port mapping needed). cloudflared on the
+# ircfiber_net connects to ircfiber-caddy:{{ caddy_tunnel_port }}.
+# This port has no auto-HTTPS redirect — Cloudflare terminates TLS at the edge.
+caddy_tunnel_port: 8080
+# Enable a Tailscale-only listener that serves the Grafana dashboard
+# exclusively to tailnet members. Bound to caddy_tailscale_logging_address
+# (the host's Tailscale IP) so it's unreachable from the public internet.
+# Requires the ircfiber-caddy container to be on the ircfiber_logging
+# Docker network (handled by the logging role's post_tasks). Disabled by
+# default to avoid adding an extra listener when logs aren't deployed.
+caddy_tailscale_logging_enabled: false
+# Tailscale IP of the host. Override per host in host_vars/.
+caddy_tailscale_logging_address: "198.51.100.1"
+# Port the Tailscale-only Grafana listener binds to on the Tailscale
+# interface. Default 3443 keeps it distinct from the main Caddy listener
+# on 443 and Tailscale's admin UI on 8443.
+caddy_tailscale_logging_port: 3443
+
+# Tailscale-only SigNoz listener. SigNoz handles its own auth so we
+# don't inject X-WebAuth-User headers.
+caddy_tailscale_signoz_enabled: false
+caddy_tailscale_signoz_port: 3003
+
+# Public SigNoz reverse-proxy mounted on the main Caddy listener.
+# Exposes ircfiber.com/signoz/* (and any extra Tailscale hosts) to the
+# browser with a SIGNOZ-API-KEY header injected. Lets the admin SPA
+# iframe the SigNoz UI at /admin#/logs without asking the user to log
+# in to SigNoz separately. The key file is provisioned by the
+# signoz_mcp role; if it is missing the route is silently skipped on
+# the next caddy run (no startup failure, just no proxy).
+caddy_signoz_route_enabled: true
+# Path on the HOST where the SigNoz service-account API key was
+# written by the signoz_mcp role. Caddy reads it once at render time
+# and passes the value to the caddy container as the SIGNOZ_API_KEY
+# env var (the caddy binary is already started with --environ).
+caddy_signoz_api_key_path: /etc/ircfiber/signoz-mcp/.api_key
+
+# Gateway replica count — must match the value in group_vars/all.yml.
+# The Caddyfile template uses this to render the correct upstream list.
+gateway_replica_count: 1
+gateway_bluegreen_enabled: true
+gateway_replica_sticky: true

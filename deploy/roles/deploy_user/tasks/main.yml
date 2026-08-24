@@ -1,0 +1,210 @@
+---
+- name: Skip if the deploy user already exists AND we are that user
+  ansible.builtin.meta: end_play
+  when:
+    - ansible_user_id == deploy_user_name
+
+- name: Preflight — must be run as root or with sudo
+  ansible.builtin.assert:
+    that:
+      - ansible_user_id == 'root' or ansible_become | bool
+    fail_msg: |
+      The deploy_user role must be run as root (or with become: true).
+      Currently running as {{ ansible_user_id }}. Run the bootstrap playbook
+      with -e ansible_user=root, or as a user that has sudo access.
+
+- name: Check which target groups already exist on this host
+  ansible.builtin.getent:
+    database: group
+    key: "{{ item }}"
+  loop: "{{ deploy_user_groups }}"
+  register: group_existence
+  failed_when: false
+  changed_when: false
+
+- name: Build the list of groups that exist now
+  ansible.builtin.set_fact:
+    existing_groups: >-
+      {{ group_existence.results
+         | selectattr('ansible_facts.getent_group', 'defined')
+         | map(attribute='item')
+         | list }}
+
+- name: Warn about groups that will be added later
+  ansible.builtin.debug:
+    msg: >-
+      These groups don't exist yet and will be skipped at user creation:
+      {{ deploy_user_groups | difference(existing_groups) | default([]) }}.
+      The relevant roles (e.g. 'docker') will add the deploy user to them
+      via append: true.
+
+- name: Create the deploy group (with explicit UID)
+  ansible.builtin.group:
+    name: "{{ deploy_user_name }}"
+    state: present
+    gid: "{{ deploy_user_uid | int }}"
+  when: deploy_user_uid | default('', true) | length > 0
+
+- name: Create the deploy group (default UID)
+  ansible.builtin.group:
+    name: "{{ deploy_user_name }}"
+    state: present
+  when: deploy_user_uid | default('', true) | length == 0
+
+- name: Create the deploy user (with explicit UID)
+  ansible.builtin.user:
+    name: "{{ deploy_user_name }}"
+    uid: "{{ deploy_user_uid | int }}"
+    group: "{{ deploy_user_name }}"
+    groups: "{{ existing_groups | difference([deploy_user_name]) }}"
+    append: true
+    shell: "{{ deploy_user_shell }}"
+    home: "{{ deploy_user_home }}"
+    create_home: true
+    password: "!"
+    state: present
+  when: deploy_user_uid | default('', true) | length > 0
+
+- name: Create the deploy user (default UID)
+  ansible.builtin.user:
+    name: "{{ deploy_user_name }}"
+    group: "{{ deploy_user_name }}"
+    groups: "{{ existing_groups | difference([deploy_user_name]) }}"
+    append: true
+    shell: "{{ deploy_user_shell }}"
+    home: "{{ deploy_user_home }}"
+    create_home: true
+    password: "!"
+    state: present
+  when: deploy_user_uid | default('', true) | length == 0
+
+- name: Create .ssh directory for deploy user
+  ansible.builtin.file:
+    path: "{{ deploy_user_home }}/.ssh"
+    state: directory
+    owner: "{{ deploy_user_name }}"
+    group: "{{ deploy_user_name }}"
+    mode: "0700"
+
+- name: Install passwordless sudoers drop-in
+  when: deploy_user_passwordless | bool
+  block:
+    - name: Ensure /etc/sudoers.d exists
+      ansible.builtin.file:
+        path: /etc/sudoers.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Drop sudoers file for deploy user
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ deploy_user_name }}"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -c -f %s"
+        content: |
+          # Managed by Ansible — {{ deploy_user_name }} passwordless sudo
+          {{ deploy_user_name }} ALL=(ALL) NOPASSWD: ALL
+- name: Collect authorized keys from various sources
+  ansible.builtin.set_fact:
+    resolved_authorized_keys: >-
+      {{ deploy_user_authorized_keys
+         | default([])
+         + ([deploy_user_ssh_public_key] if (deploy_user_ssh_public_key | default('')) | length > 0 else [])
+      }}
+
+- name: Try to slurp keys from /root/.ssh/authorized_keys as a fallback
+  ansible.builtin.slurp:
+    src: /root/.ssh/authorized_keys
+  register: root_keys_raw
+  failed_when: false
+  changed_when: false
+  when:
+    - resolved_authorized_keys | length == 0
+    - (deploy_user_ssh_public_key_file | default('')) | length == 0
+
+- name: Parse /root/.ssh/authorized_keys when used as source
+  ansible.builtin.set_fact:
+    resolved_authorized_keys: >-
+      {{ (root_keys_raw.content | b64decode).split('\n')
+         | map('trim')
+         | reject('equalto', '')
+         | reject('match', '^#')
+         | list }}
+  when:
+    - resolved_authorized_keys | length == 0
+    - root_keys_raw is defined
+    - root_keys_raw.content is defined
+
+- name: Try deploy_user_ssh_public_key_file when set
+  ansible.builtin.slurp:
+    src: "{{ deploy_user_ssh_public_key_file }}"
+  register: explicit_key_file
+  failed_when: false
+  changed_when: false
+  when:
+    - resolved_authorized_keys | length == 0
+    - (deploy_user_ssh_public_key_file | default('')) | length > 0
+
+- name: Use deploy_user_ssh_public_key_file contents
+  ansible.builtin.set_fact:
+    resolved_authorized_keys: >-
+      {{ (explicit_key_file.content | b64decode).split('\n')
+         | map('trim')
+         | reject('equalto', '')
+         | reject('match', '^#')
+         | list }}
+  when:
+    - resolved_authorized_keys | length == 0
+    - explicit_key_file is defined
+    - explicit_key_file.content is defined
+
+- name: Fail if no SSH keys were found
+  ansible.builtin.fail:
+    msg: |
+      No SSH public keys found for the deploy user. Set one of:
+        - deploy_user_ssh_public_key: "ssh-rsa AAAA..."
+        - deploy_user_ssh_public_key_file: /path/to/key.pub
+        - deploy_user_authorized_keys: ["ssh-rsa AAAA..."]
+      or run as root with at least one key in /root/.ssh/authorized_keys.
+  when: resolved_authorized_keys | length == 0
+
+- name: Write authorized_keys for deploy user
+  ansible.builtin.copy:
+    dest: "{{ deploy_user_home }}/.ssh/authorized_keys"
+    owner: "{{ deploy_user_name }}"
+    group: "{{ deploy_user_name }}"
+    mode: "0600"
+    content: "{{ resolved_authorized_keys | join('\n') }}\n"
+
+- name: Lock the deploy user account (no password auth)
+  ansible.builtin.command: passwd -l {{ deploy_user_name }}
+  changed_when: false
+  when: deploy_user_lock_password | bool
+
+- name: Disable root password (extra hardening)
+  when: deploy_user_disable_root_password | bool
+  block:
+    - name: Lock root password
+      ansible.builtin.command: passwd -l root
+      changed_when: false
+
+    - name: Disable root SSH login via sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PermitRootLogin"
+        line: "PermitRootLogin no"
+        state: present
+        validate: "sshd -t -f %s"
+      notify: Restart sshd
+
+- name: Show summary
+  ansible.builtin.debug:
+    msg: |
+      deploy user '{{ deploy_user_name }}' provisioned.
+      SSH keys installed: {{ resolved_authorized_keys | length }}
+      Passwordless sudo: {{ deploy_user_passwordless }}
+      Groups: {{ deploy_user_groups | join(', ') }}
+      Next: set ansible_user={{ deploy_user_name }} in your inventory.

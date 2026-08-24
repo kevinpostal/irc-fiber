@@ -1,0 +1,73 @@
+---
+- name: Install conntrack sysctl file
+  ansible.builtin.template:
+    src: 99-ircfiber-conntrack.conf.j2
+    dest: /etc/sysctl.d/99-ircfiber-conntrack.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sysctl
+
+- name: Apply sysctl immediately (max/buckets/timeouts)
+  ansible.builtin.command: sysctl -w {{ item.key }}={{ item.value }}
+  loop:
+    - { key: "net.netfilter.nf_conntrack_max", value: "{{ conntrack_max }}" }
+    - { key: "net.netfilter.nf_conntrack_buckets", value: "{{ conntrack_buckets }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_close", value: "{{ conntrack_tcp_timeouts.close }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_close_wait", value: "{{ conntrack_tcp_timeouts.close_wait }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_established", value: "{{ conntrack_tcp_timeouts.established }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_fin_wait", value: "{{ conntrack_tcp_timeouts.fin_wait }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_last_ack", value: "{{ conntrack_tcp_timeouts.last_ack }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_max_retrans", value: "{{ conntrack_tcp_timeouts.max_retrans }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_syn_recv", value: "{{ conntrack_tcp_timeouts.syn_recv }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_syn_sent", value: "{{ conntrack_tcp_timeouts.syn_sent }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_time_wait", value: "{{ conntrack_tcp_timeouts.time_wait }}" }
+    - { key: "net.netfilter.nf_conntrack_tcp_timeout_unacknowledged", value: "{{ conntrack_tcp_timeouts.unacknowledged }}" }
+  changed_when: true
+
+- name: Set nf_conntrack hashsize (runtime)
+  ansible.builtin.shell: "echo {{ conntrack_hashsize }} > /sys/module/nf_conntrack/parameters/hashsize"
+  changed_when: true
+  failed_when: false
+
+- name: Persist hashsize via systemd service (survives reboot)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ircfiber-conntrack-hashsize.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=IRC Fiber — set nf_conntrack hashsize to {{ conntrack_hashsize }}
+      DefaultDependencies=no
+      Before=network-pre.target
+      Wants=network-pre.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/sh -c 'echo {{ conntrack_hashsize }} > /sys/module/nf_conntrack/parameters/hashsize'
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable hashsize service
+  ansible.builtin.systemd:
+    name: ircfiber-conntrack-hashsize.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Verify conntrack tuning
+  ansible.builtin.shell: |
+    set -e
+    echo "max=$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+    echo "buckets=$(cat /proc/sys/net/netfilter/nf_conntrack_buckets 2>/dev/null || sysctl -n net.netfilter.nf_conntrack_buckets)"
+    echo "hashsize=$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo unknown)"
+    sysctl -a 2>/dev/null | grep nf_conntrack_tcp_timeout || true
+  register: conntrack_verify
+  changed_when: false
+
+- name: Show conntrack verify
+  ansible.builtin.debug:
+    var: conntrack_verify.stdout_lines

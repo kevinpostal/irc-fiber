@@ -1,0 +1,21 @@
+---
+engine_container_name: "ircfiber-engine-{{ ircfiber_engine_id }}"
+engine_no_new_privileges: true
+engine_ulimits:
+  nofile:
+    soft: 65536
+    hard: 65536
+engine_healthcheck_interval: 30s
+engine_healthcheck_timeout: 5s
+engine_healthcheck_retries: 3
+engine_healthcheck_start_period: 10s
+# Mullvad sidecars — 2 on 1 VPS, scalable to 5 via extra entries.
+# Each entry: { name: "se", exit_node: "se-sto-wg-101.mullvad.ts.net", port: 1055 }
+# The engine's IRCFIBER_MULLVAD_POOL is derived as socks5://tailscale-mullvad-<name>:<port>
+mullvad_sidecars: []
+# Example (2 sidecars):
+# mullvad_sidecars:
+#   - { name: "se", exit_node: "se-sto-wg-101.mullvad.ts.net" }
+#   - { name: "us", exit_node: "us-nyc-wg-001.mullvad.ts.net" }
+mullvad_sidecar_image: "tailscale/tailscale:stable"
+mullvad_sidecar_socks_port: 1055

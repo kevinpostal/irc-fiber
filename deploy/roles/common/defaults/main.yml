@@ -1,0 +1,23 @@
+---
+# Default variables for the common role.
+common_apt_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - apt-transport-https
+  - software-properties-common
+  - htop
+  - jq
+  - git
+  - chrony
+  - rsync
+  - ufw
+  - python3-pip
+  - python3-venv
+
+common_apt_packages_optional:
+  - vim
+  - tmux
+  - netcat-openbsd
+
+common_timezone: "UTC"

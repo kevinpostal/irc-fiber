@@ -1,0 +1,45 @@
+---
+# Manage Cloudflare DNS records for the public-facing domain(s) that
+# should resolve to this stack.
+#
+# First-time setup:
+#   1. Rotate the API token at https://dash.cloudflare.com/profile/api-tokens
+#      (create a scoped token with Zone:DNS:Edit on the target zone).
+#   2. Put the token + account ID into the encrypted vault:
+#        ansible-vault edit inventories/production/group_vars/vault.yml
+#   3. Set cloudflare_zone in group_vars/all.yml (or host_vars).
+#   4. Set cloudflare_target_ip in host_vars/<hostname>.yml.
+#   5. Make sure the zone's nameservers are delegated to Cloudflare
+#      (otherwise records created here won't resolve publicly).
+#   6. Run:
+#        ansible-playbook playbooks/cloudflare.yml
+
+- name: Preflight — ensure vault variables are defined
+  hosts: ircfiber
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+    - name: Verify Cloudflare vault variables are present
+      ansible.builtin.assert:
+        that:
+          - vault_cloudflare_api_token is defined
+          - vault_cloudflare_api_token | length > 0
+          - vault_cloudflare_api_token != "REPLACE-WITH-CF-API-TOKEN"
+          - vault_cloudflare_account_id is defined
+          - vault_cloudflare_account_id | length > 0
+          - vault_cloudflare_account_id != "REPLACE-WITH-CF-ACCOUNT-ID"
+        fail_msg: |
+          vault_cloudflare_api_token / vault_cloudflare_account_id are
+          missing or still placeholders. Run:
+            ansible-vault edit inventories/production/group_vars/vault.yml
+          and fill them in.
+
+- name: Manage Cloudflare DNS records pointing at the backend host(s)
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: cloudflare

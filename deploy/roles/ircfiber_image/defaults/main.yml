@@ -1,0 +1,6 @@
+---
+# Image names are defined in group_vars/all.yml so they are visible to all roles.
+# These defaults are used by the ircfiber_image role to build both the gateway
+# (D) and engine (Zig) images.
+ircfiber_build_pull: true
+ircfiber_force_rebuild: false

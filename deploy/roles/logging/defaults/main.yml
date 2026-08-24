@@ -1,0 +1,76 @@
+---
+# Grafana admin password — required on first boot. Override in host_vars.
+grafana_admin_password: "{{ vault_grafana_admin_password | default('CHANGE_ME_GRAPHANA_PASSWORD') }}"
+
+# Where Grafana serves. Internal container port is 3000; Caddy proxies
+# /grafana/* to it on the public domain.
+grafana_container_name: ircfiber-grafana
+grafana_image: "grafana/grafana:11.3.0"
+grafana_data_volume: ircfiber_grafana_data
+grafana_provisioning_volume: ircfiber_grafana_provisioning
+grafana_dashboards_volume: ircfiber_grafana_dashboards
+grafana_alerting_volume: ircfiber_grafana_alerting
+grafana_plugins_volume: ircfiber_grafana_plugins
+# Subpath on the public domain, e.g. https://ircfiber.com/grafana
+# Must NOT clash with /api, /ws, /admin, /health, or the SPA assets.
+grafana_public_path: /grafana
+# Root URL for Grafana (full URL — required for proper redirect handling).
+grafana_root_url: "https://{{ ircfiber_domain | default('ircfiber.com') }}{{ grafana_public_path }}/"
+# Session lifetime, days
+grafana_session_lifetime_days: 7
+# Disable user signup — admin-only access.
+grafana_disable_signup: true
+# Auto-login via Caddy reverse-proxy basic auth header — see caddy
+# templates for the matching header injection. When true, Grafana trusts
+# the X-WEBAUTH-USER header from the reverse proxy.
+grafana_auth_proxy_enabled: true
+
+# SigNoz combined image
+signoz_version: "v0.131.1"
+signoz_image: "signoz/signoz:{{ signoz_version }}"
+signoz_container_name: ircfiber-signoz
+signoz_data_volume: ircfiber_signoz_data
+# SigNoz ingester — signoz-otel-collector with bundled ClickHouse exporter
+signoz_ingester_version: "v0.144.5"
+signoz_ingester_image: "signoz/signoz-otel-collector:{{ signoz_ingester_version }}"
+# ClickHouse
+signoz_clickhouse_version: "25.8"
+signoz_clickhouse_image: "clickhouse/clickhouse-server:{{ signoz_clickhouse_version }}"
+
+# Fluent Bit — Docker log shipper for SigNoz.
+fluent_bit_version: "3.2"
+fluent_bit_container_name: ircfiber-fluent-bit
+# Host directory for Fluent Bit config (rendered from fluent-bit.conf.j2).
+fluent_bit_config_dir: /etc/ircfiber/fluent-bit
+fluent_bit_log_level: info
+fluent_bit_memory_limit: 128m
+fluent_bit_cpu_limit: 0.5
+# OTLP output target (internal service name on ircfiber_logging network).
+fluent_bit_otlp_host: signoz-ingester
+fluent_bit_otlp_port: 4318
+fluent_bit_flush: 1
+fluent_bit_mem_buf_limit: 50MB
+fluent_bit_refresh_interval: 5
+
+# SigNoz Grafana API key — provisioned by signoz_mcp role.
+# Override in host_vars or vault. Empty = datasource non-functional
+# until signoz_mcp role is run.
+signoz_grafana_api_key: ""
+
+# Healthcheck endpoints (for internal monitoring)
+logging_healthcheck_interval: 30
+
+# SigNoz alert deployment (gated — set deploy_signoz_alerts: true to enable).
+# API key can come from a vault file or be set directly via signoz_api_key.
+deploy_signoz_alerts: false
+signoz_api_url: "http://signoz:8080"
+signoz_api_key: ""  # Override via vault or env
+signoz_api_key_file: "/etc/ircfiber/signoz-mcp/.api_key"
+
+# JWT secret used to sign SigNoz session tokens. SigNoz v0.131+ refuses
+# to start serving authenticated queries without this and logs a
+# CRITICAL SECURITY ISSUE warning on every boot. Override in host_vars
+# or vault. The default below is a stable per-deployment fallback so
+# the service stays up across reboots without operator intervention;
+# production deployments should override it.
+signoz_jwt_secret: "{{ vault_signoz_jwt_secret | default('ircfiber-signoz-dev-jwt-secret-change-in-prod-9e3a7f2b') }}"

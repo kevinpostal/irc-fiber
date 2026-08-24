@@ -1,0 +1,12 @@
+---
+# Records to manage per host, derived from cloudflare_record_prefixes by
+# default. Override per host if you want a different set (e.g. drop "www"
+# or add an additional subdomain like "irc.ircfiber.com").
+# Each entry becomes one A record pointing at cloudflare_target_ip:
+#   name "@"  → "<zone>"           (apex)
+#   name "www" → "www.<zone>"
+cloudflare_records_default:
+  - name: "@"
+    type: A
+  - name: "www"
+    type: A

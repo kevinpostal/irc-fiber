@@ -1,0 +1,486 @@
+{
+  "context_envelope": {
+    "meta": {
+      "plan_id": "20260701-signoz-unified-observability-and-local-docker",
+      "created_at": "2026-07-01T12:15:00Z",
+      "last_updated": "2026-07-01T18:30:00Z",
+      "version": 2
+    },
+    "tech_stack": [
+      {
+        "name": "SigNoz Foundry (multi-container)",
+        "version": "0.130+",
+        "usage_context": "Four+ containers: signoz-query-service (REST API + alert evaluation on :8080), signoz-ingester (OTLP HTTP :4318 + gRPC :4317), signoz-clickhouse (storage, :9000 native, :8123 HTTP), signoz-signoz (frontend+alertmanager :3301 host-map, UI). Combined image NOT used — brittle on ARM64 and hides component health.",
+        "config_files": ["deploy/roles/logging/templates/docker-compose.logging.yml.j2", "deploy/local/docker-compose.yml"]
+      },
+      {
+        "name": "Fluent Bit",
+        "version": ">= 2.2.0",
+        "usage_context": "Docker container log shipper; tails /var/lib/docker/containers/*/*-json.log with docker parser, JSON field extraction (event/level/network/nick/channel), recursion guard (exclude Fluent Bit's own logs), OTLP HTTP output to signoz-ingester:4318.",
+        "config_files": ["deploy/roles/logging/templates/fluent-bit.conf.j2"]
+      },
+      {
+        "name": "Bridge otel-collector (signoz_bridge)",
+        "version": "otel/opentelemetry-collector-contrib:0.119.0",
+        "usage_context": "Network-crossing OTLP proxy. Runs on BOTH ircfiber_net and ircfiber_logging. Receives OTLP traces+metrics from engine/gateway/holder on :4317/:4318. Hostmetrics + docker_stats receivers stay. filelog/containers receiver REMOVED (now Fluent Bit's job). filelog/caddy stays. Exports to signoz-ingester:4317 gRPC. Not used in local dev (engine pushes directly to signoz-ingester).",
+        "config_files": ["deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2"]
+      },
+      {
+        "name": "Grafana",
+        "version": "11.3.0",
+        "usage_context": "Cross-source dashboards; sole datasource changed to SigNoz query-service. Prod URL: http://signoz-signoz:8080 (internal Docker). Local URL: http://signoz:3301 (host-mapped). Port 8080 IS THE QUERY-SERVICE API, NOT ClickHouse.",
+        "config_files": ["deploy/roles/logging/templates/grafana-datasources.yml.j2"]
+      },
+      {
+        "name": "D (LDC) — IRC Fiber engine/gateway",
+        "version": "LDC 1.41.0",
+        "usage_context": "OTel tracing (tracing.d) and metrics (observability.d) push OTLP HTTP to bridge collector on :4318/v1/traces and :4318/v1/metrics. In production, bridge proxies to signoz-ingester. In local dev, engine pushes directly to signoz-ingester:4318.",
+        "config_files": ["source/app.d", "source/app_engine.d", "source/ircfiber/tracing.d", "source/ircfiber/observability.d", "source/ircfiber/logging.d"]
+      },
+      {
+        "name": "Ansible",
+        "version": "2.x",
+        "usage_context": "Logging role deploys Fluent Bit + SigNoz Foundry + Grafana; signoz_bridge role deploys network-crossing collector; caddy role manages /grafana/* and /signoz/* routes.",
+        "config_files": ["deploy/roles/logging/", "deploy/playbooks/logging.yml", "deploy/roles/signoz_bridge/"]
+      },
+      {
+        "name": "Docker Compose",
+        "version": "v2",
+        "usage_context": "Local dev environment (deploy/local/docker-compose.yml) and test CI (docker-compose.test.yml). Local compose uses Foundry multi-container stack.",
+        "config_files": ["deploy/local/docker-compose.yml", "docker-compose.test.yml"]
+      },
+      {
+        "name": "Caddy v2",
+        "version": "2.x",
+        "usage_context": "Reverse proxy for /grafana/* (Grafana) and /signoz/* + /api/v[1-5]/* (SigNoz); SIGNOZ-API-KEY injection via header_up. No Loki/Tempo routes remain after cleanup.",
+        "config_files": ["deploy/roles/caddy/templates/Caddyfile.j2"]
+      }
+    ],
+    "conventions": [
+      "Two OTLP flows: (1) Engine traces+metrics via bridge otel-collector to signoz-ingester, (2) Container logs via Fluent Bit direct to signoz-ingester. Components never share a single OTLP hop.",
+      "Obs stack runs on ircfiber_logging Docker bridge. Bridge also attaches to ircfiber_net for cross-network OTLP proxy.",
+      "Grafana restricted to internal network — exposed ONLY via Caddy /grafana/* proxy.",
+      "SigNoz Foundry multi-container: separate query-service, ingester, clickhouse, frontend, alertmanager. Combined image NOT used.",
+      "SigNoz query-service API port is 8080 (internal Docker). Port 3301 is the host-mapped port. NEVER refer to 8080 as ClickHouse.",
+      "Fluent Bit OTLP output to signoz-ingester:4318 (direct, NOT via bridge). Docker socket mount for container log reading.",
+      "Fluent Bit JSON field extraction: engine log body parsed for event, level, network, nick, channel — preserved as OTLP log record attributes.",
+      "Fluent Bit recursion guard: Exclude_Path pattern to avoid reading Fluent Bit's own container logs.",
+      "No Kubernetes filter on Fluent Bit or bridge (bare Docker on VMs).",
+      "All services use restart: unless-stopped in production compose.",
+      "Ansible-managed templates with {{ ansible_managed }} header.",
+      "Named volumes for persistent data (ClickHouse, Redis, Mongo)."
+    ],
+    "constraints": {
+      "hard": [
+        "Fluent Bit config must NOT produce infinite read-loop (recursion guard required: exclude Fluent Bit's own container logs).",
+        "Engine/gateway OTel endpoint in production resolves to bridge (ircfiber-otel-collector:4318). In local dev, resolves directly to signoz-ingester:4318.",
+        "Grafana datasource URL MUST target query-service API on port 8080 (internal Docker). Port 8080 is query-service, NOT ClickHouse.",
+        "Grafana datasource URL MUST use port 3301 only when accessed from host (local dev). Internal Docker URLs use port 8080.",
+        "Local Docker Compose uses Foundry multi-container stack. Combined signoz/signoz image is NOT used (ARM64 emulation overhead with ClickHouse bundling).",
+        "Old deploy/roles/signoz/ (ClickHouse config role) and deploy/test/signoz-config/ must be removed — superseded by Foundry.",
+        "Bridge otel-collector must have filelog/containers receiver stripped — Fluent Bit is the sole container-log shipper.",
+        "14 Loki alert rules must have SigNoz equivalents active before Loki removal (no monitoring gap).",
+        "ASCII-only in all config templates — no curly quotes, em-dashes, or Unicode lookalikes."
+      ],
+      "soft": [
+        "Prefer SigNoz alert rules via REST API over provisioning YAML imports (simpler CI).",
+        "Prefer Fluent Bit OTLP output over Fluentd (lighter footprint, native OTLP).",
+        "Grafana dashboards that query Loki/Tempo/Prometheus will show no data after switch — manual migration is out of scope."
+      ],
+      "compatibility": [
+        "SigNoz Foundry images support multi-arch (linux/amd64, linux/arm64) for most components. signoz-clickhouse may need explicit platform override on ARM64.",
+        "Fluent Bit latest official image (>= 2.2.0) includes OTLP output plugin.",
+        "Engine/gateway D code connects to collector via HTTP/1.1 OTLP (no gRPC).",
+        "Local compose must work on both ARM64 (Apple Silicon) and x86_64 (Linux CI).",
+        "Bridge otel-collector (otel/opentelemetry-collector-contrib:0.119.0) supports both gRPC and HTTP OTLP."
+      ],
+      "security_requirements": [
+        "SIGNOZ-API-KEY is server-side only — Caddy injects via header_up; never in Fluent Bit config or browser-side code.",
+        "Fluent Bit tail input runs read-only (ro) on /var/lib/docker/containers — no write access.",
+        "Grafana auth proxy enabled (trusts X-WebAuth-User from Caddy) — no exposed Grafana host port.",
+        "Local compose SigNoz UI is localhost-only (no public exposure safeguard).",
+        "Old stack config dirs (loki, promtail, tempo, otelcol, prometheus) must be fully erased.",
+        "Old signoz role (ClickHouse config) and test dir must be fully removed."
+      ]
+    },
+    "architecture_snapshot": {
+      "key_dirs": [
+        "deploy/roles/logging/",
+        "deploy/roles/logging/templates/",
+        "deploy/roles/logging/files/",
+        "deploy/roles/logging/files/dashboards/",
+        "deploy/roles/signoz_bridge/",
+        "deploy/roles/caddy/templates/",
+        "deploy/local/",
+        "tests/local-dev/",
+        "source/ircfiber/"
+      ],
+      "patterns": [
+        "Dual OTLP pipeline: traces+metrics via bridge, logs via Fluent Bit (separate OTLP hops to same signoz-ingester).",
+        "Foundry multi-container: SigNoz broken into 5+ specialized containers with independent healthchecks and resource limits.",
+        "Ansible-managed docker-compose stacks: logging role renders templates and deploys via community.docker.docker_compose_v2.",
+        "Grafana as cross-vendor UI: sole datasource is SigNoz query-service on port 8080 (internal).",
+        "Fluent Bit as lightweight log shipper + JSON field extractor: replaces Promtail AND the bridge's filelog/containers receiver.",
+        "Local dev mirror: deploy/local/ uses Foundry multi-container stack, same as production."
+      ],
+      "key_components": [
+        {
+          "name": "Fluent Bit log shipper",
+          "location": "deploy/roles/logging/templates/fluent-bit.conf.j2 (production); deploy/local/docker-compose.yml (local dev)",
+          "responsibility": ["Tail Docker JSON log files with recursion guard", "JSON field extraction: event/level/network/nick/channel from engine logs", "Forward via OTLP HTTP to signoz-ingester on port 4318"]
+        },
+        {
+          "name": "Bridge otel-collector (signoz_bridge)",
+          "location": "deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2",
+          "responsibility": ["OTLP trace+metric intake from engine/gateway/holder on :4317/:4318", "hostmetrics + docker_stats collection", "filelog/caddy (Caddy access log ingestion)", "Proxy to signoz-ingester:4317 gRPC", "filelog/containers receiver REMOVED (now Fluent Bit's job)"]
+        },
+        {
+          "name": "SigNoz Foundry",
+          "location": "Docker services in compose files: signoz-query-service, signoz-ingester, signoz-clickhouse, signoz-signoz, signoz-alertmanager",
+          "responsibility": ["OTLP ingest (traces+logs+metrics) on signoz-ingester port 4318", "Trace/Log/Metric storage in signoz-clickhouse", "Query API on signoz-query-service port 8080 (internal)", "Alert evaluation (replaces Loki ruler)", "Web UI at signoz-signoz on port 3301 (host-mapped)"]
+        },
+        {
+          "name": "Grafana (SigNoz datasource)",
+          "location": "deploy/roles/logging/templates/grafana-datasources.yml.j2",
+          "responsibility": ["Query SigNoz for cross-source dashboards", "Prod URL: http://signoz-signoz:8080 (query-service API)", "Local URL: http://signoz:3301 (host-mapped)"]
+        },
+        {
+          "name": "IRC Fiber engine OTel pipeline",
+          "location": "source/ircfiber/tracing.d and source/ircfiber/observability.d",
+          "responsibility": ["Push OTLP traces to collector at /v1/traces", "Push OTLP metrics to collector at /v1/metrics", "Production: bridge at ircfiber-otel-collector:4318", "Local dev: signoz-ingester:4318 (direct, no bridge)", "Structured JSON logs with traceId/spanId for correlation"]
+        },
+        {
+          "name": "SigNoz alerting rules (migrated from Loki)",
+          "location": "deploy/roles/logging/signoz-alerts.yml.j2",
+          "responsibility": ["Replace 14 Loki LogQL alert rules with SigNoz LOGS_BASED_ALERT rules", "Filter on attribute.event = <event_name> instead of Loki's event= label selector"]
+        },
+        {
+          "name": "Local dev stack",
+          "location": "deploy/local/docker-compose.yml",
+          "responsibility": ["One-command bring-up of Foundry multi-container SigNoz + IRC services", "End-to-end development and testing environment", "Smoke script at tests/local-dev/smoke-observability.sh"]
+        }
+      ]
+    },
+    "research_digest": {
+      "relevant_files": [
+        {
+          "path": "deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2",
+          "purpose": ["Bridge otel-collector config — filelog/containers receiver (lines 136-156) to be removed", "OTLP receiver on :4317/:4318 for engine traces+metrics stays", "filelog/caddy receiver for Caddy access logs stays"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/signoz_bridge/defaults/main.yml",
+          "purpose": ["Bridge image, mem, CPU, network attachment config — no changes needed"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/signoz_bridge/tasks/main.yml",
+          "purpose": ["Bridge deployment tasks — no changes needed (filelog removal is config-only)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/logging/templates/docker-compose.logging.yml.j2",
+          "purpose": ["Current production logging compose (now being replaced with Foundry + Fluent Bit + Grafana)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/logging/templates/promtail-config.yml.j2",
+          "purpose": ["Current production Promtail config — will be replaced by Fluent Bit"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/logging/templates/loki-rules.yml.j2",
+          "purpose": ["14 Loki alert rules to migrate to SigNoz"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/logging/templates/grafana-datasources.yml.j2",
+          "purpose": ["Current Grafana datasources — will replace with SigNoz (query-service:8080)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/logging/files/otelcol-config.yaml",
+          "purpose": ["Old stand-alone otel-collector config — will be removed"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/logging/files/tempo-config.yaml",
+          "purpose": ["Old Tempo config — will be removed"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/logging/files/prometheus.yml",
+          "purpose": ["Old Prometheus config — will be removed"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/logging/defaults/main.yml",
+          "purpose": ["Default vars — will be stripped to Foundry + Fluent Bit + Grafana only"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/logging/tasks/main.yml",
+          "purpose": ["Ansible tasks — will be rewritten"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/signoz/",
+          "purpose": ["OLD ClickHouse config role (keeper, ingester, query-service files) — entire dir to be removed"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/test/signoz-config/",
+          "purpose": ["OLD ClickHouse config regression tests — entire dir to be removed"],
+          "confidence": 1.0
+        },
+        {
+          "path": "source/ircfiber/tracing.d",
+          "purpose": ["OTLP trace exporter — pushes to http://ircfiber-otel-collector:4318/v1/traces in production"],
+          "confidence": 1.0
+        },
+        {
+          "path": "source/ircfiber/observability.d",
+          "purpose": ["OTLP metrics pipeline — pushes to http://ircfiber-otel-collector:4318/v1/metrics"],
+          "confidence": 1.0
+        },
+        {
+          "path": "source/ircfiber/logging.d",
+          "purpose": ["Structured JSON logging with traceId/spanId; emitted to stderr, picked up by Fluent Bit"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/caddy/templates/Caddyfile.j2",
+          "purpose": ["Caddy proxy config — contains Loki routes to be removed"],
+          "confidence": 1.0
+        },
+        {
+          "path": "docker-compose.test.yml",
+          "purpose": ["CI test compose — will get Fluent Bit service added"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/vite.config.ts",
+          "purpose": ["Dev proxy — SIGNOZ_URL default changes from 8080 to 3301 (host-mapped query-service port)"],
+          "confidence": 1.0
+        }
+      ],
+      "patterns_found": [
+        {
+          "name": "Dual OTLP pipeline pattern",
+          "category": "architecture",
+          "confidence": 1.0,
+          "example_location": ["source/ircfiber/tracing.d:exporters to bridge at /v1/traces", "deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2: receiver->exporter chain"]
+        },
+        {
+          "name": "Ansible-managed docker-compose stacks",
+          "category": "deployment",
+          "confidence": 1.0,
+          "example_location": ["deploy/roles/logging/tasks/main.yml", "deploy/roles/signoz_bridge/tasks/main.yml"]
+        },
+        {
+          "name": "Fluent Bit JSON field extraction for OTLP attributes",
+          "category": "configuration",
+          "confidence": 1.0,
+          "example_location": ["deploy/roles/logging/templates/fluent-bit.conf.j2 (created by this plan)"]
+        },
+        {
+          "name": "SigNoz Foundry multi-container stack",
+          "category": "architecture",
+          "confidence": 1.0,
+          "example_location": ["deploy/local/docker-compose.yml (created by this plan)"]
+        },
+        {
+          "name": "Structured JSON logging with trace correlation",
+          "category": "observability",
+          "confidence": 1.0,
+          "example_location": ["source/ircfiber/logging.d:105-121"]
+        },
+        {
+          "name": "Loki LogQL alert -> SigNoz LOGS_BASED_ALERT attribute.event filter",
+          "category": "migration",
+          "confidence": 1.0,
+          "example_location": ["deploy/roles/logging/signoz-alerts.yml.j2 (created by w2-t3)"]
+        }
+      ],
+      "gotchas": [
+        {
+          "text": "CRITICAL: Port 8080 on SigNoz query-service is the REST API, NOT ClickHouse. ClickHouse native protocol is port 9000; HTTP is 8123. Every previous reference calling 8080 'ClickHouse port' is WRONG and must be corrected.",
+          "confidence": 1.0
+        },
+        {
+          "text": "The signoz/signoz combined image bundles ClickHouse inside the same container as the collector/query-service/frontend. This is brittle on ARM64 (ClickHouse via Rosetta 2 emulation adds ~2GB memory overhead and is crash-prone). Use Foundry multi-container stack instead.",
+          "confidence": 1.0
+        },
+        {
+          "text": "Bridge otel-collector currently has `filelog/containers` receiver (line 136) that tails ALL Docker container logs. Fluent Bit will duplicate these logs if the bridge receiver is not removed. Strip filelog/containers BEFORE or simultaneously with Fluent Bit deployment.",
+          "confidence": 1.0
+        },
+        {
+          "text": "Fluent Bit OTLP output requires Fluent Bit >= 2.1.0 built with --enable-opentelemetry. The official fluent/fluent-bit:latest image supports it as of v2.2+.",
+          "confidence": 1.0
+        },
+        {
+          "text": "Fluent Bit must exclude its own container logs (recursion guard). Without Exclude_Path, Fluent Bit reads its own output log files and re-ingests them, creating an infinite read-loop.",
+          "confidence": 1.0
+        },
+        {
+          "text": "Engine OTel endpoint string 'http://ircfiber-otel-collector:4318' resolves to the bridge collector (which stays). In local dev, engines push directly to 'signoz-ingester:4318'. These are different endpoints — do NOT confuse.",
+          "confidence": 1.0
+        },
+        {
+          "text": "The old deploy/roles/signoz/ role contains ClickHouse configs (keeper, ingester, query-service Prometheus config). This is SEPARATE from deploy/roles/signoz_bridge/ (OTel bridge). Only the former is removed.",
+          "confidence": 1.0
+        },
+        {
+          "text": "Loki alert rules use LogQL count_over_time on structured event labels. SigNoz equivalent uses attribute.event = filter with threshold matchType. 1:1 translation is possible but evaluation frequency and window semantics differ slightly.",
+          "confidence": 0.9
+        },
+        {
+          "text": "Grafana dashboards that query Loki/Tempo/Prometheus datasources will stop working after switch. Dashboards NOT migrated in this plan — manual rewrite required to query SigNoz.",
+          "confidence": 1.0
+        },
+        {
+          "text": "Local Docker Compose with Foundry requires 8GB+ RAM host (ClickHouse ~4GB, query-service ~512MB, ingester ~256MB, IRC stack ~1GB, frontend/alertmanager ~256MB). On ARM64, signoz-clickhouse may need platform: linux/amd64 if native ARM images are unavailable.",
+          "confidence": 1.0
+        }
+      ]
+    },
+    "prior_decisions": [
+      {
+        "decision": "Use Foundry multi-container stack (NOT signoz/signoz combined image) for both local and production",
+        "rationale": [
+          "Combined image bundles ClickHouse in same container — brittle on ARM64 (Rosetta 2 emulation, crash-prone).",
+          "Foundry gives per-service healthchecks, resource limits, and independent restart capability.",
+          "Production already uses Foundry-style named services (signoz-query-service, signoz-ingester, signoz-clickhouse).",
+          "Foundry images are actively maintained and published for both amd64 and (mostly) arm64."
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Retain bridge otel-collector (signoz_bridge) but strip filelog/containers receiver",
+        "rationale": [
+          "Bridge provides network-crossing OTLP proxy between ircfiber_net (engine/gateway) and ircfiber_logging (SigNoz).",
+          "D services cannot directly reach signoz-ingester from ircfiber_net without the bridge's dual-network attachment.",
+          "filelog/containers becomes redundant with Fluent Bit — Fluent Bit is the sole container-log shipper.",
+          "Bridge keeps: OTLP receiver, hostmetrics, docker_stats, filelog/caddy, all processors."
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Retain Grafana but switch datasource from Loki/Tempo/Prometheus to SigNoz query-service on port 8080",
+        "rationale": [
+          "Port 8080 is the query-service HTTP API port (NOT ClickHouse). This was previously confused.",
+          "Grafana provides cross-source dashboards that the admin SPA's native SigNoz panel cannot render.",
+          "SigNoz 0.130+ query-service exposes a REST API on port 8080 that Grafana can query.",
+          "Grafana datasource URL differs by environment: signoz-signoz:8080 (prod Docker), signoz:3301 (local host)."
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Remove Tempo + Prometheus (user already decided — no design gate needed)",
+        "rationale": [
+          "SigNoz stores traces natively (not just Tempo's trace_id index — full span data in ClickHouse).",
+          "SigNoz computes RED metrics from traces (replaces Tempo's metrics_generator + Prometheus scrape).",
+          "Engine pushes OTLP metrics directly — no Prometheus scrape target needed.",
+          "Removal is flat (no findings doc required). Merged into w2-t4 unified strip."
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Fluent Bit replaces Promtail AND bridge's filelog/containers receiver",
+        "rationale": [
+          "Fluent Bit is smaller (~30MB vs Promtail ~100MB).",
+          "Fluent Bit speaks native OTLP output — no intermediate format conversion.",
+          "Promtail only pushes to Loki; Fluent Bit pushes to SigNoz's signoz-ingester:4318.",
+          "Same log source (/var/lib/docker/containers/*/*-json.log), same docker parser.",
+          "Bridge filelog/containers becomes redundant once Fluent Bit is live."
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Local Docker Compose in deploy/local/ with Foundry stack (not combined image)",
+        "rationale": [
+          "One-command bring-up from source checkout — no external docker-compose repo.",
+          "Shares Containerfile + docker/ircd/Dockerfile with production.",
+          "Port mapping mirrors production: query-service on 8080 (internal)/3301 (host), ingester on 4318.",
+          "Foundry multi-container gives parity with production architecture."
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Migrate Loki alert rules to SigNoz LOGS_BASED_ALERT with attribute.event = filters",
+        "rationale": [
+          "SigNoz has a built-in alert evaluation engine (replaces Loki Ruler).",
+          "14 Loki rules all filter on event= labels — direct mapping to attribute.event = in SigNoz.",
+          "Fluent Bit JSON field extraction ensures event/level/network/nick/channel survive as OTLP attributes.",
+          "Thresholds and evaluation windows match 1:1 between Loki LogQL and SigNoz alert config."
+        ],
+        "confidence": 0.9
+      },
+      {
+        "decision": "Remove old deploy/roles/signoz/ and deploy/test/signoz-config/ directories",
+        "rationale": [
+          "signoz/ role was ClickHouse config (keeper, ingester, query-service Prometheus) — superseded by Foundry.",
+          "signoz-test dir was ClickHouse config regression tests — no longer applicable with Foundry.",
+          "These cruft assets confuse future operators. Removal is safe after audit for playbook references."
+        ],
+        "confidence": 1.0
+      }
+    ],
+    "reuse_notes": [
+      {
+        "path": "docs/plan/20260630-admin-signoz-logs-panel/plan.yaml",
+        "trust": "high"
+      },
+      {
+        "path": "docs/plan/20260630-admin-signoz-logs-panel/context_envelope.json",
+        "trust": "high"
+      },
+      {
+        "path": "deploy/roles/signoz_bridge/",
+        "trust": "high"
+      },
+      {
+        "path": "AGENTS.md",
+        "trust": "high"
+      }
+    ],
+    "learned_from_review": [
+      {
+        "finding": "Port 8080 is query-service API, NOT ClickHouse",
+        "impact": "ALL open_questions, quality_warnings, and port references in the first plan were wrong. Corrected throughout v2.",
+        "confidence": 1.0
+      },
+      {
+        "finding": "Bridge otel-collector already has filelog/containers receiver that overlaps with Fluent Bit",
+        "impact": "First plan assumed bridge was only for traces+metrics. Reality: bridge also ingests container logs via filelog/containers. Must strip this receiver to avoid duplicate ingestion.",
+        "confidence": 1.0
+      },
+      {
+        "finding": "SigNoz combined image is NOT suitable for ARM64 local dev",
+        "impact": "First plan assumed combined image. Review revealed Foundry multi-container stack is the correct architecture for both local and production. Combined image is brittle (ClickHouse emulation, opaque health, no per-service limits).",
+        "confidence": 1.0
+      },
+      {
+        "finding": "Old deploy/roles/signoz/ role exists separately from signoz_bridge",
+        "impact": "First plan missed this old ClickHouse config role. It must be removed to avoid confusion. Separate from signoz_bridge which stays.",
+        "confidence": 1.0
+      },
+      {
+        "finding": "Fluent Bit recursion guard (Exclude_Path) is mandatory",
+        "impact": "Without excluding its own logs, Fluent Bit creates an infinite read-loop — reading its own output as input, re-ingesting, growing log, repeat. This was absent from the first plan's Fluent Bit config.",
+        "confidence": 1.0
+      },
+      {
+        "finding": "Grafana datasource URL differs by environment",
+        "impact": "First plan used :3301 in all contexts. Reality: internal Docker networking uses :8080 (query-service). Only host-mapped Grafana uses :3301. Production Grafana (Docker) MUST use :8080.",
+        "confidence": 1.0
+      },
+      {
+        "finding": "Engine OTel endpoint differs between prod and local dev",
+        "impact": "Production: bridge (dual-network, ircfiber-otel-collector:4318). Local dev: direct to signoz-ingester:4318 (no bridge in local compose). First plan assumed same endpoint everywhere.",
+        "confidence": 1.0
+      }
+    ]
+  }
+}

@@ -1,0 +1,112 @@
+---
+- name: Preflight — restore_confirm must be true
+  ansible.builtin.assert:
+    that:
+      - restore_confirm | bool
+    fail_msg: |
+      restore.yml will OVERWRITE the live MongoDB / Redis data.
+      Re-run with -e restore_confirm=true to proceed.
+
+- name: List available backups
+  ansible.builtin.command: ls -1 {{ backup_dir }}
+  register: available_backups
+  changed_when: false
+
+- name: Show available backups
+  ansible.builtin.debug:
+    var: available_backups.stdout_lines
+
+- name: Verify snapshot files exist
+  ansible.builtin.stat:
+    path: "{{ backup_dir }}/{{ item }}"
+  loop:
+    - "{{ restore_mongo_snapshot }}"
+    - "{{ restore_redis_snapshot }}"
+  register: snapshot_stats
+  when: item | length > 0
+
+- name: Set facts for gateway replica deployment
+  ansible.builtin.set_fact:
+    _gw_container_names: "{{ [gateway_container_name] if (gateway_replica_count | default(1) | int) == 1 else (range(gateway_replica_count | default(1) | int) | map('regex_replace', '^', 'ircfiber-gateway-') | list) }}"
+  when:
+    - restore_mongo_snapshot | length > 0 or restore_redis_snapshot | length > 0
+    - gateway_container_name is defined
+
+- name: Stop the gateway replicas
+  community.docker.docker_container:
+    name: "{{ item }}"
+    state: stopped
+  loop: "{{ _gw_container_names | default([gateway_container_name]) }}"
+  when:
+    - restore_mongo_snapshot | length > 0 or restore_redis_snapshot | length > 0
+    - gateway_container_name is defined
+
+- name: Stop all engines (by label)
+  ansible.builtin.shell:
+    cmd: set -o pipefail; docker ps -q --filter label=com.ircfiber.component=engine | xargs -r docker stop
+  register: stopped_engines
+  changed_when: stopped_engines.stdout | length > 0
+  when:
+    - restore_mongo_snapshot | length > 0 or restore_redis_snapshot | length > 0
+
+- name: Restore MongoDB from snapshot
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      docker exec -i {{ mongo_container_name }} \
+        mongorestore \
+          --username={{ vault_mongo_app_username }} \
+          --password={{ vault_mongo_app_password }} \
+          --authenticationDatabase={{ mongo_initdb_database }} \
+          --archive \
+          --gzip \
+          --drop \
+          --nsInclude={{ mongo_initdb_database }}.* \
+        < {{ backup_dir }}/{{ restore_mongo_snapshot }}
+  changed_when: true
+  no_log: true
+  when: restore_mongo_snapshot | length > 0
+
+- name: Restore Redis from AOF
+  ansible.builtin.copy:
+    src: "{{ backup_dir }}/{{ restore_redis_snapshot }}"
+    dest: "/tmp/{{ restore_redis_snapshot }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: restore_redis_snapshot | length > 0
+
+- name: Apply redis AOF inside container
+  ansible.builtin.command: >-
+    docker cp /tmp/{{ restore_redis_snapshot }}
+    {{ redis_container_name }}:/data/appendonly.aof
+  changed_when: true
+  when: restore_redis_snapshot | length > 0
+
+- name: Restart redis to load AOF
+  community.docker.docker_container:
+    name: "{{ redis_container_name }}"
+    restart: true
+  when: restore_redis_snapshot | length > 0
+
+- name: Cleanup tmp restore file
+  ansible.builtin.file:
+    path: "/tmp/{{ restore_redis_snapshot }}"
+    state: absent
+  when: restore_redis_snapshot | length > 0
+
+- name: Start the gateway replicas
+  community.docker.docker_container:
+    name: "{{ item }}"
+    state: started
+  loop: "{{ _gw_container_names | default([gateway_container_name]) }}"
+  when:
+    - gateway_container_name is defined
+    - restore_mongo_snapshot | length > 0 or restore_redis_snapshot | length > 0
+
+- name: Start all engines (by label)
+  ansible.builtin.shell:
+    cmd: set -o pipefail; docker ps -a -q --filter label=com.ircfiber.component=engine | xargs -r docker start
+  changed_when: true
+  when:
+    - restore_mongo_snapshot | length > 0 or restore_redis_snapshot | length > 0

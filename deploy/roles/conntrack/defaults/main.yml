@@ -1,0 +1,22 @@
+---
+# IRC Fiber — conntrack tuning for high-connection Docker/IRC workloads
+# Values as requested (2026-08-23): max=1048576, hashsize=262144 (buckets alias, so 262144)
+# User listed buckets=1048576 + hashsize=262144 in order; on Linux they alias — last wins (262144). 4:1 max:buckets ratio is canonical.
+#   tcp timeouts preserved (already default on 6.8 kernels) but pinned for drift protection.
+
+conntrack_max: 1048576
+conntrack_buckets: 262144
+conntrack_hashsize: 262144
+
+# net.netfilter.nf_conntrack_tcp_timeout_* — must match `sysctl -a | grep nf_conntrack_tcp_timeout`
+conntrack_tcp_timeouts:
+  close: 10
+  close_wait: 60
+  established: 432000
+  fin_wait: 120
+  last_ack: 30
+  max_retrans: 300
+  syn_recv: 60
+  syn_sent: 120
+  time_wait: 120
+  unacknowledged: 300

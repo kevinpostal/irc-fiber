@@ -1,0 +1,18 @@
+---
+# SigNoz bridge collector
+signoz_bridge_container: "ircfiber-otel-collector"
+docker_registry_url: ""
+signoz_bridge_image: "{{ docker_registry_url }}otel/opentelemetry-collector-contrib:0.119.0"
+signoz_bridge_mem: 256m
+signoz_bridge_cpus: 0.5
+# Networks to attach the bridge to. Both are required:
+#   - ircfiber_net: where ircfiber D services live (gateway, engine, holder, caddy)
+#   - ircfiber_logging: where signoz-ingester lives (export target)
+signoz_bridge_networks:
+  - ircfiber_net
+  - ircfiber_logging
+# OTLP ingest ports exposed to the ircfiber_net
+signoz_bridge_otlp_grpc_port: 4317
+signoz_bridge_otlp_http_port: 4318
+# Health check endpoint (extensions/health_check)
+signoz_bridge_health_port: 13133

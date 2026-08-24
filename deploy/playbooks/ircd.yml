@@ -1,0 +1,60 @@
+---
+# IRC Fiber — Deploy IRC daemon (Ergo)
+#
+# Standalone playbook. Run from the deploy/ directory:
+#
+#   ansible-playbook playbooks/ircd.yml -l ircfiber-ovh-1
+#
+# Sets up:
+#   - Ergo IRC daemon container (ircfiber-ircd)
+#   - Ports 6667 (plain) and 6697 (TLS) exposed
+#   - Persistent data volume for accounts + channels
+#   - NickServ, ChanServ, HostServ, MemoServ built-in services
+#   - Admin oper account from vault
+#   - Cloudflare DNS A record for irc.ircfiber.com
+#   - UFW firewall rules for IRC ports
+#
+# Prerequisites: site.yml has been run (Docker, Tailscale, firewall base).
+
+- name: Preflight — vault variables
+  hosts: ircfiber
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+    - name: Assert vault_ircd_oper_password is set
+      ansible.builtin.assert:
+        that:
+          - vault_ircd_oper_password is defined
+          - vault_ircd_oper_password | length > 0
+        fail_msg: "vault_ircd_oper_password must be set in vault.yml"
+
+- name: Manage Cloudflare DNS for irc.ircfiber.com
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+    - name: Ensure irc.ircfiber.com A record exists (DNS-only, no proxy)
+      community.general.cloudflare_dns:
+        api_token: "{{ vault_cloudflare_api_token }}"
+        zone: "{{ cloudflare_zone }}"
+        record: "irc"
+        type: A
+        value: "{{ cloudflare_target_ip }}"
+        ttl: 300
+        proxied: false
+        state: present
+      when:
+        - cloudflare_target_ip is defined
+        - cloudflare_target_ip | length > 0
+
+- name: Deploy IRC daemon
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: ircd

@@ -1,0 +1,5 @@
+---
+- name: Restart engine
+  community.docker.docker_container:
+    name: "{{ engine_container_name }}"
+    restart: true

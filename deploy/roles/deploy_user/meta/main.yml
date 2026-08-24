@@ -1,0 +1,18 @@
+galaxy_info:
+  author: IRC Fiber
+  description: One-time provisioning of the non-root 'deploy' user
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+    - name: Debian
+      versions:
+        - bullseye
+        - bookworm
+  galaxy_tags:
+    - ircfiber
+    - bootstrap
+    - user
+dependencies: []

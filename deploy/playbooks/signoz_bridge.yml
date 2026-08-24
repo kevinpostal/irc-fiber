@@ -1,0 +1,19 @@
+---
+# Deploy the SigNoz bridge collector (OpenTelemetry Collector that
+# receives telemetry from ircfiber D services + host + docker + caddy
+# access logs and forwards to the SigNoz ingester).
+#
+# Usage:
+#   ansible-playbook playbooks/signoz_bridge.yml
+#   ansible-playbook playbooks/signoz_bridge.yml -e signoz_bridge_image=otel/opentelemetry-collector-contrib:0.120.0
+#
+# Requires: signoz role has been deployed (signoz-ingester on ircfiber_logging)
+# Requires: ircfiber_net network exists (gateway/engine already attached)
+
+- name: Deploy SigNoz bridge collector
+  hosts: all
+  become: true
+  gather_facts: false
+  roles:
+    - role: signoz_bridge
+      tags: [signoz_bridge]

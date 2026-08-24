@@ -1,0 +1,4 @@
+---
+# The cloudflared role has no handlers — docker_container with
+# state: started handles restarts automatically when the image
+# or config changes.

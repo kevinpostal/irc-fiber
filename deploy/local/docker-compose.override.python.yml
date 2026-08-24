@@ -1,0 +1,26 @@
+services:
+  irc-fiber-api-py:
+    build:
+      context: ../..
+      dockerfile: api-python/Dockerfile
+    image: irc-fiber-api-py:local
+    container_name: irc-fiber-api-py-local
+    restart: unless-stopped
+    networks:
+      - ircfiber_local
+    ports:
+      - "8001:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MONGO_URL: mongodb://mongo:27017/ircfiber
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

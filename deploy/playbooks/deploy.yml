@@ -1,0 +1,48 @@
+---
+# Fast incremental deploy — skips OS/Docker/Tailscale/firewall setup.
+# Use this for day-to-day code changes. Only rebuilds the image + restarts
+# gateway & engine containers. Expects the host to already be bootstrapped.
+#
+# Usage:
+#   ansible-playbook playbooks/deploy.yml -l ircfiber-prod-1 --ask-vault-pass
+#
+# First-time setup (run once):
+#   ansible-playbook playbooks/site.yml -l ircfiber-prod-1 --ask-vault-pass
+
+- name: Rsync repo & rebuild image
+  hosts: ircfiber
+  become: false
+  gather_facts: true
+  # ansible-core 2.20 doesn't auto-load group_vars when the inventory
+  # path contains spaces (see site.yml for the full explanation).
+  # Load group_vars and the vault explicitly so ircfiber_repo_root and
+  # vault_mongo_* are both resolvable.
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/all.yml"
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: ircfiber_image
+
+- name: Recreate gateway with new image
+  hosts: ircfiber_gw
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/all.yml"
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: gateway
+
+- name: Recreate engines with new image
+  hosts: ircfiber_engines
+  become: true
+  serial: 1
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/all.yml"
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: engine
+
+  post_tasks:
+    - name: Wait for engine to re-register
+      ansible.builtin.pause:
+        seconds: 10

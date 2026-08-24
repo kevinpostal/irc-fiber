@@ -1,0 +1,10 @@
+---
+tailscale_apt_keyring: /etc/apt/keyrings/tailscale.gpg
+tailscale_apt_repo: >-
+  deb [signed-by={{ tailscale_apt_keyring }}]
+  https://pkgs.tailscale.com/stable/{{ ansible_distribution | lower }}
+  {{ ansible_distribution_release }} main
+tailscale_packages:
+  - tailscale
+tailscale_up_extra_args: ""
+# e.g. tailscale_up_extra_args: "--ssh --accept-routes"

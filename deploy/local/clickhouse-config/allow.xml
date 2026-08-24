@@ -1,0 +1,4 @@
+<clickhouse>
+  <allow_replicated_database_without_keeper>1</allow_replicated_database_without_keeper>
+  <database_replicated_allow_replicated_database_without_keeper>1</database_replicated_allow_replicated_database_without_keeper>
+</clickhouse>

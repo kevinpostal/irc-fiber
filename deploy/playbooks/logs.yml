@@ -1,0 +1,40 @@
+---
+# Tail logs for a single component.
+# Usage:
+#   ansible-playbook playbooks/logs.yml -e component=gateway tail=200
+#   ansible-playbook playbooks/logs.yml -e component=engine -l engine2.example.com
+#
+# Valid components: caddy, gateway, engine, mongo, redis
+
+- name: Tail irc-fiber logs
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    component: "gateway"
+    tail: 100
+  tasks:
+    - name: Validate component
+      ansible.builtin.assert:
+        that:
+          - component in ['caddy', 'gateway', 'engine', 'mongo', 'redis']
+        fail_msg: "Invalid component '{{ component }}'"
+
+    - name: Resolve container name
+      ansible.builtin.set_fact:
+        target_container: "{{ 'ircfiber-engine-' + (hostvars[item].ircfiber_engine_id | default(item)) if component == 'engine' else 'ircfiber-' + component }}"
+      when: component == 'engine'
+      loop: "{{ groups['ircfiber_engines'] | default([]) }}"
+
+    - name: Resolve container name (non-engine)
+      ansible.builtin.set_fact:
+        target_container: "ircfiber-{{ component }}"
+      when: component != 'engine'
+
+    - name: Show container log location
+      ansible.builtin.debug:
+        msg: "Container: {{ target_container }}"
+
+    - name: Tail logs
+      ansible.builtin.command: docker logs --tail {{ tail }} -f {{ target_container }}
+      changed_when: false

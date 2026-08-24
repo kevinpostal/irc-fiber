@@ -1,0 +1,8 @@
+---
+- name: Install Docker CE
+  hosts: ircfiber
+  become: true
+  gather_facts: true
+  roles:
+    - common
+    - docker

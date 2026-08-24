@@ -1,0 +1,167 @@
+---
+- name: Ensure ircfiber_logging Docker network exists
+  community.docker.docker_network:
+    name: ircfiber_logging
+    driver: bridge
+    state: present
+    driver_options:
+      # Linux IFNAMSIZ = 15 chars; "br-ircfiber-logging" (20) overflows.
+      com.docker.network.bridge.name: br-ircfiber-log
+
+- name: Ensure logging Docker volumes exist
+  community.docker.docker_volume:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - "{{ grafana_data_volume }}"
+    - "{{ grafana_provisioning_volume }}"
+    - "{{ grafana_dashboards_volume }}"
+    - "{{ grafana_alerting_volume }}"
+    - "{{ grafana_plugins_volume }}"
+    - "ircfiber_signoz_data"
+
+- name: Ensure logging directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ fluent_bit_config_dir }}"
+    - /etc/ircfiber/grafana
+    - /etc/ircfiber/grafana/provisioning
+    - /etc/ircfiber/grafana/provisioning/datasources
+    - /etc/ircfiber/grafana/provisioning/dashboards
+    - /etc/ircfiber/grafana/dashboards
+    - /etc/ircfiber/grafana/alerting
+    - /etc/ircfiber/logging
+
+- name: Render Fluent Bit config
+  ansible.builtin.template:
+    src: fluent-bit.conf.j2
+    dest: "{{ fluent_bit_config_dir }}/fluent-bit.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart fluent-bit
+
+- name: Render Fluent Bit parsers config
+  ansible.builtin.template:
+    src: parsers.conf.j2
+    dest: "{{ fluent_bit_config_dir }}/parsers.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart fluent-bit
+
+- name: Render Grafana datasources
+  ansible.builtin.template:
+    src: grafana-datasources.yml.j2
+    dest: "/etc/ircfiber/grafana/provisioning/datasources/signoz.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Render Grafana dashboards provider
+  ansible.builtin.template:
+    src: grafana-dashboards.yml.j2
+    dest: "/etc/ircfiber/grafana/provisioning/dashboards/ircfiber.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Deploy Grafana dashboards
+  ansible.posix.synchronize:
+    src: dashboards/
+    dest: "/etc/ircfiber/grafana/dashboards/"
+    recursive: yes
+    delete: yes
+  register: grafana_dashboards_deploy
+  notify: Restart grafana
+
+- name: Render docker-compose for logging stack
+  ansible.builtin.template:
+    src: docker-compose.logging.yml.j2
+    dest: "/etc/ircfiber/logging/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart logging stack
+
+- name: Render logging env file (consumed by docker compose)
+  ansible.builtin.template:
+    src: logging.env.j2
+    dest: "/etc/ircfiber/logging/logging.env"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart logging stack
+
+# ────────────────────────────────────────────────────────────────────────
+# Deploy via docker compose
+# ────────────────────────────────────────────────────────────────────────
+- name: Deploy logging stack (Fluent Bit + SigNoz Foundry + Grafana)
+  community.docker.docker_compose_v2:
+    project_src: /etc/ircfiber/logging
+    state: present
+    pull: missing
+    remove_orphans: true
+    env_files:
+      - /etc/ircfiber/logging/logging.env
+  register: logging_deploy
+
+# ────────────────────────────────────────────────────────────────────────
+# Post-deploy healthchecks
+# ────────────────────────────────────────────────────────────────────────
+- name: Wait for SigNoz to become healthy (API on :8080)
+  ansible.builtin.command:
+    cmd: "docker exec {{ signoz_container_name }} wget -qO- http://localhost:8080/api/v1/services"
+  register: signoz_ready
+  changed_when: false
+  until: signoz_ready.rc == 0
+  retries: 30
+  delay: 4
+
+- name: Wait for Fluent Bit to start
+  ansible.builtin.command:
+    cmd: "docker exec {{ fluent_bit_container_name }} pidof fluent-bit"
+  register: fluent_bit_ready
+  changed_when: false
+  until: fluent_bit_ready.rc == 0
+  retries: 10
+  delay: 3
+  failed_when: false
+
+- name: Wait for Grafana to become healthy
+  ansible.builtin.command:
+    cmd: "docker exec {{ grafana_container_name }} wget -qO- http://127.0.0.1:3000/api/health"
+  register: grafana_ready
+  changed_when: false
+  until:
+    - grafana_ready.rc == 0
+    - grafana_ready.stdout is search("database")
+  retries: 15
+  delay: 4
+
+# ────────────────────────────────────────────────────────────────────────
+# Caddy integration — add Grafana proxy route
+# ────────────────────────────────────────────────────────────────────────
+- name: Notify Caddy to reload after logging stack deployment
+  ansible.builtin.debug:
+    msg: "Caddy route for /grafana must be enabled in caddy role"
+  when: signoz_ready is succeeded and grafana_ready is succeeded
+
+# ────────────────────────────────────────────────────────────────────────
+# Deploy SigNoz alert rules (gated — not on every deploy)
+# ────────────────────────────────────────────────────────────────────────
+- name: Deploy SigNoz alert rules
+  ansible.builtin.import_tasks: deploy-alerts.yml
+  when: deploy_signoz_alerts | default(false) | bool
+
+# ────────────────────────────────────────────────────────────────────────
+# Optional: Clean up old stack (Loki/Promtail/Tempo/Prometheus/legacy otelcol)
+# ────────────────────────────────────────────────────────────────────────
+- name: Clean up old observability stack
+  ansible.builtin.import_tasks: cleanup-old-stack.yml
+  when: cleanup_old_stack | default(false) | bool

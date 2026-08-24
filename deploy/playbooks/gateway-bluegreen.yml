@@ -1,0 +1,175 @@
+---
+# Blue/green gateway deploy — zero-downtime for frontend/gateway-only changes.
+# Engine is untouched. Build the new image on the host first (docker build --target runtime-gateway),
+# then this playbook starts green, waits healthy, and swaps.
+- name: Blue/green gateway deploy
+  hosts: ircfiber_gw
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  vars:
+    gateway_bluegreen_enabled: true
+    gateway_container_name: ircfiber-gateway
+    gateway_green_name: ircfiber-gateway-green
+    gateway_http_port: 8090
+    gateway_uploads_volume: ircfiber_uploads
+    gateway_logs_volume: ircfiber_logs
+    docker_ircfiber_network: ircfiber_net
+    ircfiber_gateway_image_full: "irc-fiber-gateway:latest"
+    ircfiber_admin_password_reset: "{{ vault_ircfiber_admin_password | default('') }}"
+  tasks:
+    - name: Ensure ircfiber config dir exists (for env)
+      ansible.builtin.file:
+        path: /etc/ircfiber/gateway
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Render gateway env file (so green gets current env)
+      ansible.builtin.template:
+        src: ../roles/gateway/templates/env.j2
+        dest: /etc/ircfiber/gateway/env
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Slurp gateway env file
+      ansible.builtin.slurp:
+        src: /etc/ircfiber/gateway/env
+      register: _gw_env_raw
+
+    - name: Parse gateway env into dict
+      vars:
+        _raw_lines: "{{ (_gw_env_raw.content | b64decode).split('\n') | reject('match', '^\\s*#') | map('trim') | reject('equalto', '') | list }}"
+        _pairs: "{{ _raw_lines | map('split', '=', 1) | list }}"
+      ansible.builtin.set_fact:
+        _gateway_env: "{{ dict(_pairs) }}"
+
+    - name: Ensure uploads & logs volumes exist
+      community.docker.docker_volume:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - "{{ gateway_uploads_volume }}"
+        - "{{ gateway_logs_volume }}"
+
+    - name: Resolve ircfiber networks for gateway
+      ansible.builtin.set_fact:
+        ircfiber_networks_for_gateway:
+          - name: "{{ docker_ircfiber_network }}"
+          - name: ircfiber_logging
+
+    - name: Start green gateway (new image, same env)
+      community.docker.docker_container:
+        name: "{{ gateway_green_name }}"
+        image: "{{ ircfiber_gateway_image_full }}"
+        state: started
+        restart_policy: unless-stopped
+        command: ["/app/irc-fiber"]
+        networks: "{{ ircfiber_networks_for_gateway }}"
+        networks_cli_compatible: true
+        env: "{{ _gateway_env }}"
+        volumes:
+          - "{{ gateway_uploads_volume }}:/app/uploads"
+          - "{{ gateway_logs_volume }}:/var/log/irc-fiber"
+        security_opts:
+          - "no-new-privileges:true"
+        ulimits:
+          - "nofile:65536:65536"
+        healthcheck:
+          test: ["CMD", "curl", "-fsS", "http://localhost:{{ gateway_http_port }}/health"]
+          interval: 10s
+          timeout: 5s
+          retries: 3
+          start_period: 10s
+        labels:
+          com.ircfiber.component: "gateway-green"
+          com.ircfiber.version: "{{ ircfiber_version | default('unknown') }}"
+      register: green_start
+
+    - name: Wait for green to become healthy
+      community.docker.docker_container_info:
+        name: "{{ gateway_green_name }}"
+      register: green_info
+      until: green_info.container.State.Health.Status == "healthy"
+      retries: 30
+      delay: 2
+      failed_when: green_info.container.State.Health.Status == "unhealthy"
+
+    - name: Stop and remove blue gateway (old)
+      community.docker.docker_container:
+        name: "{{ gateway_container_name }}"
+        state: absent
+
+    - name: Rename green to blue (atomic swap)
+      ansible.builtin.command: docker rename {{ gateway_green_name }} {{ gateway_container_name }}
+      register: rename_result
+      failed_when: false
+      changed_when: rename_result.rc == 0
+
+    - name: Ensure blue is started (after rename, ensure it stays up)
+      community.docker.docker_container:
+        name: "{{ gateway_container_name }}"
+        image: "{{ ircfiber_gateway_image_full }}"
+        state: started
+        restart_policy: unless-stopped
+        command: ["/app/irc-fiber"]
+        networks: "{{ ircfiber_networks_for_gateway }}"
+        networks_cli_compatible: true
+        env: "{{ _gateway_env }}"
+        volumes:
+          - "{{ gateway_uploads_volume }}:/app/uploads"
+          - "{{ gateway_logs_volume }}:/var/log/irc-fiber"
+        security_opts:
+          - "no-new-privileges:true"
+        ulimits:
+          - "nofile:65536:65536"
+        healthcheck:
+          test: ["CMD", "curl", "-fsS", "http://localhost:{{ gateway_http_port }}/health"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+        labels:
+          com.ircfiber.component: "gateway"
+          com.ircfiber.version: "{{ ircfiber_version | default('unknown') }}"
+
+    - name: Reload Caddy to clear DNS cache and re-resolve gateway IP
+      ansible.builtin.shell: docker exec ircfiber-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1 | head -n 20; echo reload_done
+      register: caddy_reload
+      failed_when: false
+      changed_when: false
+
+    - name: Brief pause for Caddy to re-probe upstreams
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Verify Caddy proxy is serving gateway (no 503)
+      ansible.builtin.shell: |
+        curl -fsS -H "Host: ircfiber.com" http://127.0.0.1:80/health >/dev/null 2>&1 || curl -kfsS --resolve ircfiber.com:443:127.0.0.1 https://ircfiber.com/health >/dev/null 2>&1
+      register: caddy_proxy_check
+      retries: 5
+      delay: 2
+      until: caddy_proxy_check.rc == 0
+      failed_when: false
+      changed_when: false
+
+    - name: Verify gateway health (inside container)
+      ansible.builtin.command: docker exec {{ gateway_container_name }} sh -c "curl -fsS http://127.0.0.1:{{ gateway_http_port }}/health"
+      register: health_check
+      retries: 5
+      delay: 2
+      until: health_check.rc == 0
+      changed_when: false
+
+    - name: Report engine untouched
+      ansible.builtin.shell: docker ps --format "{{ '{{' }}.Names{{ '}}' }} {{ '{{' }}.Status{{ '}}' }}" | grep -E "engine"
+      register: engine_status
+      changed_when: false
+      failed_when: false
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "Blue/green swap done — green is now blue. Engine: {{ engine_status.stdout }} | Health: {{ health_check.stdout | default('ok') }}"

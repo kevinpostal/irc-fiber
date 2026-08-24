@@ -1,0 +1,18 @@
+---
+# IRC Fiber — operator secrets (Ansible Vault template).
+#
+# Copy this file to `vault.yml` and replace the placeholders, then encrypt:
+#
+#   cp inventories/production/group_vars/all/vault.example.yml \
+#      inventories/production/group_vars/all/vault.yml
+#   # edit vault.yml and replace CHANGE_ME with the real value
+#   ansible-vault encrypt inventories/production/group_vars/all/vault.yml
+#
+# vault.yml is matched by the .gitignore rule `inventories/**/vault.yml`
+# and will never be committed. Decryption uses the key in
+# deploy/.vault_pass.txt (also gitignored) per ansible.cfg.
+#
+# Run any playbook against this inventory without -e flags; Ansible will
+# auto-decrypt the vault using vault_password_file from ansible.cfg.
+
+vault_signoz_admin_password: "CHANGE_ME"

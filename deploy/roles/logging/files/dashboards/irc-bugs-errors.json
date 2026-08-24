@@ -1,0 +1,798 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Bug hunting across the IRC Fiber APPLICATION containers (engine / gateway / holder / ircd). Framework containers (loki, grafana, promtail, caddy, mongo, redis, cloudflared) are excluded — their internal log noise (plugin re-registration, query cancellation, WAL recovery, scheduler RPC) overwhelms the real signal. For per-container health see the Container Health dashboard.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Health overview (last 1h)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "id": 100,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "title": "Errors",
+      "type": "stat",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 50
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "sum(count_over_time({job=\"ircfiber_containers\", container_name!~\"ircfiber-loki\"} |~ \"(?i)(error|exception|panic|fatal)\" !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|no marks file|found stale draining)\" [1h])) !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|caller=roundtrip.go|ratestore.go|no marks file|found stale draining|caller=ingester.go)\" ",
+          "legendFormat": "Errors",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Warnings",
+      "type": "stat",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "orange",
+                "value": 100
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "sum(count_over_time({job=\"ircfiber_containers\", container_name!~\"ircfiber-loki\"} |~ \"(?i)(warn|warning)\" !~ \"(?i)(caller=scheduler_processor)\" [1h])) !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|caller=roundtrip.go|ratestore.go|no marks file|found stale draining|caller=ingester.go)\" ",
+          "legendFormat": "Warnings",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "IRC disconnects",
+      "type": "stat",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "sum(count_over_time({job=\"ircfiber_containers\", container_name=~\"ircfiber-(engine.+|gateway|holder.+|ircd)\", event=\"disconnected\"}[1h]))",
+          "legendFormat": "Disconnects",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "TLS handshake fails",
+      "type": "stat",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "sum(count_over_time({job=\"ircfiber_containers\", container_name=~\"ircfiber-(engine.+|gateway|holder.+|ircd)\", event=\"tls_fail\"}[1h]))",
+          "legendFormat": "TLS fails",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Error timeline",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "collapsed": false,
+      "id": 101,
+      "panels": []
+    },
+    {
+      "id": 5,
+      "title": "Errors per minute, by container",
+      "type": "timeseries",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "pointSize": 3,
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "sum by (container_name) (rate({job=\"ircfiber_containers\", container_name!~\"ircfiber-loki\"} |~ \"(?i)(error|exception|panic|fatal)\" !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|no marks file|found stale draining)\" [1m])) !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|caller=roundtrip.go|ratestore.go|no marks file|found stale draining|caller=ingester.go)\" ",
+          "legendFormat": "{{container_name}}",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "IRC protocol anomalies over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "sum by (event) (rate({job=\"ircfiber_containers\", container_name=~\"ircfiber-(engine.+|gateway|holder.+|ircd)\", event=~\"tls_fail|sasl_fail|disconnected|tls_plain_fallback|reconnect_attempt\"}[1m]))",
+          "legendFormat": "{{event}}",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Top offenders (last 24h)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "collapsed": false,
+      "id": 102,
+      "panels": []
+    },
+    {
+      "id": 7,
+      "title": "Errors by container",
+      "type": "table",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 0,
+        "y": 26
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Errors",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "topk(20, sum by (container_name, component) (count_over_time({job=\"ircfiber_containers\", container_name!~\"ircfiber-loki\"} |~ \"(?i)(error|exception|panic|fatal)\" !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|no marks file|found stale draining)\" [24h]))) !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|caller=roundtrip.go|ratestore.go|no marks file|found stale draining|caller=ingester.go)\" ",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "TLS fails by network",
+      "type": "table",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 8,
+        "y": 26
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Fails",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "table",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "topk(20, sum by (network) (count_over_time({job=\"ircfiber_containers\", container_name=~\"ircfiber-(engine.+|gateway|holder.+|ircd)\", event=\"tls_fail\"}[24h])))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "IRC numeric errors (433/464/etc) by network",
+      "type": "table",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 26
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Count",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "topk(20, sum by (network, msg) (count_over_time({job=\"ircfiber_containers\", container_name=~\"ircfiber-(engine.+|gateway|holder.+|ircd)\", event=\"numeric\"} [24h])))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Loop detection (5min)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "collapsed": false,
+      "id": 103,
+      "panels": []
+    },
+    {
+      "id": 10,
+      "title": "Repeated error patterns (≥10x in 5m = likely loop)",
+      "type": "table",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Repeats",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "table",
+            "steps": [
+              {
+                "color": "yellow",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "topk(15, sum by (container_name, msg) (count_over_time({job=\"ircfiber_containers\", container_name!~\"ircfiber-loki\"} |~ \"(?i)(error|exception)\" !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|no marks file|found stale draining)\" [5m]))) !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|caller=roundtrip.go|ratestore.go|no marks file|found stale draining|caller=ingester.go)\" ",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Per-container error burst (max rate in last 5m)",
+      "type": "bargauge",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "max"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.1
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "max by (container_name) (rate({job=\"ircfiber_containers\", container_name!~\"ircfiber-loki\"} |~ \"(?i)(error|exception|panic|fatal)\" !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|no marks file|found stale draining)\" [5m])) !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|caller=roundtrip.go|ratestore.go|no marks file|found stale draining|caller=ingester.go)\" ",
+          "legendFormat": "{{container_name}}",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Engine stack traces & crashes",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 44
+      },
+      "collapsed": false,
+      "id": 104,
+      "panels": []
+    },
+    {
+      "id": 12,
+      "title": "Engine task crashes & D exceptions (live)",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 24,
+        "x": 0,
+        "y": 45
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "{job=\"ircfiber_containers\", container_name!~\"ircfiber-loki\"} |~ \"(?i)(Task crashed|Exception|stack trace|panic|fatal error|segfault|AssertionError)\"",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Live errors log",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 59
+      },
+      "collapsed": false,
+      "id": 105,
+      "panels": []
+    },
+    {
+      "id": 13,
+      "title": "All errors (live, noise-filtered)",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "expr": "{job=\"ircfiber_containers\", container_name!~\"ircfiber-loki\"} |~ \"(?i)(error|exception)\" !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|no marks file|found stale draining)\" !~ \"(?i)(broken pipe|context canceled|EOF|caller=scheduler_processor|caller=roundtrip.go|ratestore.go|no marks file|found stale draining|caller=ingester.go)\" ",
+          "queryType": "range"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "ircfiber",
+    "errors",
+    "bugs",
+    "diagnostics"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Bugs & Errors",
+  "uid": "ircfiber-bugs-errors",
+  "version": 1,
+  "weekStart": ""
+}

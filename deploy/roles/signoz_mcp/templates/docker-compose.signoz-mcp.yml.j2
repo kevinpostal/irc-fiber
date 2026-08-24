@@ -1,0 +1,43 @@
+# {{ ansible_managed }}
+# SigNoz MCP server — HTTP sidecar to the IRC Fiber SigNoz stack.
+# Joins the ircfiber_logging network so it can reach the SigNoz
+# query-service via Docker DNS. Exposes its MCP listener on the
+# host's Tailscale IP only — never on the public interface.
+
+x-logging-common: &logging-common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  signoz-mcp:
+    <<: *logging-common
+    image: {{ signoz_mcp_image }}
+    container_name: {{ signoz_mcp_container }}
+    hostname: signoz-mcp
+    networks:
+      - ircfiber_logging
+    environment:
+      # Container is named ircfiber-signoz on the logging network.
+      - SIGNOZ_URL=http://ircfiber-signoz:8080
+      - SIGNOZ_API_KEY={{ signoz_mcp_api_key }}
+      - TRANSPORT_MODE=http
+      - MCP_SERVER_PORT={{ signoz_mcp_container_port }}
+      - LOG_LEVEL=info
+    ports:
+      # Tailscale-only. Override signoz_mcp_bind_address in host_vars
+      # to bind to 0.0.0.0 if you need it reachable outside the tailnet.
+      - "{{ signoz_mcp_bind_address }}:{{ signoz_mcp_port }}:{{ signoz_mcp_container_port }}"
+    mem_limit: {{ signoz_mcp_mem }}
+    cpus: {{ signoz_mcp_cpus }}
+    healthcheck:
+      # Distroless image — no shell, no wget. NONE avoids perpetual
+      # unhealthy. restart: unless-stopped handles process crashes.
+      disable: true
+
+networks:
+  ircfiber_logging:
+    external: true

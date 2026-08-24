@@ -1,0 +1,1052 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAN METADATA
+# ═══════════════════════════════════════════════════════════════════════════
+plan_id: 20260701-signoz-unified-observability-and-local-docker
+objective: |
+  Unify observability on SigNoz for IRC Fiber. Fluent Bit replaces the bridge
+  otel-collector's filelog/containers receiver as the Docker-log shipper,
+  pushing container logs via OTLP HTTP to signoz-ingester. SigNoz stores
+  traces, logs, and metrics natively — Tempo + Prometheus become redundant.
+  The bridge otel-collector stays for network-crossing OTLP proxy (engine
+  traces+metrics) but loses its filelog receiver. Grafana repurposed to query
+  SigNoz as its sole datasource. A new local Docker Compose
+  (`deploy/local/docker-compose.yml`) uses the Foundry multi-container stack
+  for dev/test parity.
+created_at: 2026-07-01T12:15:00Z
+updated_at: 2026-07-01T18:30:00Z
+created_by: gem-planner
+status: pending
+tldr: |
+  4-wave plan (14 tasks). Wave 1 (4): local Docker Compose (SigNoz Foundry
+  multi-container stack) + smoke test + Vite proxy + test compose Fluent Bit.
+  Wave 2 (4): Fluent Bit prod config (json parser, docker socket, recursion
+  guard) + rewrite Ansible logging role + migrate Loki alerts to SigNoz +
+  unified strip (old stack, bridge filelog, Tempo/Prometheus, orphaned assets,
+  signoz role, signoz-test). Wave 3 (3): Grafana SigNoz datasource (correct
+  port :8080 query-service, NOT ClickHouse) + Caddy route cleanup + deploy
+  SigNoz alert rules. Wave 4 (3): local README + Makefile targets + CREATE
+  AGENTS.md observability section.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAN-LEVEL METRICS
+# ═══════════════════════════════════════════════════════════════════════════
+plan_metrics:
+  wave_1_task_count: 4
+  total_dependencies: 26
+  risk_score: high
+quality_warnings:
+  - "CRITICAL: SigNoz query-service API port is 8080 (internal Docker), NOT
+    ClickHouse. Port 3301 is the host-mapped port (3301→8080). Fix all
+    occurrences in env, templates, docs that call 8080 'ClickHouse port'."
+  - "BREAKING: Local Docker Compose uses the Foundry multi-container stack
+    (signoz-query-service, signoz-ingester, signoz-clickhouse, etc.), NOT the
+    combined signoz/signoz single image. The combined image is brittle on ARM64
+    (ClickHouse emulation overhead). Foundry gives per-service scaling and
+    explicit healthchecks."
+  - "Bridge otel-collector loses `filelog/containers` receiver (now Fluent
+    Bit's job). Fluent Bit OTLP output routes to signoz-ingester:4318 (NOT the
+    bridge). Two separate OTLP flows: engine traces+metrics → bridge
+    → signoz-ingester; container logs → Fluent Bit → signoz-ingester."
+  - "Grafana SigNoz datasource URL must target the query-service API
+    (signoz-signoz:8080 prod, signoz:3301 local via host map), NOT the
+    signoz-ingester OTLP port (4318). The query-service port is 8080 internal;
+    3301 is the host-mapped port."
+  - "14 Loki alert rules migrate to SigNoz LOGS_BASED_ALERT. Fluent Bit's JSON
+    field extraction ensures `event`, `level`, `network`, `nick`, `channel` are
+    preserved as OTLP log record attributes so `attribute.event =` filters work."
+  - "Pending review findings addressed in this plan (see open_questions →
+    pending_tasks for the full table)."
+  - "Fluent Bit recursion guard: Path_Exclude or Exclude_Path must exclude
+    Fluent Bit's own container logs (container name matches `ircfiber-fluent-bit`
+    or `fluent-bit`) to avoid read-loop amplification."
+  - "Local Docker Compose requires 8GB+ free RAM on host (SigNoz ClickHouse
+    ~4GB, query-service ~512MB, ingester ~256MB, IRC stack ~1GB). ARM64
+    requires Rosetta 2 for x86 ClickHouse containers — set
+    platform: linux/amd64 on signoz-clickhouse if native ARM images unavailable."
+
+pending_tasks:
+  - finding: "M1 — Remove requires_design_validation from Tempo/Prometheus disposal"
+    resolution: "User already decided to remove. Design gate removed. Disposition merged into w2-t4 as flat removal."
+  - finding: "M2 — Fluent Bit JSON field extraction for engine logs"
+    resolution: "Added to w2-t1: json_parser parses engine body, extract event/level/network/nick/channel as OTLP attributes."
+  - finding: "M3 — SigNoz combined image on ARM64 is brittle"
+    resolution: "Use Foundry multi-container stack for local dev (w1-t1). Production also uses Foundry-style named services."
+  - finding: "F1 — Bridge otel-collector filelog/containers receiver overlaps with Fluent Bit"
+    resolution: "Strip filelog/containers from signoz_bridge config (w2-t4). Fluent Bit is now the sole container-log shipper."
+  - finding: "F2 — Local SigNoz must be Foundry multi-container, not combined image"
+    resolution: "w1-t1 uses Foundry stack: signoz-query-service (8080), signoz-ingester (4318), signoz-clickhouse, signoz-signoz (frontend+alertmanager)."
+  - finding: "F3 — Orphaned test/cruft assets at deploy/roles/grafana/ and deploy/roles/signoz/"
+    resolution: "w2-t4 removes deploy/roles/signoz/ (old ClickHouse config role), deploy/test/signoz-config/, and orphaned test debug files."
+  - finding: "F4 — Port 8080 is query-service API, NOT ClickHouse"
+    resolution: "All plan docs, context_envelope, and tasks corrected. 8080 = query-service HTTP. ClickHouse internal ports are 9000/8123."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLANNING ANALYSIS (HIGH complexity — full section)
+# ═══════════════════════════════════════════════════════════════════════════
+open_questions:
+  - question: |
+      Fluent Bit OTLP output uses HTTP/1.1 (not gRPC). Does signoz-ingester
+      accept OTLP HTTP on port 4318 or only gRPC on 4317?
+    context: |
+      SigNoz ingester (otel-collector based) accepts both HTTP and gRPC by
+      default. The bridge otel-collector uses gRPC (4317) for its export but
+      Fluent Bit's OTLP plugin sends HTTP. Verify ingester config accepts
+      /v1/logs HTTP before cutover.
+    type: decision_blocker
+    affects: [w2-t1, w3-t1]
+  - question: |
+      Fluent Bit's OTLP plugin preserves Docker log fields (container_name,
+      container_id, source) as OTLP resource attributes. Do these need explicit
+      mapping or are they automatically included?
+    context: |
+      The `docker` parser in Fluent Bit extracts fields like `time`,
+      `log`, `source`, `container_id`, `container_name`. The OTLP plugin
+      may or may not include all of these in the outgoing record. If IRC
+      Fiber dashboards filter by container_name, we need explicit field
+      mapping in the Fluent Bit config.
+    type: decision_blocker
+    affects: [w2-t1, w4-t1]
+  - question: |
+      signoz_bridge runs on both ircfiber_net AND ircfiber_logging. The local
+      Docker Compose needs only ircfiber_net for bridge services. Should the
+      local compose include a bridge-like OTLP proxy, or can engine push
+      directly to signoz-ingester?
+    context: |
+      For local dev, the engine can push OTLP directly to signoz-ingester:4318
+      (simpler). The bridge is only needed in production for the dual-network
+      crossing. w1-t1 should configure engines to push to signoz-ingester:4318
+      directly.
+    type: decision_blocker
+    affects: [w1-t1]
+  - question: |
+      Grafana Dashboards that query Loki/Tempo/Prometheus — do we migrate them
+      to query SigNoz in this plan, or leave them broken and document?
+    context: |
+      Dashboard migration is explicitly out-of-scope in the original
+      objective. These dashboards will show no data after the datasource
+      switch. Plan to document the gap in AGENTS.md and the local README.
+      A follow-up plan should migrate dashboards.
+    type: decision_blocker
+    affects: [w4-t3]
+
+assumptions:
+  - "Fluent Bit >= 2.2.0 has native OTLP output plugin (required for fluent-bit.conf.j2)."
+  - "SigNoz Foundry multi-container images (signoz/otel-collector, signoz/query-service, signoz/frontend, etc.) are published for both linux/amd64 and linux/arm64."
+  - "signoz-ingester accepts OTLP HTTP on port 4318 for /v1/logs, /v1/traces, /v1/metrics (standard otel-collector behavior)."
+  - "Engine D code (tracing.d) pushes OTLP HTTP to the configured endpoint. The local compose points it to signoz-ingester:4318 directly (no bridge needed)."
+  - "Fluent Bit's `docker` parser extracts container_name + container_id as top-level fields, which become OTLP resource attributes via the opentelemetry output plugin."
+  - "ClickHouse in the local Foundry stack uses ephemeral storage by default — named volume (signoz_clickhouse_data) must be mounted explicitly."
+  - "Grafana 11.x supports the grafana-signoz-datasource plugin (or the Infinity datasource fallback)."
+  - "Loki alert rules migrate reasonably via SigNoz LOGS_BASED_ALERT with `attribute.event =` filters matching the LogQL `event=` selectors."
+
+pre_mortem:
+  overall_risk_level: high
+  critical_failure_modes:
+    - scenario: |
+        Fluent Bit OTLP output drops structured JSON fields (`event`,
+        `level`, `network`) because the `docker` parser extracts them
+        into the body but the OTLP output nests the entire body as a
+        single string, burying the structured fields.
+      likelihood: medium
+      impact: high
+      mitigation: |
+        Test with a known engine log line (`event:join`). Verify in
+        SigNoz logs explorer that `attribute.event = join` returns
+        results. If the body is a flat string, add a `json_parser`
+        operator in the Fluent Bit config to re-parse `$log` before
+        OTLP serialization.
+    - scenario: |
+        Foundry multi-container stack fails to start on ARM64 Mac because
+        signoz-clickhouse is only published for linux/amd64 and Rosetta 2
+        falls over with a ClickHouse segfault.
+      likelihood: high
+      impact: high
+      mitigation: |
+        Pin signoz-clickhouse image to `clickhouse/clickhouse-server:24.8`
+        (which has official ARM64 images). If the Foundry images require
+        x86 ClickHouse, add `platform: linux/amd64` to the clickhouse
+        service in docker-compose.yml.
+    - scenario: |
+        Engine/gateway OTel endpoint change causes a brief trace/metric
+        gap during Fluent Bit cutover if the old bridge and new
+        signoz-ingester are both online with conflicting hostname
+        resolution.
+      likelihood: low
+      impact: medium
+      mitigation: |
+        For local dev: no bridge, engine → signoz-ingester directly, no
+        conflict. For production: keep bridge (it stays), just remove its
+        filelog receiver. Engine OTel endpoint unchanged (bridge still
+        at ircfiber-otel-collector:4318).
+    - scenario: |
+        Grafana SigNoz datasource plugin not available or broken on
+        Grafana 11.3.0, blocking cross-source dashboards.
+      likelihood: medium
+      impact: high
+      mitigation: |
+        w3-t1 must validate plugin availability FIRST. Fallback: use
+        Infinity datasource (yesoreyeram-infinity-datasource). Document
+        in the task.
+    - scenario: |
+        Local Docker Compose runs out of RAM on an 8GB dev machine
+        (ClickHouse ~4GB, query-service ~512MB, ingester ~256MB,
+        IRC stack ~1GB = ~5.8GB before macOS overhead).
+      likelihood: high
+      impact: medium
+      mitigation: |
+        Set ClickHouse memory limits via docker-compose env or
+        `CLICKHOUSE_MEMORY_LIMIT_GB=2`. Configure
+        `max_memory_usage=2GB` in clickhouse config overrides.
+        Document prominently in README.
+    - scenario: |
+        Removing deploy/roles/signoz/ (old ClickHouse config role)
+        breaks an existing playbook that includes this role.
+      likelihood: medium
+      impact: critical
+      mitigation: |
+        Audit all playbooks for `roles/signoz` references BEFORE
+        removal. Update to use Foundry equivalent or remove the
+        include. Document all callers in w2-t4.
+
+coordination_notes:
+  - "Wave 1 (local compose) must complete before Wave 2 (production deploy)
+    because the local compose is the test harness for Fluent Bit config
+    validity and SigNoz Foundry ingestion."
+  - "w2-t4 (unified strip) depends on w2-t1 (Fluent Bit), w2-t2 (role
+    rewrite), w2-t3 (alerts migrated), AND w3-t1 (Grafana datasource)
+    because you cannot remove old container-log shipper, bridge filelog
+    receiver, Tempo, Prometheus, old signoz role, or orphaned test assets
+    until the new stack is fully operational."
+  - "signoz_bridge filelog/containers removal (part of w2-t4) is the
+    transition point: before removal, both bridge and Fluent Bit will be
+    ingesting container logs (duplicate). Schedule a 1-minute overlap
+    window where both run, confirm Fluent Bit logs appear in SigNoz,
+    then remove the bridge receiver and restart the bridge."
+  - "Loki rules migration (w2-t3) is a data-loss risk — current alerts
+    stop firing the moment Loki goes down. Create SigNoz alert rules
+    BEFORE removing Loki. Schedule a 2-minute overlap window."
+  - "The old `deploy/roles/signoz/` ClickHouse config role is separate
+    from `deploy/roles/signoz_bridge/` (OTel bridge). Only the former is
+    removed in w2-t4. The bridge role stays."
+
+contracts:
+  - from_task: w1-t1
+    to_task: w1-t2
+    interface: "localhost port 3301 (host-mapped SigNoz API), localhost port 8090 (gateway health), localhost port 4318 (OTLP HTTP)"
+    format: "docker compose --project-directory deploy/local up -> services healthy on TCP ports"
+  - from_task: w2-t1
+    to_task: w2-t2
+    interface: "fluent-bit.conf rendered from Ansible template -> written to /etc/ircfiber/fluent-bit/fluent-bit.conf"
+    format: "Ansible template -> flat config file on target host"
+  - from_task: w2-t2
+    to_task: w2-t4
+    interface: "docker-compose.logging.yml.j2 rendered template (new stack) -> docker compose deploy"
+    format: "Ansible template -> /etc/ircfiber/logging/docker-compose.yml -> community.docker.docker_compose_v2"
+  - from_task: w2-t3
+    to_task: w3-t3
+    interface: "SigNoz alert rule YAML rendered from signoz-alerts.yml.j2 -> SigNoz REST API POST /api/v2/rules"
+    format: "Ansible template -> API payload -> active alert rules in SigNoz"
+  - from_task: w3-t1
+    to_task: w2-t4
+    interface: "Grafana datasource provisioning YAML -> /etc/ircfiber/grafana/provisioning/datasources/signoz.yml"
+    format: "Ansible template -> YAML file -> re-read by Grafana provisioning provider"
+  - from_task: w3-t3
+    to_task: w2-t4
+    interface: "SigNoz alert rules active before Loki removal and bridge filelog strip"
+    format: "verify via GET /api/v2/rules before proceeding with w2-t4"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TASKS
+# ═══════════════════════════════════════════════════════════════════════════
+tasks:
+  # ═══════════════════════════════════════════════════════════════════════
+  # WAVE 1 — Local Docker Compose (test harness for entire unified stack)
+  # ═══════════════════════════════════════════════════════════════════════
+  - id: w1-t1-local-compose
+    title: Create deploy/local/docker-compose.yml with SigNoz Foundry stack
+    description: |
+      Create `deploy/local/docker-compose.yml` with the Foundry multi-container
+      SigNoz stack (NOT the combined signoz/signoz image — which is brittle on
+      ARM64). Services:
+      - `signoz-query-service`: signoz/query-service:latest on port 8080
+        (REST API — NOT ClickHouse). Host-map 3301→8080. Healthcheck on
+        `http://localhost:8080/api/v1/services`.
+      - `signoz-ingester`: signoz/otel-collector:latest on ports 4317 (gRPC)
+        and 4318 (HTTP OTLP). Accepts traces+metrics+logs OTLP HTTP.
+        Healthcheck on :13133.
+      - `signoz-clickhouse`: clickhouse/clickhouse-server:24.8 on ports
+        9000 (native), 8123 (HTTP). Named volume for data persistence.
+        Memory limit env: `CLICKHOUSE_MEMORY_LIMIT_GB=2`.
+      - `signoz-signoz`: signoz/frontend:latest on port 3301 (UI). Healthcheck.
+      - `signoz-alertmanager`: signoz/alertmanager:latest. Internal only.
+      - `fluent-bit`: fluent/fluent-bit:latest, mounts
+        `/var/lib/docker/containers/` read-only via volumes.
+        Config inline: [INPUT] tail with docker parser, Path_Exclude pattern
+        for Fluent Bit's own logs (recursion guard).
+        [OUTPUT] opentelemetry to signoz-ingester:4318.
+        `json_parser` operator on `$log` field for structured extraction
+        of `event`, `level`, `network`, `nick`, `channel`.
+      - `ircfiber-gateway`: build from Containerfile, command `/app/irc-fiber`.
+        Env: IRCFIBER_OTEL_ENDPOINT=http://signoz-ingester:4318,
+        IRCFIBER_REDIS_URL=redis://redis:6379/0,
+        IRCFIBER_MONGO_URL=mongodb://mongo:27017/ircfiber. Port 8090:8090.
+      - `ircfiber-engine`: same build, command `/app/irc-fiber-engine`.
+        Env: IRCFIBER_SERVER_ID=localdev1,
+        IRCFIBER_OTEL_ENDPOINT=http://signoz-ingester:4318.
+      - `ircd`: build from docker/ircd/Dockerfile, port 6667.
+      - `redis`: redis:7-alpine with healthcheck.
+      - `mongo`: mongo:7 with healthcheck.
+      All services on a shared `ircfiber_local` bridge network.
+      Named volumes: redis_data, mongo_data, signoz_clickhouse_data.
+      Healthchecks on every service.
+    wave: 1
+    agent: gem-devops
+    covers:
+      - local-dev-compose
+      - signoz-foundry
+      - fluent-bit-setup
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: docker-compose.test.yml
+        description: Reference for IRC service config (env vars, healthchecks, networks)
+      - path: Containerfile
+        description: Source for local gateway + engine build
+      - path: deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2
+        description: Reference for OTLP ingest pattern and port conventions
+    acceptance_criteria:
+      - "h1: `docker compose -f deploy/local/docker-compose.yml up -d` exits 0"
+      - "h2: `curl -fsS http://localhost:8090/health` returns OK"
+      - "h3: `curl -fsS http://localhost:3301/api/v1/services` returns valid JSON services list (port 3301 maps to signoz-query-service:8080)"
+      - "h4: `curl -fsS http://localhost:4318/v1/logs` with OTLP-shaped POST returns 200 (signoz-ingester reachable)"
+      - "h5: `curl -fsS http://localhost:6667` connects to ircd"
+      - "h6: All 11 containers show healthy in `docker ps --filter network=ircfiber_local`"
+      - "h7: Fluent Bit starts without config errors: `docker logs ircfiber-fluent-bit 2>&1 | grep -i error` returns empty"
+    success_criteria:
+      - "Run `docker compose -f deploy/local/docker-compose.yml up -d` and verify all services healthy within 120s"
+      - "Verify SigNoz UI at http://localhost:3301 loads"
+      - "Verify gateway health at http://localhost:8090/health"
+      - "Verify Fluent Bit ingesting container logs appears in SigNoz logs explorer"
+    handoff:
+      target_files:
+        - deploy/local/docker-compose.yml
+      do_not_reinvestigate:
+        - "Port 3301 maps to signoz-query-service:8080 (API port — NOT ClickHouse)"
+        - "Fluent Bit OTLP endpoint: signoz-ingester:4318"
+        - "Engine OTel endpoint: signoz-ingester:4318 (no bridge needed in local compose)"
+      minimal_change: "Create new file deploy/local/docker-compose.yml; do NOT modify docker-compose.test.yml"
+      acceptance_checks:
+        - "Verify SigNoz shows >0 services after 60s ingestion window"
+        - "Verify engine connects to ircd (look for JOIN event in SigNoz logs)"
+
+  - id: w1-t2-smoke-script
+    title: Create tests/local-dev/smoke-observability.sh
+    description: |
+      Create a bash smoke test script that validates the entire local stack
+      end-to-end. Checks:
+      a) Gateway health: `curl -fsS http://localhost:8090/health`
+      b) SigNoz API reachable: `curl -fsS http://localhost:3301/api/v1/services`
+         returns valid JSON with at least one entry.
+      c) OTLP ingestion: query
+         `http://localhost:3301/api/v5/query_range` with a known service name
+         (ircfiber-gateway or ircfiber-engine) — confirm at least one trace
+         or log record returned.
+      d) Fluent Bit running: `docker ps --filter name=ircfiber-fluent-bit --format json`
+         and container status = running.
+      e) OTLP endpoint reachable: `curl -s -o /dev/null -w '%{http_code}'
+         http://localhost:4318` returns non-zero (signoz-ingester port is
+         HTTP-accessible, not a port conflict).
+      Each check prints `PASS:` or `FAIL:` with ISO-8601 timestamp and the
+      response details. Exits 0 only if ALL checks pass.
+    wave: 1
+    agent: gem-implementer
+    covers:
+      - smoke-test
+      - verification-script
+    dependencies:
+      - w1-t1-local-compose
+    conflicts_with: []
+    context_files:
+      - path: deploy/local/docker-compose.yml
+        description: Target compose file (created by w1-t1)
+    acceptance_criteria:
+      - "h1: `bash tests/local-dev/smoke-observability.sh` exits 0"
+      - "h2: Each block prints PASS with ISO-8601 timestamp"
+      - "h3: `bash tests/local-dev/smoke-observability.sh 2>&1 | grep -c FAIL` returns 0"
+    success_criteria:
+      - "Run smoke script against `docker compose up` stack, verify all 5 checks pass"
+    handoff:
+      target_files:
+        - tests/local-dev/smoke-observability.sh
+      minimal_change: "Create new file tests/local-dev/smoke-observability.sh; no existing files modified"
+      acceptance_checks:
+        - "Script is idempotent (run twice, same result)"
+
+  - id: w1-t3-vite-dev-proxy
+    title: Update VITE_SIGNOZ_URL default to localhost:3301
+    description: |
+      Update `frontend/vite.config.ts` so the dev proxy's SigNoz URL default
+      points to the local Docker Compose SigNoz host port mapping.
+      Current default: `http://127.0.0.1:8080`
+      New default: `http://127.0.0.1:3301`
+      Rationale: port 3301 maps to signoz-query-service:8080 inside the local
+      Docker Compose. Port 8080 was previously confused with ClickHouse — it
+      is actually the query-service HTTP API port. The dev proxy rules for
+      `/api/v1/*` through `/api/v5/*` and `/signoz/*` already exist and need
+      no structural changes.
+      Keep the `process.env.VITE_SIGNOZ_URL` override for tailnet/non-local use.
+    wave: 1
+    agent: gem-implementer
+    covers:
+      - dev-proxy
+      - vite-config
+    dependencies:
+      - w1-t1-local-compose
+    conflicts_with: []
+    context_files:
+      - path: frontend/vite.config.ts
+        description: The dev proxy config to update
+    acceptance_criteria:
+      - "h1: Default VITE_SIGNOZ_URL in vite.config.ts is `http://127.0.0.1:3301`"
+      - "h2: Env var override `VITE_SIGNOZ_URL=http://other:1234 npm run dev` still works"
+      - "h3: Vite dev server starts without errors with the new default"
+    success_criteria:
+      - "Run `grep SIGNOZ_URL frontend/vite.config.ts | grep 3301` matches"
+      - "Env override: VITE_SIGNOZ_URL=http://irrelevant:9999 npm run dev starts with no proxy errors"
+    handoff:
+      target_files:
+        - frontend/vite.config.ts
+      do_not_reinvestigate:
+        - "SIGNOZ_URL default changes from 8080 to 3301"
+        - "Port 8080 is the query-service API port (NOT ClickHouse) — the host maps 3301→8080"
+        - "The proxy rules themselves (order, path patterns) are unchanged"
+      minimal_change: "Single one-line change to the SIGNOZ_URL constant default value"
+      acceptance_checks:
+        - "`npm run dev` starts with no proxy errors logged"
+
+  - id: w1-t4-test-compose-fluent-bit
+    title: Add Fluent Bit to docker-compose.test.yml
+    description: |
+      Add a `fluent-bit` service to the existing `docker-compose.test.yml`
+      so CI integration tests also exercise the container-log pipeline.
+      Config: fluent/fluent-bit:latest, mounts
+      `/var/lib/docker/containers/` read-only (same as prod), OTLP output
+      to signoz-ingester:4318.
+      The CI test stack (redis, mongo, ircd, gateway, engine) does not
+      currently include observability — this is additive and non-breaking.
+      The Fluent Bit container must start and remain healthy, but the test
+      suite does not depend on it (failure is non-fatal for CI).
+    wave: 1
+    agent: gem-devops
+    covers:
+      - test-infra
+      - ci-integration
+    dependencies:
+      - w1-t1-local-compose
+    conflicts_with: []
+    context_files:
+      - path: docker-compose.test.yml
+        description: Existing CI test compose to extend
+      - path: deploy/local/docker-compose.yml
+        description: Reference for Fluent Bit config pattern
+    acceptance_criteria:
+      - "h1: `docker compose -f docker-compose.test.yml up -d fluent-bit` starts successfully"
+      - "h2: `docker ps --filter name=fluent-bit --format '{{.Status}}' | grep -q Up` exits 0"
+      - "h3: Existing test services (ircd, redis, mongo) are unaffected"
+    success_criteria:
+      - "Run `docker compose -f docker-compose.test.yml up -d fluent-bit` and check status = healthy/Up"
+      - "Run `docker compose -f docker-compose.test.yml ps` — all original services still healthy"
+    handoff:
+      target_files:
+        - docker-compose.test.yml
+      do_not_reinvestigate:
+        - "Fluent Bit service entry follows the same pattern as existing services"
+      minimal_change: "Add a single `fluent-bit:` service block to the existing services section"
+      acceptance_checks:
+        - "`docker compose -f docker-compose.test.yml config` validates without errors"
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # WAVE 2 — Production deployment changes
+  # ═══════════════════════════════════════════════════════════════════════
+  - id: w2-t1-fluent-bit-prod-config
+    title: Create Fluent Bit production config with JSON extraction and recursion guard
+    description: |
+      Create `deploy/roles/logging/templates/fluent-bit.conf.j2` — the
+      Ansible template for production Fluent Bit config on the OVH server.
+      Config structure:
+      - [INPUT] tail of /var/lib/docker/containers/*/*-json.log with
+        `docker` parser, tag docker.*, Mem_Buf_Limit 50MB.
+        Exclude_Path: pattern matching `ircfiber-fluent-bit` container logs
+        (recursion guard — Fluent Bit must not read its own logs).
+      - No Kubernetes filter (bare Docker deployment).
+      - [FILTER] json_parser on `$log` body to extract structured fields:
+        `event`, `level`, `network`, `nick`, `channel` from IRC engine
+        JSON log lines. These become OTLP log record attributes so
+        `attribute.event = join` queries work in SigNoz.
+      - [FILTER] modify: add `service` label derived from container name
+        (mirror current Promtail's component label logic).
+      - [OUTPUT] opentelemetry to signoz-ingester:4318 via HTTP
+        (the SigNoz ingester accepts OTLP HTTP on port 4318).
+        Logs_Format otlp.
+      - [OUTPUT] (optional) stdout for debugging — disabled by default.
+      JSON field extraction detail:
+        The engine emits structured JSON like:
+        `{"event":"join","level":"info","network":"LiberaChat","nick":"bot","channel":"#dev"}`
+        Fluent Bit must:
+        a) Parse the `log` field with a `json_parser` operator
+        b) Extract top-level keys as individual attributes
+        c) Pass them through to the OTLP output as log record attributes
+      Container mount: Docker socket + /var/lib/docker/containers/
+      (the docker-compose template in w2-t2 mounts these. The config
+      file is just the Fluent Bit config — volume mounts are in the
+      docker-compose template).
+    wave: 2
+    agent: gem-devops
+    covers:
+      - fluent-bit-config
+      - production-logging
+      - json-field-extraction
+    dependencies:
+      - w1-t1-local-compose
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/logging/templates/promtail-config.yml.j2
+        description: Reference — current log-shipping config (will be replaced)
+      - path: deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2
+        description: Reference for OTLP port conventions and structured log field patterns
+    acceptance_criteria:
+      - "h1: `deploy/roles/logging/templates/fluent-bit.conf.j2` exists and is valid Fluent Bit config syntax"
+      - "h2: Template uses {{ }} Jinja2 vars for configurable host/port/parser"
+      - "h3: OTLP output targets signoz-ingester:4318 (configurable via ansible var)"
+      - "h4: Config excludes Fluent Bit's own container logs (Exclude_Path recursion guard)"
+      - "h5: Config has json_parser operator extracting event, level, network, nick, channel from log body"
+    success_criteria:
+      - "Validate with: `docker run --rm -v $(pwd)/deploy/roles/logging/templates/fluent-bit.conf.j2:/fluent-bit/etc/fluent-bit.conf fluent/fluent-bit:latest --dry-run`"
+      - "Rendered template with defaults passes Fluent Bit's config parser"
+    handoff:
+      target_files:
+        - deploy/roles/logging/templates/fluent-bit.conf.j2
+      do_not_reinvestigate:
+        - "OTLP output to signoz-ingester:4318 (NOT the bridge otel-collector)"
+        - "Recursion guard: exclude container name matching ircfiber-fluent-bit"
+        - "JSON extract fields: event, level, network, nick, channel"
+      minimal_change: "Create new template file; do not modify other templates in this task"
+      acceptance_checks:
+        - "Template renders to valid Fluent Bit config with ansible-playbook --check"
+
+  - id: w2-t2-rewrite-logging-role
+    title: Rewrite Ansible logging role for SigNoz-native stack
+    description: |
+      Rewrite the `deploy/roles/logging/` Ansible role to replace the
+      Loki/Promtail/Tempo/otel-collector/Prometheus stack with Fluent Bit
+      + SigNoz Foundry-style services. Specific changes:
+      - `defaults/main.yml`: Remove all `loki_*`, `promtail_*`, `tempo_*`,
+        `otelcol_*`, `prometheus_*` vars. Add `fluent_bit_*` vars:
+        `fluent_bit_image`, `fluent_bit_container_name`, `fluent_bit_config_path`,
+        `fluent_bit_memory_limit`, `fluent_bit_cpu_limit`.
+        Retain `grafana_*` vars. Add `signoz_*` vars for Foundry services.
+      - `tasks/main.yml`: Remove Loki/Promtail/Tempo/otel-collector/Prometheus
+        config-render + volume-create + deploy tasks. Add:
+        * Fluent Bit config dir creation
+        * Render fluent-bit.conf from new template
+        * Render Fluent Bit docker-compose service (adds to logging stack)
+        * Render SigNoz Foundry docker-compose services (query-service,
+          ingester, clickhouse, signoz-frontend, alertmanager)
+        * Render Grafana datasource (SigNoz instead of Loki/Tempo/Prometheus)
+        * Post-deploy healthchecks: SigNoz API + Grafana + Fluent Bit
+      - `handlers/main.yml`: Remove old-service restart handlers.
+        Add Fluent Bit + SigNoz restart handlers.
+      - `templates/docker-compose.logging.yml.j2`: Replace full stack with
+        Foundry-style: `signoz-query-service`, `signoz-ingester`,
+        `signoz-clickhouse`, `signoz-signoz`, `signoz-alertmanager`,
+        `fluent-bit`, `grafana`. Fluent Bit mounts Docker socket +
+        container log dirs. Docker-compose networking on `ircfiber_logging`.
+      - `templates/logging.env.j2`: Remove old vars. Add Fluent Bit + SigNoz vars.
+      - `templates/grafana-datasources.yml.j2`: Will be updated in w3-t1.
+      - `files/`: Remove `otelcol-config.yaml`, `tempo-config.yaml`,
+        `prometheus.yml`. Retain `dashboards/` directory (unchanged —
+        manual dashboard migration is out of scope).
+      - `templates/loki-rules.yml.j2`: Remove — handled in w2-t3.
+    wave: 2
+    agent: gem-devops
+    covers:
+      - ansible-role
+      - production-deploy
+    dependencies:
+      - w2-t1-fluent-bit-prod-config
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/logging/
+        description: The entire logging role directory to rewrite
+      - path: deploy/roles/logging/defaults/main.yml
+        description: Defaults to update (remove old services, add Fluent Bit + SigNoz)
+      - path: deploy/roles/logging/tasks/main.yml
+        description: Task list to rewrite
+      - path: deploy/roles/logging/handlers/main.yml
+        description: Handlers to update
+      - path: deploy/roles/logging/templates/docker-compose.logging.yml.j2
+        description: Compose template to replace
+      - path: deploy/roles/logging/templates/logging.env.j2
+        description: Env vars to simplify
+    acceptance_criteria:
+      - "h1: `deploy/roles/logging/defaults/main.yml` contains no loki_*, promtail_*, tempo_*, otelcol_*, prometheus_* vars"
+      - "h2: `deploy/roles/logging/tasks/main.yml` has no task referencing loki, promtail, tempo, otel-collector, or prometheus"
+      - "h3: `deploy/roles/logging/handlers/main.yml` has no handler for loki, promtail, tempo, otel-collector, prometheus"
+      - "h4: `deploy/roles/logging/templates/docker-compose.logging.yml.j2` contains only Foundry services"
+      - "h5: `deploy/roles/logging/files/otelcol-config.yaml`, `tempo-config.yaml`, `prometheus.yml` are deleted"
+      - "h6: `deploy/roles/logging/templates/loki-config.yml.j2`, `promtail-config.yml.j2`, `loki-rules.yml.j2` are deleted"
+      - "h7: Ansible syntax check: `ansible-playbook deploy/playbooks/logging.yml --syntax-check` passes"
+    success_criteria:
+      - "`ansible-playbook deploy/playbooks/logging.yml --syntax-check --check` exits 0"
+      - "`grep -Er 'loki|promtail|tempo|prometheus' deploy/roles/logging/tasks/ deploy/roles/logging/handlers/ deploy/roles/logging/defaults/ deploy/roles/logging/templates/` returns nothing for removed services"
+    handoff:
+      target_files:
+        - deploy/roles/logging/defaults/main.yml
+        - deploy/roles/logging/tasks/main.yml
+        - deploy/roles/logging/handlers/main.yml
+        - deploy/roles/logging/templates/docker-compose.logging.yml.j2
+        - deploy/roles/logging/templates/logging.env.j2
+      do_not_reinvestigate:
+        - "Grafana datasource provisioning (deferred to w3-t1)"
+        - "Dashboard JSON files (unchanged — migration out of scope)"
+      minimal_change: "Rewrite role files; remove old-service files; do not touch roles outside logging/"
+      acceptance_checks:
+        - "ansible-playbook --syntax-check passes"
+        - "git diff --stat shows the expected file deletions"
+
+  - id: w2-t3-migrate-loki-alerts-to-signoz
+    title: Migrate Loki alerting rules to SigNoz alert rules
+    description: |
+      Migrate all 14 alert rules from
+      `deploy/roles/logging/templates/loki-rules.yml.j2` to SigNoz
+      LOGS_BASED_ALERT rules. Create a migration manifest as
+      `deploy/roles/logging/signoz-alerts.yml.j2` — an Ansible template
+      that renders to a list of SigNoz alert rule definitions.
+      The 14 rules to migrate:
+      1. IrcfiberTLSFailures — event=tls_fail, 3 in 5m → severity warning
+      2. IrcfiberReconnectStorm — event=reconnect_scheduled, 10 in 5m → warning
+      3. IrcfiberHandoffTLSFailures — event=handoff_fail,reason=tls → warning
+      4. IrcfiberSASLFailures — event=sasl_fail, 2 in 10m per network → critical
+      5. IrcfiberEngineSilent — no logs for 10m → critical
+      6. IrcfiberErrorSpike — level=error, rate >1/s for 5m → warning
+      7. IrcfiberConnectionDrop — event=disconnected, 3 in 5m → warning
+      8. IrcfiberPrefsFieldInvalid — event=prefs_field_invalid → warning
+      9. IrcfiberPrefsLoadFail — event=prefs_load_fail → critical
+      10. IrcfiberTLSWriteFail — event=tls_write_fail → warning
+      11. IrcfiberCmdExecFail — event=cmd_exec_fail, 10 in 5m → warning
+      12. IrcfiberCmdDroppedNoConn — event=cmd_dropped_no_conn → warning
+      13. IrcfiberLineTooLong — event=line_too_long → warning
+      14. IrcfiberServerErrorDetected — event=server_error_detected → warning
+      Each rule maps the Loki LogQL query to a SigNoz filter expression
+      (`attribute.event = 'tls_fail'`) + threshold + evaluation window.
+      NOTIFY: The migration manifest should document the notification
+      channel (Slack webhook or PagerDuty, per user preference).
+    wave: 2
+    agent: gem-devops
+    covers:
+      - alert-migration
+      - signoz-alerts
+    dependencies:
+      - w2-t2-rewrite-logging-role
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/logging/templates/loki-rules.yml.j2
+        description: Source rules to migrate (full file with 14 rules)
+      - path: docs/plan/20260630-admin-signoz-logs-panel/plan.yaml
+        description: Reference for existing SigNoz integration patterns and alerting conventions
+    acceptance_criteria:
+      - "h1: `deploy/roles/logging/signoz-alerts.yml.j2` exists and contains all 14 rules mapped to SigNoz LOGS_BASED_ALERT format"
+      - "h2: Each rule has `filter: attribute.event = '<event_name>'` replacing the Loki LogQL selector"
+      - "h3: Thresholds and evaluation windows match Loki rules"
+      - "h4: Ansible syntax check passes"
+      - "h5: `deploy/roles/logging/templates/loki-rules.yml.j2` is deleted"
+    success_criteria:
+      - "Ansible template renders valid SigNoz alert rule JSON"
+      - "Each Loki rule has exactly one SigNoz counterpart (title, severity, event filter match)"
+    handoff:
+      target_files:
+        - deploy/roles/logging/signoz-alerts.yml.j2
+        - deploy/roles/logging/templates/loki-rules.yml.j2 (to delete)
+      do_not_reinvestigate:
+        - "The 14 Loki rule patterns and thresholds are the source of truth"
+      minimal_change: "Create alert migration template; delete old loki-rules.yml.j2"
+      acceptance_checks:
+        - "Each migrated rule has the same severity+threshold as the Loki original"
+        - "`grep -r 'event=' deploy/roles/logging/signoz-alerts.yml.j2` matches 14 event types"
+
+  - id: w2-t4-unified-strip
+    title: Remove old stack, bridge filelog, Tempo/Prometheus, orphaned assets
+    description: |
+      After Fluent Bit is shipping logs (w2-t1), the new docker-compose
+      rendered (w2-t2), SigNoz alerts active (w2-t3), and Grafana datasource
+      deployed (w3-t1), execute the unified cleanup:
+      A) Old stack removal (original w2-t4):
+         - `docker compose -f /etc/ircfiber/logging/docker-compose.yml down`
+         - Remove Docker volumes: ircfiber_loki_data, ircfiber_loki_config,
+           ircfiber_promtail_config, ircfiber_promtail_positions,
+           ircfiber_tempo_data, ircfiber_tempo_config,
+           ircfiber_otelcol_config, ircfiber_prometheus_data
+         - Remove old config dirs: /etc/ircfiber/{loki,promtail,tempo,otelcol,prometheus}/
+         - Verify no containers running for old services
+      B) Bridge filelog/containers strip:
+         - Edit `deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2`
+         - Remove the `filelog/containers` receiver block (lines 136-156)
+         - Remove `filelog/containers` from the `logs` pipeline receiver list
+         - Optionally add transform/newrelic processor note to ensure
+           container log attributes are not duplicated (Fluent Bit now
+           sets its own resource attributes)
+         - Keep all other receivers (otlp, hostmetrics, docker_stats, filelog/caddy)
+         - Keep all processors (memory_limiter, batch, resourcedetection,
+           transform/newrelic, redaction)
+         - Keep the exporter (otlp/signoz to signoz-ingester:4317)
+         - Restart the bridge collector after config change
+         - Verify: `grep -c 'filelog/containers' otel-collector-config.yaml` returns 0
+      C) Tempo + Prometheus removal (merged from w3-t2 — user already decided):
+         - Remove Tempo datasource from Grafana provisioning
+         - Remove Prometheus datasource from Grafana provisioning
+         - Remove Tempo container + volume (if still running)
+         - Remove Prometheus container + volume (if still running)
+         - (Already handled by the logging role rewrite in w2-t2 for
+           the compose template; this step ensures orphan containers
+           are also removed)
+      D) Old signoz role removal:
+         - Remove `deploy/roles/signoz/` entire directory (old ClickHouse
+           config role — superseded by Foundry)
+         - Audit all playbooks for `roles/signoz` references and update
+         - Remove `deploy/test/signoz-config/` entire directory (ClickHouse
+           config regression tests — no longer applicable)
+      E) Orphaned test/debug assets removal:
+         - Check `deploy/roles/grafana/` for stray test/cruft files and remove
+         - Check `deploy/roles/signoz_bridge/` for stray test/debug files and remove
+         - Check `deploy/roles/caddy/` for orphaned signoz test assets and remove
+      Task is idempotent — exit 0 if items already absent.
+    wave: 2
+    agent: gem-devops
+    covers:
+      - stack-teardown
+      - bridge-cleanup
+      - cleanup
+      - disposition
+    dependencies:
+      - w2-t3-migrate-loki-alerts-to-signoz
+      - w3-t1-signoz-data-source
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2
+        description: Bridge config to strip filelog/containers from
+      - path: deploy/roles/signoz/
+        description: Old role directory to remove entirely
+      - path: deploy/test/signoz-config/
+        description: Old test directory to remove entirely
+    acceptance_criteria:
+      - "A-h1: `docker ps -a --filter name=ircfiber-loki --filter name=ircfiber-promtail --filter name=ircfiber-tempo --filter name=ircfiber-otel-collector --filter name=ircfiber-prometheus` returns empty"
+      - "A-h2: `docker volume ls --filter name=ircfiber_loki --filter name=ircfiber_promtail --filter name=ircfiber_tempo --filter name=ircfiber_otelcol --filter name=ircfiber_prometheus` returns empty"
+      - "B-h1: `grep -c 'filelog/containers' deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2` returns 0"
+      - "B-h2: Bridge collector restarts clean: `docker inspect ircfiber-otel-collector --format '{{.State.Status}}'` returns running"
+      - "C-h1: Grafana datasource list shows no Tempo or Prometheus datasource"
+      - "D-h1: `ls deploy/roles/signoz/ 2>&1` returns 'No such file or directory'"
+      - "D-h2: `ls deploy/test/signoz-config/ 2>&1` returns 'No such file or directory'"
+      - "E-h1: No files named *test*, *debug*, or *cruft* in deploy/roles/grafana/, deploy/roles/signoz_bridge/, deploy/roles/caddy/"
+    success_criteria:
+      - "Run cleanup tasks; verify old services absent; verify bridge config has no filelog/containers; verify signoz role dir removed; verify Grafana still serves dashboards"
+    handoff:
+      target_files:
+        - deploy/roles/logging/tasks/cleanup-old-stack.yml
+        - deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2 (to edit)
+      do_not_reinvestigate:
+        - "filelog/containers in bridge config must be removed (lines 136-156)"
+        - "Bridge otlp receiver and transform/newrelic processor stay"
+        - "signoz_test and signoz role directories are safe to delete (superseded by Foundry)"
+      minimal_change: "Edit bridge config in place; remove dirs; add cleanup task file"
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # WAVE 3 — Grafana, Caddy cleanup, Alert deployment
+  # ═══════════════════════════════════════════════════════════════════════
+  - id: w3-t1-signoz-data-source
+    title: Replace Grafana datasources with SigNoz (correct port)
+    description: |
+      Update `deploy/roles/logging/templates/grafana-datasources.yml.j2`
+      to replace the Loki/Tempo/Prometheus datasources with a single
+      SigNoz datasource. Requirements:
+      a) Remove the Loki datasource block entirely.
+      b) Remove the Tempo datasource block entirely.
+      c) Remove the Prometheus datasource block entirely.
+      d) Add a SigNoz datasource:
+        - Name: "SigNoz"
+        - Type: prefer "grafana-signoz-datasource" plugin if available;
+          fallback to "yesoreyeram-infinity-datasource" or Grafana's
+          built-in "grafana" datasource type for Prometheus-style metrics.
+        - URL: `http://signoz-signoz:8080` (production — query-service API,
+          internal Docker network. Port 8080 is the query-service HTTP API,
+          NOT ClickHouse).
+          Local override: set `signoz_grafana_url` default to
+          `http://signoz:3301` for host-mapped local access.
+        - Access: proxy
+        - JSON data: API key injected from ansible vault var
+          `signoz_grafana_api_key`
+        - isDefault: true
+        - editable: false
+      e) FIRST validate that the SigNoz datasource plugin is available
+        for Grafana 11.3.0. If not, use the Infinity datasource
+        (yesoreyeram-infinity-datasource) as the primary.
+      f) Add `sigNoz_alert_provisioning` section to the defaults/main.yml
+        for alert rule deployment (consumed by w3-t3).
+    wave: 3
+    agent: gem-devops
+    covers:
+      - grafana-config
+      - signoz-integration
+    dependencies:
+      - w2-t2-rewrite-logging-role
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/logging/templates/grafana-datasources.yml.j2
+        description: Current datasource file to rewrite
+      - path: deploy/roles/logging/defaults/main.yml
+        description: Will need new signoz_grafana_api_key default
+    acceptance_criteria:
+      - "h1: `deploy/roles/logging/templates/grafana-datasources.yml.j2` contains no `name: Loki`, `name: Tempo`, or `name: Prometheus`"
+      - "h2: File contains a datasource with `name: SigNoz`, `url: http://signoz-signoz:8080`"
+      - "h3: SigNoz datasource is `isDefault: true`"
+      - "h4: After deploy, `curl -fsS https://ircfiber.com/grafana/api/datasources | jq '.[].name'` returns `SigNoz`"
+      - "h5: Existing Grafana dashboards can query the SigNoz datasource"
+    success_criteria:
+      - "Deploy playbook; verify Grafana datasources list shows SigNoz as default; open a dashboard and see data"
+    handoff:
+      target_files:
+        - deploy/roles/logging/templates/grafana-datasources.yml.j2
+      do_not_reinvestigate:
+        - "SigNoz query-service API port is 8080 (internal Docker network)"
+        - "Port 3301 is the host-mapped port — DO NOT use 3301 in Grafana datasource URL for production Docker deployments"
+        - "Grafana plugin fork/version decision"
+      minimal_change: "Replace datasource definitions in place; preserve `apiVersion: 1` header"
+
+  - id: w3-t2-caddy-route-cleanup
+    title: Remove Loki-related Caddy routes and orphaned test assets
+    description: |
+      Audit `deploy/roles/caddy/templates/Caddyfile.j2` for any routes
+      referencing Loki, Promtail, Tempo, or the old logging stack. Remove them.
+      The `/grafana/*` proxy route stays. The `/signoz/*` and
+      `/api/v[1-5]/*` SigNoz routes stay.
+      ALSO: remove orphaned signoz/grafana test/debug assets under the
+      Caddy role directory (`deploy/roles/caddy/`) that reference old
+      stack services.
+      Expected:
+      - No `loki`, `promtail`, `tempo` strings in the Caddyfile
+      - No route pointing at ircfiber-loki
+      - The Grafana block remains (still served at /grafana/)
+      - Orphaned test files removed
+      Run: `grep -ri 'loki\|promtail\|tempo' deploy/roles/caddy/` — must
+      return no matches after cleanup.
+    wave: 3
+    agent: gem-devops
+    covers:
+      - caddy-config
+      - route-cleanup
+    dependencies:
+      - w2-t4-unified-strip
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/caddy/templates/Caddyfile.j2
+        description: Caddyfile to audit and clean
+    acceptance_criteria:
+      - "h1: `grep -irE 'loki|promtail|tempo|prometheus' deploy/roles/caddy/` returns no matches"
+      - "h2: `/grafana` route in Caddyfile.j2 is intact"
+      - "h3: `/signoz` routes in Caddyfile.j2 are intact"
+    success_criteria:
+      - "Rerun `grep -irE 'loki|promtail' deploy/roles/caddy/` returns empty"
+    handoff:
+      target_files:
+        - deploy/roles/caddy/templates/Caddyfile.j2
+      do_not_reinvestigate:
+        - "Grafana and SigNoz routes stay as-is"
+      minimal_change: "Remove only the Loki/Tempo/Promtail/Prometheus route lines and orphaned test files"
+
+  - id: w3-t3-deploy-signoz-alerts
+    title: Deploy SigNoz alert rules via Ansible provisioning
+    description: |
+      Add Ansible tasks to `deploy/roles/logging/tasks/main.yml` that deploy
+      the SigNoz alert rules created in w2-t3 (`signoz-alerts.yml.j2`).
+      Approach: render the alert rule YAML template to a JSON payload and
+      POST to SigNoz's `POST /api/v2/rules` endpoint via `ansible.builtin.uri`.
+      Steps:
+      a) Render `signoz-alerts.yml.j2` to a temp JSON file on the target.
+      b) For each rule in the rendered file:
+         - Check if it already exists via `GET /api/v2/rules`
+           (match by rule name).
+         - If not: POST to create it.
+         - If yes: PUT to update it (if thresholds/secrets changed).
+      c) Verify: `GET /api/v2/rules` returns the expected 14 rules.
+      d) Cleanup temp file.
+      Depends on w3-t1 (SigNoz URL port correct: signoz-query-service:8080)
+      and w2-t3 (alert templates exist).
+    wave: 3
+    agent: gem-devops
+    covers:
+      - alert-deployment
+      - signoz-provisioning
+    dependencies:
+      - w2-t3-migrate-loki-alerts-to-signoz
+      - w3-t1-signoz-data-source
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/logging/signoz-alerts.yml.j2
+        description: Alert rule templates to deploy (created by w2-t3)
+      - path: deploy/roles/logging/defaults/main.yml
+        description: Will need signoz_api_url and signoz_api_key defaults
+    acceptance_criteria:
+      - "h1: All 14 alert rules are created in SigNoz (verify via GET /api/v2/rules)"
+      - "h2: Each rule is enabled (disabled = false)"
+      - "h3: Notification channel is attached (verify preferredChannels not empty)"
+      - "h4: Ansible playbook `--check` passes without errors"
+    success_criteria:
+      - "Run playbook; curl https://ircfiber.com/signoz/api/v2/rules returns 14 rules matching the migrated names"
+    handoff:
+      target_files:
+        - deploy/roles/logging/tasks/deploy-alerts.yml
+      do_not_reinvestigate:
+        - "SigNoz API endpoint is signoz-query-service:8080 (NOT signoz-ingester:4318)"
+        - "API key from vault /etc/ircfiber/signoz-mcp/.api_key"
+      minimal_change: "Add a new task include file; include it from main.yml after alert template rendering"
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # WAVE 4 — Polish + docs + Makefile
+  # ═══════════════════════════════════════════════════════════════════════
+  - id: w4-t1-local-readme
+    title: Create deploy/local/README.md
+    description: |
+      Create `deploy/local/README.md` with full instructions for the local
+      Docker Compose development environment. Sections:
+      - Prerequisites: Docker 24+, 8GB+ free RAM, ports 3301/4318/8090/6667 free
+      - Architecture diagram (ASCII): Fluent Bit -> signoz-ingester (logs)
+        + Engine -> signoz-ingester (traces+metrics) -> SigNoz ClickHouse
+        + Grafana -> signoz-query-service:8080
+      - Quick start: `docker compose up -d` and smoke test
+      - Component reference: table of all 11 containers, ports, service names
+      - Foundry multi-container explanation (why not combined image)
+      - Local dev workflow: running engine, connecting to local ircd, viewing
+        traces in SigNoz at http://localhost:3301
+      - Port clarification: 8080 = query-service API (internal), 3301 = host
+        access to API, 4318 = OTLP HTTP ingestion
+      - Fluent Bit: how to verify log ingestion, JSON field extraction
+      - Connection: configuring Vite dev server to talk to local SigNoz
+      - Tear-down: `docker compose down --volumes` (wipes ClickHouse data)
+      - Troubleshooting: ClickHouse OOM, ARM64 ClickHouse platform hints,
+        port conflicts, Fluent Bit recursion guard, empty SigNoz services
+      - Makefile targets reference (covers w4-t2)
+    wave: 4
+    agent: gem-documentation-writer
+    covers:
+      - documentation
+      - local-dev-guide
+    dependencies:
+      - w1-t1-local-compose
+      - w1-t2-smoke-script
+      - w4-t2-makefile-targets
+    conflicts_with: []
+    context_files:
+      - path: deploy/local/docker-compose.yml
+        description: The compose file being documented
+      - path: tests/local-dev/smoke-observability.sh
+        description: The smoke script being documented
+    acceptance_criteria:
+      - "h1: `deploy/local/README.md` exists with all listed sections"
+      - "h2: A new developer can follow Quick Start and get the stack running in <10min"
+      - "h3: All shell commands are copy-paste safe ($ prefix, consistent shell)"
+    success_criteria:
+      - "Fresh checkout -> `cd deploy/local && docker compose up -d` -> `bash ../../tests/local-dev/smoke-observability.sh` succeeds"
+    handoff:
+      target_files:
+        - deploy/local/README.md
+      minimal_change: "Create new file"
+
+  - id: w4-t2-makefile-targets
+    title: Add local-dev Makefile targets
+    description: |
+      Add three new targets to the project root `Makefile`:
+      - `make local-dev-up`: runs `docker compose -f deploy/local/docker-compose.yml up -d`
+      - `make local-dev-down`: runs `docker compose -f deploy/local/docker-compose.yml down --volumes`
+        (--volumes to clear ClickHouse data; docs should warn users)
+      - `make local-dev-smoke`: runs `bash tests/local-dev/smoke-observability.sh`
+      All three should print a descriptive message about what they are doing
+      before delegating to `docker compose` or `bash`.
+      Follow the existing Makefile style (comment headers, `@` prefix for
+      silent commands, `##` for help text).
+    wave: 4
+    agent: gem-devops
+    covers:
+      - makefile
+      - developer-experience
+    dependencies:
+      - w1-t1-local-compose
+      - w1-t2-smoke-script
+    conflicts_with: []
+    context_files:
+      - path: Makefile
+        description: Project Makefile to append targets to
+    acceptance_criteria:
+      - "h1: `make local-dev-up` runs `docker compose -f deploy/local/docker-compose.yml up -d`"
+      - "h2: `make local-dev-down` runs `docker compose -f deploy/local/docker-compose.yml down --volumes`"
+      - "h3: `make local-dev-smoke` runs `bash tests/local-dev/smoke-observability.sh`"
+      - "h4: `make help` (or existing help mechanism) lists the new targets"
+    success_criteria:
+      - "Run `make local-dev-up` -> stack green -> `make local-dev-smoke` -> all PASS -> `make local-dev-down` -> containers removed"
+    handoff:
+      target_files:
+        - Makefile
+      do_not_reinvestigate:
+        - "Existing Makefile style and conventions"
+      minimal_change: "Append three target blocks after the existing targets, following the same pattern"
+
+  - id: w4-t3-agents-md-create
+    title: Create AGENTS.md observability section (new section)
+    description: |
+      Create a new "Observability / Monitoring" section in `AGENTS.md`.
+      No existing observability section exists — this is a pure addition.
+      Content:
+      - New architecture: Fluent Bit -> signoz-ingester (logs)
+        + Engine -> bridge otel-collector -> signoz-ingester (traces+metrics)
+        -> SigNoz ClickHouse. Grafana queries signoz-query-service:8080.
+      - Removed: Loki, Promtail, Tempo, stand-alone otel-collector,
+        Prometheus, old signoz role.
+      - Retained: Grafana (now queries SigNoz), bridge otel-collector
+        (network crossing — filelog/containers removed), Grafana dashboards
+        (manual query migration needed — out of scope).
+      - Port clarification: 8080 = query-service API port, NOT ClickHouse.
+      - Local development: reference `deploy/local/README.md` and the
+        local Foundry docker-compose.
+      - Key files table: fluent-bit.conf.j2, signoz-alerts.yml.j2,
+        deploy/local/docker-compose.yml, signoz_bridge config.
+      - Alert rules: reference the 14 SigNoz alert rules (w2-t3 + w3-t3).
+      - Commands table: update `make` targets (local-dev-up/down/smoke).
+      - No references to Promtail, Loki, Tempo, old otel-collector, or
+        Prometheus config paths.
+    wave: 4
+    agent: gem-documentation-writer
+    covers:
+      - documentation
+      - agents-md
+    dependencies:
+      - w1-t1-local-compose
+      - w2-t2-rewrite-logging-role
+      - w3-t1-signoz-data-source
+      - w4-t2-makefile-targets
+    conflicts_with: []
+    context_files:
+      - path: AGENTS.md
+        description: The file to add a new section to (no existing observability section)
+    acceptance_criteria:
+      - "h1: AGENTS.md has a new '# Observability' or '## Observability' section"
+      - "h2: `grep -cE 'Promtail|Loki|Tempo|Prometheus' AGENTS.md` shows only expected references (e.g. \"removed\")"
+      - "h3: `grep -cE 'Fluent Bit|SigNoz|deploy/local|signoz-ingester' AGENTS.md` >= 5"
+      - "h4: Architecture description: Fluent Bit -> signoz-ingester (logs), Engine -> bridge -> signoz-ingester (traces+metrics)"
+    success_criteria:
+      - "Developer reads AGENTS.md observability section and can start the local stack without additional context"
+    handoff:
+      target_files:
+        - AGENTS.md
+      do_not_reinvestigate:
+        - "SigNoz query-service API port is 8080 (NOT ClickHouse)"
+        - "signoz-ingester OTLP port is 4318"
+        - "Fluent Bit OTLP output to signoz-ingester:4318"
+      minimal_change: "Append new observability section to AGENTS.md; leave non-observability sections intact"

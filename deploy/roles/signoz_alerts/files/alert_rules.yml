@@ -1,0 +1,320 @@
+---
+# Alert rules pushed to SigNoz via /api/v1/rules. Idempotent by compositeKey.
+# Each rule = SigNoz v2 alert schema: a query (PromQL/ClickHouse SQL) evaluated
+# against a metrics/logs source on a fixed schedule.
+
+# 1. Host CPU > 85% for 5 min
+- name: "host_cpu_high"
+  alertType: "METRIC_BASED_ALERT"
+  ruleType: "prometheus_rule"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "time_series"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "metrics"
+            aggregateOperator: "avg"
+            aggregateAttribute:
+              key: "system.cpu.utilization"
+              dataType: "float64"
+            timeAggregation: "avg"
+            spaceAggregation: "avg"
+            functions: []
+            filter:
+              expression: ""
+            op: "avg"
+            groupBy: []
+            expression: "A"
+            disabled: false
+            having:
+              expression: "A > {{ signoz_alert_cpu_threshold }}"
+              value: "{{ signoz_alert_cpu_threshold }}"
+            orderBy: []
+            limit: null
+            legend: "{{service.name}} cpu%"
+      unit: "percent"
+  labels:
+    severity: "warning"
+    service: "host"
+    deployment_environment: "production"
+  annotations:
+    summary: "Host CPU high"
+    description: "Average host CPU above {{ signoz_alert_cpu_threshold }}% for 5 min"
+    runbook: "ssh deploy@ovh-1 'top -bn1 | head -20'; docker stats --no-stream"
+
+# 2. Host memory > 90%
+- name: "host_memory_high"
+  alertType: "METRIC_BASED_ALERT"
+  ruleType: "prometheus_rule"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "time_series"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "metrics"
+            aggregateOperator: "avg"
+            aggregateAttribute:
+              key: "system.memory.utilization"
+              dataType: "float64"
+            timeAggregation: "avg"
+            spaceAggregation: "avg"
+            functions: []
+            filter:
+              expression: ""
+            op: "avg"
+            groupBy: []
+            expression: "A"
+            disabled: false
+            having:
+              expression: "A > {{ signoz_alert_memory_threshold }}"
+              value: "{{ signoz_alert_memory_threshold }}"
+            orderBy: []
+            limit: null
+            legend: "mem%"
+      unit: "percent"
+  labels:
+    severity: "critical"
+    service: "host"
+  annotations:
+    summary: "Host memory high"
+    description: "Host memory > {{ signoz_alert_memory_threshold }}% — OOMKill risk for containers"
+    runbook: "docker stats --no-stream; consider restarting the heaviest container or increasing host RAM"
+
+# 3. Disk > 85% on root
+- name: "host_disk_high"
+  alertType: "METRIC_BASED_ALERT"
+  ruleType: "prometheus_rule"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "time_series"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "metrics"
+            aggregateOperator: "max"
+            aggregateAttribute:
+              key: "system.filesystem.utilization"
+              dataType: "float64"
+            timeAggregation: "max"
+            spaceAggregation: "max"
+            functions: []
+            filter:
+              expression: ""
+            op: "max"
+            groupBy:
+              - key: "filesystem.mode"
+                dataType: "string"
+                type: "tag"
+                isColumn: false
+                isJSON: false
+            expression: "A"
+            disabled: false
+            having:
+              expression: "A > {{ signoz_alert_disk_threshold }}"
+              value: "{{ signoz_alert_disk_threshold }}"
+            orderBy: []
+            limit: null
+            legend: "{{filesystem.mode}} disk%"
+      unit: "percent"
+  labels:
+    severity: "warning"
+    service: "host"
+  annotations:
+    summary: "Host disk > {{ signoz_alert_disk_threshold }}%"
+    description: "Filesystem utilization above threshold — ClickHouse data growth, expired containers, or log fills"
+
+# 4. Container OOMKilled (last hour)
+- name: "container_oom_killed"
+  alertType: "LOGS_BASED_ALERT"
+  ruleType: "logs"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "list"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "logs"
+            filter:
+              expression: "body CONTAINS 'OOMKilled' OR body CONTAINS 'out of memory'"
+            op: "count"
+            having: []
+            orderBy: []
+            limit: null
+            selectFields: []
+            groupBy:
+              - key: "container.name"
+                dataType: "string"
+                type: "tag"
+                isColumn: false
+                isJSON: false
+      unit: "short"
+      step: "60s"
+  labels:
+    severity: "critical"
+    service: "docker"
+  annotations:
+    summary: "Container OOMKilled"
+    description: "At least one container was OOMKilled in the last hour"
+    runbook: "docker events --since 1h --filter type=oom"
+
+# 5. Any service restart count > 3 in 10 min
+- name: "service_restart_storm"
+  alertType: "LOGS_BASED_ALERT"
+  ruleType: "logs"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "list"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "logs"
+            filter:
+              expression: "body CONTAINS 'container start' OR body CONTAINS 'Starting' OR body CONTAINS 'Restarting'"
+            op: "count"
+            groupBy:
+              - key: "container.name"
+                dataType: "string"
+                type: "tag"
+                isColumn: false
+                isJSON: false
+      unit: "short"
+      step: "600s"
+  labels:
+    severity: "warning"
+    service: "docker"
+  annotations:
+    summary: "Container restart storm"
+    description: "Container restarts >3 in 10 min — likely crash loop or OOM"
+
+# 6. ClickHouse down (no logs received for 5 min from signoz services)
+- name: "signoz_clickhouse_down"
+  alertType: "LOGS_BASED_ALERT"
+  ruleType: "logs"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "list"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "logs"
+            filter:
+              expression: "service.name = signoz-signoz"
+            op: "count"
+            having:
+              expression: "A = 0"
+              value: "0"
+            orderBy: []
+            limit: null
+            selectFields: []
+            groupBy: []
+      unit: "short"
+      step: "300s"
+  labels:
+    severity: "critical"
+    service: "signoz"
+  annotations:
+    summary: "SigNoz backend silent"
+    description: "No signoz-signoz log activity in 5 min — ingester or clickhouse likely down"
+
+# 7. Caddy 5xx rate > 1% over 5 min
+- name: "caddy_5xx_rate"
+  alertType: "LOGS_BASED_ALERT"
+  ruleType: "logs"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "time_series"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "logs"
+            filter:
+              expression: "service.name = caddy AND http.response.status_code >= 500"
+            op: "count"
+            groupBy: []
+        - type: "builder"
+          spec:
+            name: "B"
+            signal: "logs"
+            filter:
+              expression: "service.name = caddy"
+            op: "count"
+            groupBy: []
+      unit: "percent"
+      step: "60s"
+      expressions:
+        - name: "ratio"
+          expression: "(A / B) * 100"
+          disabled: false
+  labels:
+    severity: "warning"
+    service: "caddy"
+  annotations:
+    summary: "Caddy 5xx > 1% of traffic"
+    description: "More than 1% of caddy requests returning 5xx over 5 min"
+
+# 8. Gateway fiber wedge (long-running fibers > 0 for 30 consecutive seconds)
+- alert: GatewayFiberWedge
+  alertType: "METRIC_BASED_ALERT"
+  ruleType: "prometheus_rule"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  for: 30s
+  disabled: true
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "time_series"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "metrics"
+            aggregateOperator: "max"
+            aggregateAttribute:
+              key: "gateway_long_running_fiber_seconds"
+              dataType: "float64"
+            timeAggregation: "max"
+            spaceAggregation: "max"
+            functions: []
+            filter:
+              expression: ""
+            op: "max"
+            groupBy: []
+            expression: "A"
+            disabled: false
+            having:
+              expression: "A > 0"
+              value: "0"
+            orderBy: []
+            limit: null
+            legend: "fiber wedge"
+      unit: "seconds"
+  labels:
+    severity: critical
+    service: gateway
+  annotations:
+    summary: "Gateway fiber wedge detected"
+    description: "Gateway has had a fiber running without yielding for >5s for 30 consecutive seconds. HTTP requests will time out."
+

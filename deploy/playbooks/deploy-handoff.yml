@@ -1,0 +1,48 @@
+---
+# DEPRECATED — Handoff removed 2026-08-08 (see AGENTS.md Engine Lifecycle).
+# This playbook now does a hard restart (docker restart) — brief IRC
+# disconnect then auto-reconnect via backoff. The SCM_RIGHTS FD-transfer
+# path (handoff.d, reload_orchestrator.d, exec_reload.d,
+# IRCFIBER_RELOAD_FROM_PID) was fragile and failed on OVH where redis
+# binds to Tailscale IP 198.51.100.1. Use `make update` or
+# `docker restart ircfiber-engine-ovh` instead.
+#
+# Kept for backward compat — `make handoff` now prints a deprecation
+# warning and calls hard restart. New code must not reintroduce handoff.
+
+- name: Engine hard restart (handoff removed)
+  hosts: "{{ target | default('ircfiber_engines') }}"
+  become: true
+  gather_facts: false
+  vars:
+    engine_container: "{{ 'ircfiber-engine-' ~ ircfiber_engine_id }}"
+  pre_tasks:
+    - name: Preflight — ircfiber_engine_id is required
+      ansible.builtin.assert:
+        that:
+          - ircfiber_engine_id is defined
+          - ircfiber_engine_id | length > 0
+        fail_msg: "ircfiber_engine_id must be defined"
+  tasks:
+    - name: Hard restart engine container
+      community.docker.docker_container:
+        name: "{{ engine_container }}"
+        state: started
+        restart: true
+      register: restarted
+    - name: Wait for engine to be healthy
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          if docker inspect {{ engine_container }} --format '{{.State.Health.Status}}' 2>/dev/null | grep -q healthy; then
+            echo "healthy"
+            exit 0
+          fi
+          sleep 1
+        done
+        docker ps --format '{{.Names}} {{.Status}}' | grep {{ engine_container }} || true
+        exit 1
+      register: health
+      failed_when: health.rc != 0
+    - name: Report
+      ansible.builtin.debug:
+        msg: "Engine {{ engine_container }} hard-restarted (handoff removed 2026-08-08)"

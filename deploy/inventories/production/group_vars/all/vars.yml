@@ -1,0 +1,175 @@
+---
+# IRC Fiber — public defaults (safe to commit)
+# Override per host in inventories/production/host_vars/<hostname>.yml
+
+# --- Versions -----------------------------------------------------------------
+ircfiber_version: "0.3.0"
+
+# --- Image registry ------------------------------------------------------------
+# Docker Hub: set url to "docker.io" (or ""), namespace to your Docker Hub username.
+# GHCR: set url to "ghcr.io" and namespace to your GitHub user/org.
+# Private: set url to "registry.example.com" etc.
+# Leave url empty ("") to skip the registry and build images directly on the target host.
+docker_registry_url: ""
+docker_registry_namespace: "kevindpostal"
+docker_image_tag: "{{ ircfiber_version }}"
+
+# --- Public-facing ------------------------------------------------------------
+ircfiber_domain: "ircfiber.com"
+# Email used by Caddy for Let's Encrypt ACME registration (only used when
+# ircfiber_use_lets_encrypt is true)
+ircfiber_acme_email: "[email protected]"
+# When true, Caddy requests a real Let's Encrypt cert (requires DNS for
+# ircfiber_domain to point at the host's public IP and port 80/443 open).
+# When false, Caddy uses a local self-signed cert — convenient for the
+# /etc/hosts trick to access the host via its Tailscale IP. Browsers will
+# show a cert warning; click through to proceed.
+ircfiber_use_lets_encrypt: false
+
+# --- Container runtime --------------------------------------------------------
+mongo_image: "mongo:7"
+redis_image: "redis:7-alpine"
+caddy_image: "caddy:2-alpine"
+
+# --- Tailscale ----------------------------------------------------------------
+# Tag applied to all ircfiber hosts; use in Tailscale ACLs to scope the mesh.
+tailscale_tags: "tag:ircfiber"
+# Where to find tailscaled state
+tailscale_state_dir: "/var/lib/tailscale"
+
+# --- Internal networking -------------------------------------------------------
+# The Docker bridge network used by gateway/caddy (and for management of backend containers).
+docker_ircfiber_subnet: "172.30.0.0/16"
+docker_ircfiber_network: "ircfiber_net"
+docker_ircfiber_gateway: "172.30.0.1"
+
+# --- Firewall -----------------------------------------------------------------
+firewall_enabled: true
+firewall_allow_ssh_cidr: "0.0.0.0/0"
+# Whether to allow the engine admin port (8091) from the Tailscale subnet only.
+firewall_open_engine_admin: true
+
+# --- Mongo --------------------------------------------------------------------
+mongo_data_volume: "ircfiber_mongo_data"
+mongo_initdb_database: "ircfiber"
+mongo_port: 27017
+
+# --- Redis --------------------------------------------------------------------
+redis_data_volume: "ircfiber_redis_data"
+redis_port: 6379
+redis_maxmemory: "256mb"
+redis_appendonly: true
+
+# --- Gateway ------------------------------------------------------------------
+gateway_http_port: 8090
+gateway_uploads_volume: "ircfiber_uploads"
+gateway_logs_volume: "ircfiber_logs"
+# Number of gateway container replicas (1 = single, backward-compatible name).
+# Raise to 2-4 for process-level isolation and horizontal scale on the same host.
+gateway_replica_count: 1
+# When true and replica_count > 1, Caddy uses ip_hash load balancing so
+# WebSocket clients stay pinned to the same replica.
+gateway_replica_sticky: true
+# Swappable API backend (Step 3): D gateway (default) vs Python gateway.
+# When gateway_use_python is true, Caddy proxies /api/* and /ws to
+# irc-fiber-api-py:8000 instead of ircfiber-gateway:8090. Frontend needs
+# no rebuild — it keeps API_BASE=/api behind Caddy. Toggle via
+# `gateway_use_python: true` in host_vars or with `--extra-vars`.
+gateway_backend_host: "ircfiber-gateway"
+gateway_backend_port: "{{ gateway_http_port }}"
+gateway_use_python: false
+gateway_python_host: "irc-fiber-api-py"
+gateway_python_port: 8000
+# --- Caddy --------------------------------------------------------------------
+caddy_data_volume: "ircfiber_caddy_data"
+caddy_config_volume: "ircfiber_caddy_config"
+
+# --- Backups ------------------------------------------------------------------
+backup_dir: "/var/backups/ircfiber"
+backup_keep_days: 14
+backup_s3_enabled: false
+backup_s3_bucket: ""
+backup_s3_prefix: "ircfiber/"
+
+# --- Operations ---------------------------------------------------------------
+common_upgrade: false
+image_prune_keep_count: 3
+
+# --- Image build (control node) -----------------------------------------------
+# The directory containing the IRC Fiber repo (with Containerfile, source/, public/, views/)
+# Playbooks live in deploy/playbooks/, so the repo root is two levels up.
+ircfiber_repo_root: "{{ playbook_dir }}/../.."
+ircfiber_build_target: "release"
+
+# Gateway image (D / full app)
+ircfiber_gateway_containerfile: "Containerfile"
+ircfiber_gateway_build_args:
+  LDC_VERSION: "1.41.0"
+  TARGETARCH: "{{ 'amd64' if ansible_architecture == 'x86_64' else ('arm64' if ansible_architecture == 'aarch64' else ansible_architecture) }}"
+ircfiber_gateway_image_name: >-
+  {{ (docker_registry_url + '/' if (docker_registry_url | length > 0) else '')
+     + docker_registry_namespace + '/irc-fiber-gateway' }}
+ircfiber_gateway_image_full: "{{ ircfiber_gateway_image_name }}:{{ docker_image_tag }}"
+
+# Engine image (D — same Containerfile as gateway, builds both binaries)
+ircfiber_engine_containerfile: "Containerfile"
+ircfiber_engine_build_args:
+  TARGETARCH: "{{ 'amd64' if ansible_architecture == 'x86_64' else ('arm64' if ansible_architecture == 'aarch64' else ansible_architecture) }}"
+ircfiber_engine_image_name: >-
+  {{ (docker_registry_url + '/' if (docker_registry_url | length > 0) else '')
+     + docker_registry_namespace + '/ircfiber-engine' }}
+ircfiber_engine_image_full: "{{ ircfiber_engine_image_name }}:{{ docker_image_tag }}"
+
+# --- Engine defaults ----------------------------------------------------------
+# NOTE: ircfiber_engine_id has NO default — it MUST be set per-host in
+# host_vars/<hostname>.yml or via inline inventory vars. The old default
+# of "{{ inventory_hostname_short }}" silently leaked hostnames like
+# ircfiber-ovh-1 as engine server IDs, creating duplicate registrations
+# in Redis when the correct host_vars override wasn't applied.
+# Every engine host in [ircfiber_engines] must define its own id.
+ircfiber_engine_bind_address: "0.0.0.0"
+ircfiber_engine_admin_port: 8091
+ircfiber_engine_log_level: "info"
+
+# --- Gateway defaults ---------------------------------------------------------
+ircfiber_gateway_log_level: "info"
+ircfiber_admin_password: "{{ vault_ircfiber_admin_password }}"  # set in vault.yml — no default
+
+# --- IRCd (Ergo) defaults ------------------------------------------------------
+ircd_port_plain: 6667
+ircd_port_tls: 6697
+ircd_image: "ghcr.io/ergochat/ergo:v2.18.0"
+ircd_container_name: "ircfiber-ircd"
+ircd_data_volume: "ircfiber_ircd_data"
+
+# --- Cloudflare DNS ------------------------------------------------------------
+# Used by the `cloudflare` role to point DNS records at this host's public IP.
+# `cloudflare_zone` is the registered domain (the zone that owns the records).
+# Override per host in inventories/production/host_vars/<hostname>.yml.
+# `cloudflare_target_ip` MUST be set in host_vars; the playbook refuses to
+# auto-discover it (use `tailscale netcheck` to find the right value).
+#
+# When using Cloudflare Tunnel (cloudflared), DNS records are managed
+# automatically by Cloudflare Zero Trust when you add Public Hostnames to
+# the tunnel. The `cloudflare` role for manual A records becomes optional.
+cloudflare_zone: "ircfiber.com"          # the registered CF zone
+cloudflare_proxied: false                # true = orange cloud (CF proxies traffic),
+                                         # false = DNS-only (CF is just authoritative DNS)
+cloudflare_record_ttl: 300                # seconds; only used when cloudflare_proxied=false
+cloudflare_record_prefixes:               # record names under cloudflare_zone to manage
+  - "@"                                  # apex (e.g. ircfiber.com)
+  - "www"                                # e.g. www.ircfiber.com
+
+# --- Cloudflare Tunnel (cloudflared) -------------------------------------------
+cloudflared_image: "cloudflare/cloudflared:latest"
+cloudflared_container_name: "ircfiber-cloudflared"
+cloudflared_no_autoupdate: true
+cloudflared_restart_policy: "unless-stopped"
+# Port Caddy listens on for tunnel-originated HTTP traffic.
+# Must match caddy_tunnel_port in the Caddy role defaults.
+cloudflared_caddy_tunnel_port: 8080
+
+# --- Preflight assertions -----------------------------------------------------
+ircfiber_min_docker_version: "20.10.0"
+ircfiber_min_ubuntu_codename: ["jammy", "noble"]   # 22.04, 24.04
+ircfiber_min_debian_codename: ["bookworm", "bullseye"]

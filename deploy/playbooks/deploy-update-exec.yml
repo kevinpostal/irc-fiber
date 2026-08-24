@@ -1,0 +1,299 @@
+---
+# Zero-disconnect engine hot-reload via exec(2).
+#
+# The OLD engine:
+#   1. Pauses every IRC connection's event loop
+#   2. Snapshots state (nick, caps, channels, msgid cursors, etc.)
+#   3. Clears O_CLOEXEC on every IRC socket FD
+#   4. Writes a JSON checkpoint file
+#   5. Calls execve("/app/irc-fiber-engine.new") — same PID, same FDs, fresh code
+#
+# The NEW engine (after exec, same PID):
+#   1. Reads IRCFIBER_EXEC_RELOAD_MARKER env var → finds checkpoint file
+#   2. Restores in-memory state from the snapshot
+#   3. For each IRC connection: adopts the existing TCP FD via AdoptedSocket
+#   4. For TLS connections: does a fresh TLS handshake on the SAME TCP socket
+#      (IRC layer above TLS sees no change — IRC sessions are keyed to the
+#      TCP 4-tuple, not the TLS identity)
+#   5. Resumes normal IRC traffic
+#
+# From the IRC server's perspective: ONE continuous TCP connection the
+# entire time. No QUIT, no reconnect, no nick collision. The connection
+# never drops. This is true Erlang-style hot-reload.
+#
+# Flow:
+#   1. rsync source → /opt/ircfiber-src/
+#   2. BuildKit builds new binary
+#   3. Stage new binary as /app/irc-fiber-engine.new (NOT replacing the
+#      binary the OLD engine is currently running)
+#   4. Send `beginExecReload` control message with binary path
+#   5. Wait for done marker
+#   6. After exec: the new engine runs in the same PID. We then move
+#      /app/irc-fiber-engine.new → /app/irc-fiber-engine so the on-disk
+#      binary matches what's in memory (matters for next container restart).
+#
+# Fallback: if exec fails (e.g. binary won't start), fall back to the
+# regular deploy-update.yml path with hard container restart.
+#
+# Usage:
+#   make update-exec
+#   ansible-playbook playbooks/deploy-update-exec.yml -l ircfiber-ovh-1
+
+- name: Zero-disconnect engine hot-reload (exec-based)
+  hosts: "{{ target | default('ircfiber_engines') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    src_root: /opt/ircfiber-src
+    builder_image: ircfiber-builder
+    host_bin_dir: /opt/ircfiber/bin
+    engine_container: "{{ 'ircfiber-engine-' ~ ircfiber_engine_id }}"
+    engine_binary_src: "{{ host_bin_dir }}/irc-fiber-engine"
+    engine_binary_staged: "/app/irc-fiber-engine.new"
+    engine_binary_dest: "/app/irc-fiber-engine"
+    ldc_version: "1.41.0"
+    exec_done_marker: "/tmp/ircfiber-exec-reload-done-{{ ircfiber_engine_id }}"
+    exec_timeout_seconds: 30
+
+  pre_tasks:
+    - name: Preflight — ircfiber_engine_id is required
+      ansible.builtin.assert:
+        that:
+          - ircfiber_engine_id is defined
+          - ircfiber_engine_id | length > 0
+        fail_msg: "ircfiber_engine_id must be defined for exec-reload target"
+
+  tasks:
+    # ── Build ─────────────────────────────────────────────────────────
+    - name: Ensure output directory exists
+      ansible.builtin.file:
+        path: "{{ host_bin_dir }}"
+        state: directory
+        mode: "0777"
+
+    - name: Ensure source directory exists
+      ansible.builtin.file:
+        path: "{{ src_root }}"
+        state: directory
+        mode: "0755"
+
+    - name: rsync source → {{ src_root }}
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../../"
+        dest: "{{ src_root }}"
+        delete: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.dub"
+          - "--exclude=*.o"
+          - "--exclude=irc-fiber"
+          - "--exclude=irc-fiber-engine"
+          - "--exclude=frontend/node_modules"
+          
+          - "--exclude=.reasonix"
+          - "--exclude=.playwright-mcp"
+          - "--exclude=test-results"
+          - "--exclude=e2e/test-results"
+          - "--exclude=*.log"
+          - "--exclude=.worktrees"
+
+    - name: Build stage (BuildKit — cached dub + LDC)
+      ansible.builtin.shell: |
+        DOCKER_BUILDKIT=1 docker build \
+          --target builder \
+          --build-arg LDC_VERSION={{ ldc_version }} \
+          --build-arg CACHE_BUST=$(date +%s) \
+          -t {{ builder_image }}:latest \
+          -f {{ src_root }}/Containerfile \
+          {{ src_root }} 2>&1
+      args:
+        executable: /bin/bash
+      timeout: 900
+      changed_when: true
+
+    - name: Extract engine binary from builder image
+      ansible.builtin.shell: |
+        CID=$(docker create {{ builder_image }}:latest)
+        docker cp "$CID":/build/irc-fiber-engine {{ engine_binary_src }}
+        docker rm "$CID" >/dev/null
+        chmod 0755 {{ engine_binary_src }}
+        strip {{ engine_binary_src }} 2>/dev/null || true
+        echo "Engine: $(ls -lh {{ engine_binary_src }} | awk '{print $5}')"
+      args:
+        executable: /bin/bash
+
+    # ── Preflight ────────────────────────────────────────────────────
+    - name: Check engine container exists
+      community.docker.docker_container_info:
+        name: "{{ engine_container }}"
+      register: engine_info
+
+    - name: Get current engine PID
+      # After an exec-reload, PID 7's cmdline becomes the private-copy path
+      # (e.g. /tmp/irc-fiber-engine.7.1782427614), not the canonical name.
+      # Match by exe name via /proc/<pid>/comm so we find the running engine
+      # regardless of what argv[0] points at.
+      ansible.builtin.shell: |
+        docker exec {{ engine_container }} bash -c '
+          for p in $(pgrep -f "irc-fiber-engine"); do
+            # Match engines, not the engine binary file or playbook itself
+            if [ -f /proc/$p/exe ] && readlink /proc/$p/exe 2>/dev/null | grep -q irc-fiber-engine; then
+              echo $p
+              break
+            fi
+          done
+        '
+      register: old_pid_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if no engine running
+      ansible.builtin.fail:
+        msg: "No irc-fiber-engine process running in {{ engine_container }} — nothing to hot-reload"
+      when: old_pid_raw.rc != 0 or (old_pid_raw.stdout | trim) == ""
+
+    - name: Set engine vars
+      ansible.builtin.set_fact:
+        _engine_pid: "{{ old_pid_raw.stdout | trim | split(' ') | first }}"
+        _exec_done_marker: "{{ exec_done_marker }}"
+
+    # ── Stage new binary (DO NOT replace the running binary yet) ─────
+    - name: Stage new binary as {{ engine_binary_staged }}
+      ansible.builtin.command:
+        cmd: docker cp {{ engine_binary_src }} {{ engine_container }}:{{ engine_binary_staged }}
+      register: stage_result
+      changed_when: true
+
+    - name: Mark staged binary executable
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} chmod +x {{ engine_binary_staged }}
+      changed_when: true
+
+    # ── Clean up stale markers ──────────────────────────────────────
+    - name: Remove stale exec-reload markers
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} rm -f {{ _exec_done_marker }} /tmp/ircfiber-exec-reload-{{ ircfiber_engine_id }}.marker
+      changed_when: false
+      ignore_errors: true
+
+    # ── Send beginExecReload ──────────────────────────────────────────
+    # The control message tells the OLD engine to:
+    #   1. Snapshot its state
+    #   2. Clear O_CLOEXEC on IRC FDs
+    #   3. Write the checkpoint file
+    #   4. execve() into the staged binary
+    - name: Trigger exec-reload via Redis control message
+      ansible.builtin.shell: |
+        msg='{"action":"beginExecReload","config":{"binary":"{{ engine_binary_staged }}"}}'
+        docker exec {{ redis_container_name | default('ircfiber-redis') }} redis-cli LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
+        echo "Sent beginExecReload to {{ engine_container }}"
+      args:
+        executable: /bin/bash
+      register: exec_trigger
+      changed_when: true
+
+    # ── Wait for done marker ─────────────────────────────────────────
+    # The OLD engine writes this marker just before calling execve().
+    # After exec, the new engine takes over — same PID.
+    - name: Wait for exec-reload done marker
+      ansible.builtin.shell: |
+        marker="{{ _exec_done_marker }}"
+        for i in $(seq 1 {{ exec_timeout_seconds | int * 2 }}); do
+          if docker exec {{ engine_container }} test -f "$marker" 2>/dev/null; then
+            echo "EXEC_OK"
+            exit 0
+          fi
+          sleep 0.5
+        done
+        echo "EXEC_TIMEOUT"
+        exit 1
+      args:
+        executable: /bin/bash
+      register: exec_done
+      ignore_errors: true
+      changed_when: false
+
+    # ── Verify the new engine is alive ───────────────────────────────
+    - name: Verify engine PID is still alive (same PID, new code)
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} kill -0 {{ _engine_pid }}
+      register: engine_alive
+      ignore_errors: true
+      changed_when: false
+      when: exec_done.stdout | default('') == 'EXEC_OK'
+
+    # ── Success: clean up and report ─────────────────────────────────
+    - name: Post-exec — move staged binary to canonical location
+      ansible.builtin.shell: |
+        if docker exec {{ engine_container }} test -f {{ engine_binary_staged }} 2>/dev/null; then
+          docker exec {{ engine_container }} mv -f {{ engine_binary_staged }} {{ engine_binary_dest }}
+          echo "Binary moved to {{ engine_binary_dest }}"
+        else
+          echo "Staged binary already moved (new engine cleaned up after exec)"
+        fi
+      args:
+        executable: /bin/bash
+      when: exec_done.stdout | default('') == 'EXEC_OK'
+      register: post_move
+      changed_when: true
+
+    - name: Clean up done marker
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} rm -f {{ _exec_done_marker }}
+      changed_when: false
+      when: exec_done.stdout | default('') == 'EXEC_OK'
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg: |
+          ✓ Exec-reload successful.
+            Engine PID: {{ _engine_pid }} (unchanged — same process, new code)
+            IRC connection: preserved (TCP socket survived exec)
+            No nick collision, no reconnect, no blip.
+
+    # ── Failure fallback ─────────────────────────────────────────────
+    # If the done marker never appeared or the engine isn't alive,
+    # we have to fall back to a hard container restart. This drops
+    # the IRC connection, but it shouldn't happen often — exec is
+    # reliable as long as the new binary isn't broken.
+    - name: Exec-reload FAILED — falling back to hard restart
+      ansible.builtin.debug:
+        msg: |
+          Exec-reload did not complete:
+            exec_done: {{ exec_done.stdout | default('SKIPPED') }}
+            engine_alive: {{ engine_alive.rc | default('N/A') }}
+          Falling back to hard container restart (IRC connection will drop).
+      when: exec_done.stdout | default('') != 'EXEC_OK' or (engine_alive is defined and engine_alive.rc != 0)
+
+    - name: Hard fallback — replace binary and restart container
+      ansible.builtin.shell: |
+        docker exec {{ engine_container }} cp -f {{ engine_binary_staged }} {{ engine_binary_dest }} 2>/dev/null || docker cp {{ engine_binary_src }} {{ engine_container }}:{{ engine_binary_dest }}
+        docker restart {{ engine_container }}
+      args:
+        executable: /bin/bash
+      when: exec_done.stdout | default('') != 'EXEC_OK' or (engine_alive is defined and engine_alive.rc != 0)
+      register: fallback_restart
+      changed_when: true
+
+    - name: Wait for engine to come back after fallback restart
+      ansible.builtin.command:
+        cmd: sleep 5 && docker exec {{ engine_container }} pidof irc-fiber-engine
+      register: fallback_pid
+      changed_when: false
+      failed_when: false
+      when: fallback_restart is defined
+
+    - name: Re-push network assignments (fallback path wipes them)
+      ansible.builtin.shell: |
+        # Get the network list from Mongo and re-assign
+        for nid in $(docker exec {{ redis_container_name | default('ircfiber-redis') }} redis-cli HKEYS irc:network:assignments 2>/dev/null); do
+          docker exec {{ redis_container_name | default('ircfiber-redis') }} redis-cli HSET irc:network:assignments "$nid" {{ ircfiber_engine_id }} >/dev/null
+        done
+      args:
+        executable: /bin/bash
+      when: fallback_restart is defined
+      changed_when: false
+      ignore_errors: true

@@ -1,0 +1,6 @@
+---
+- name: Restart ircd
+  community.docker.docker_container:
+    name: "{{ ircd_container_name }}"
+    state: started
+    restart: true

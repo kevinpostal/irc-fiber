@@ -1,0 +1,32 @@
+---
+- name: Restart grafana
+  community.docker.docker_container:
+    name: "{{ grafana_container_name }}"
+    state: started
+    restart: true
+
+- name: Restart fluent-bit
+  community.docker.docker_container:
+    name: "{{ fluent_bit_container_name }}"
+    state: started
+    restart: true
+
+- name: Restart signoz-query-service
+  community.docker.docker_container:
+    name: "{{ signoz_query_service_container_name }}"
+    state: started
+    restart: true
+
+- name: Restart signoz-ingester
+  community.docker.docker_container:
+    name: "{{ signoz_ingester_container_name }}"
+    state: started
+    restart: true
+
+- name: Restart logging stack
+  community.docker.docker_compose_v2:
+    project_src: /etc/ircfiber/logging
+    state: present
+    recreate: always
+    env_files:
+      - /etc/ircfiber/logging/logging.env

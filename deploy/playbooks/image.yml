@@ -1,0 +1,9 @@
+---
+- name: Build & push irc-fiber image
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - ircfiber_image

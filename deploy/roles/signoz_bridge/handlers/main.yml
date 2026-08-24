@@ -1,0 +1,15 @@
+---
+# Restart the otel-collector (OTLP bridge) container when the
+# collector config changes. See deploy/roles/caddy/handlers/main.yml
+# for the bind-mount-deleted-inode footgun this protects against:
+# Ansible re-renders the YAML via temp+rename, the old inode at
+# the bind-mount source is unlinked, and the running container
+# keeps reading the deleted inode. SIGHUP on the otel-collector
+# process would also work, but `restart: true` is simpler and
+# the collector has no in-flight state to lose (it just resumes
+# exporting).
+- name: Restart otel bridge
+  community.docker.docker_container:
+    name: "{{ signoz_bridge_container }}"
+    state: started
+    restart: true

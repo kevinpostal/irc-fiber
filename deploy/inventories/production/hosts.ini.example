@@ -1,0 +1,35 @@
+# IRC Fiber — production inventory
+#
+# =============================================================================
+# ONE-TIME BOOTSTRAP (per host, once):
+# =============================================================================
+# 1. Make sure you can SSH to the host as ROOT (e.g. `ssh root@HOST`).
+# 2. Rename the Tailscale device to a stable, human-readable name so this
+#    inventory doesn't break the next time the host re-registers:
+#       ssh root@HOST tailscale set --hostname=<name>
+# 3. Run the bootstrap playbook to create a non-root 'deploy' user:
+#       ansible-playbook playbooks/bootstrap.yml --user root
+# 4. After bootstrap succeeds, change `ansible_user=root` to
+#    `ansible_user=deploy` in this file (or set it via group_vars).
+# 5. From then on, NEVER use root for Ansible. The deploy user has
+#    passwordless sudo, so all role tasks still work.
+# =============================================================================
+#
+# To add additional engine hosts on new VMs:
+#  - Repeat steps 1–3 above for the new host.
+#  - Append the new host to [ircfiber_engines] below.
+#  - Run:   ansible-playbook playbooks/engine.yml -l new-host
+# =============================================================================
+
+[ircfiber]
+vps-efb4b52d ansible_host=203.0.113.10 ansible_user=deploy ansible_ssh_private_key_file=/Users/zodiac/.ssh/id_ed25519_ircfiber
+
+[ircfiber_backend]
+vps-efb4b52d
+
+[ircfiber_gw]
+vps-efb4b52d
+
+[ircfiber_engines]
+vps-efb4b52d ircfiber_engine_id=ovh ircfiber_engine_bind_address=0.0.0.0 ircfiber_engine_admin_port=8091
+# Example — replace 203.0.113.10 with your host

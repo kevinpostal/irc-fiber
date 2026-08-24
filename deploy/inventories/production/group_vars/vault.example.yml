@@ -1,0 +1,59 @@
+---
+# IRC Fiber — vault template (REDACTED — safe to commit)
+# Copy this file to vault.yml, fill in real values, and run:
+#   ansible-vault encrypt inventories/production/group_vars/vault.yml
+# All keys MUST be defined (even if empty string for unused ones) so the
+# playbooks don't fail with undefined variables.
+
+# --- Tailscale ----------------------------------------------------------------
+vault_tailscale_authkey: "tskey-auth-REPLACE-ME"
+
+# --- Docker registry ----------------------------------------------------------
+vault_docker_registry_username: "REPLACE-ME"
+vault_docker_registry_password: "REPLACE-ME"
+
+# --- MongoDB ------------------------------------------------------------------
+# Root credentials used by the init container
+vault_mongo_root_username: "root"
+vault_mongo_root_password: "REPLACE-WITH-STRONG-PASSWORD"
+
+# Application user used by gateway + engine to talk to the ircfiber DB
+vault_mongo_app_username: "ircfiber"
+vault_mongo_app_password: "REPLACE-WITH-STRONG-PASSWORD"
+
+# --- Redis --------------------------------------------------------------------
+vault_redis_password: "REPLACE-WITH-STRONG-PASSWORD"
+
+# --- IRC Fiber admin user (overrides source/app.d default 'REDACTED') ---------
+# When set to a non-empty value, the gateway will reset the admin password on
+# every start to match this value. Leave empty to keep the in-source default.
+vault_ircfiber_admin_password: ""
+
+# --- Backup S3 (optional) -----------------------------------------------------
+vault_aws_access_key: ""
+vault_aws_secret_key: ""
+
+# --- Cloudflare DNS (direct API) ---------------------------------------------
+# Used by the `cloudflare` role to manage DNS records for the domain(s) that
+# should resolve to this stack's public IP. Create a scoped token at
+# https://dash.cloudflare.com/profile/api-tokens with permission
+#   Zone:DNS:Edit   (scoped to the specific zone you'll be managing)
+# The account ID is shown in the Cloudflare dashboard sidebar on any zone.
+# DO NOT commit the real values to this file — fill them into the encrypted
+# vault.yml via `ansible-vault edit`.
+vault_cloudflare_api_token: "REPLACE-WITH-CF-API-TOKEN"
+vault_cloudflare_account_id: "REPLACE-WITH-CF-ACCOUNT-ID"
+
+# --- IRCd (Ergo) oper account ------------------------------------------------
+# Password for the admin oper account on the IRC daemon.
+# The password hash is generated during deploy via:
+#   docker run --rm ergochat/ergo:stable genpasswd <password>
+# Change this before first deploy.
+vault_ircd_oper_password: "REPLACE-WITH-STRONG-PASSWORD"
+
+# --- Cloudflare Tunnel (cloudflared) -----------------------------------------
+# Token for a named tunnel created in Cloudflare Zero Trust dashboard:
+#   https://one.dash.cloudflare.com/ → Networks → Tunnels → Add a tunnel
+# The token is available under the tunnel's "Configure" tab.
+# DO NOT commit the real value — use `ansible-vault edit`.
+vault_cloudflared_tunnel_token: "REPLACE-WITH-CF-TUNNEL-TOKEN"

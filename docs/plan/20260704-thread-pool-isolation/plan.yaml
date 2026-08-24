@@ -1,0 +1,2673 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAN METADATA
+# ═══════════════════════════════════════════════════════════════════════════
+plan_id: 20260704-thread-pool-isolation
+objective: |
+  Eliminate the "site freezes when IRC traffic floods" symptom on ircfiber.com
+  AND redesign the gateway architecture to be enterprise-grade and capable
+  of handling hundreds of thousands of concurrent users.
+
+  The plan is structured as three tiers, each gated by an explicit capacity
+  milestone that must be provable before the next tier begins:
+
+    Tier 1 (week 1)         — IMMEDIATE freeze fix in the current single
+                                process. Per-session outbound queues, priority
+                                demotion, explicit yields, Mongo circuit
+                                breaker, fiber watchdog, /api/health
+                                contention surface, SigNoz alert,
+                                ircfiber-loadtest + p99<200ms gate.
+                                CAPACITY TARGET: 10K concurrent WS sessions,
+                                10K msg/sec.
+
+    Tier 2 (weeks 2-3)      — Single-process, 50K-user scale. No deploy
+                                change. Adds stateless Redis-only session
+                                tokens (no Mongo on the WS hot path),
+                                WS-protocol-v2 batched frames, gateway-side
+                                write coalescer, drain-pool worker pattern,
+                                adaptive per-session backpressure.
+                                CAPACITY TARGET: 50K concurrent WS sessions,
+                                25K msg/sec distributed across the fleet.
+
+    Tier 3 (weeks 4-12)     — Process-level isolation + deploy HA. Multi-
+                                replica gateway behind a Caddy load balancer
+                                with sticky-cookie WS affinity, Redis Cluster
+                                (3-node Sentinel + 2 shards), MongoDB
+                                sharded (config svr + 2 shards + 2 mongos),
+                                and a **DECISION_BLOCKER** on the vibe-core
+                                upgrade path (Go rewrite vs D-lib bump vs
+                                accept-limits). Sub-plan t3-upgrade-vibe-core.
+                                CAPACITY TARGET: 200K concurrent WS sessions,
+                                100K msg/sec distributed, multi-region
+                                failover simulated.
+
+  Each tier's success criterion is its own load test. We do NOT ship a tier
+  to OVH prod until its tier gate passes (see rollout_plan at the bottom).
+created_at: 2026-07-04T22:30:00Z
+updated_at: 2026-07-04T22:30:00Z
+created_by: gem-planner
+status: pending
+tldr: |
+  Three-tier enterprise redesign of the IRC Fiber gateway. Tier 1 (11 tasks
+  across 4 waves) keeps the existing fiber-level isolation fixes but
+  reshapes them into a single deploy unit. Tier 2 (12 tasks across 4 waves)
+  adds internal abstractions — stateless Redis-backed sessions, WS
+  protocol v2 batched frames, gateway write coalescer — for 50K-user
+  single-process scale. Tier 3 (10 tasks across 5 waves) introduces
+  process-level isolation via multi-replica gateway behind Caddy LB,
+  Redis Cluster, MongoDB sharded, and a sub-plan for the vibe-core
+  upgrade decision (Go rewrite vs D-lib bump vs accept limits). Each
+  tier has its own loadtest progression (10K → 25K+50K WS → 200K WS
+  across 4 replicas) and its own CI gate that must pass before the
+  next tier ships.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAN-LEVEL METRICS (populated by planner)
+# ═══════════════════════════════════════════════════════════════════════════
+plan_metrics:
+  tier_1_task_count: 11
+  tier_2_task_count: 12
+  tier_3_task_count: 13
+  total_task_count: 36
+  total_dependencies: 40
+  risk_score: high
+  estimated_total_effort_days: 80
+  quality_warnings:
+    - "HARD CONSTRAINT: vibe-d 0.10 / vibe-core 2.14 has a single shared
+      TaskPool (st_workerPool). Tier 1 exploits TaskSettings priority +
+      runWorkerTask + per-session outbound queues. Tier 3 explicitly opens
+      the vibe-core 1.x + vibe-http 2.x upgrade as a DECISION_BLOCKER
+      sub-plan — it exposes per-listener pools but is multi-month work."
+    - "HARD CONSTRAINT: Tier 1+2 are single-process. They CANNOT isolate
+      WS read, WS write, Mongo IO, Redis IO, span flush, and janitor on
+      separate OS threads — they all land on st_workerPool. The illusion
+      of isolation comes from bounded queues, priority ratios, and worker
+      tasks. Process-level isolation is the WHOLE POINT of Tier 3."
+    - "TIER GATING: We do NOT ship Tier 2 to prod until tier1_gate_passed
+      returns true. Same for tier3_gate. The CLI helper
+      ./scripts/check-tier-gate.sh is the canonical gate."
+    - "WS PROTOCOL v2: Tier 2 changes the WS frame shape from {cmd, ...}
+      to {type, channel, payload, eid, batchSize[?]} on the wire. The
+      w2-w6-t1 frame must keep v1 parsing for at least one minor version
+      so the frontend can roll forward without a forced deploy. We DO
+      NOT break client compatibility in Tier 1."
+    - "BACKWARD COMPAT: Per-session outbound queues change the wire timing.
+      The frontend's messageBatcher is already 200ms-trailing-edge debounced
+      with a 200-message hard cap, so coalescing in the gateway is
+      structural insurance, not a behavior change visible to users. The
+      irc_parity tests must remain green throughout."
+    - "TIER 3 introduces deploy changes. The ansible playbook structure is
+      preserved — new roles under deploy/roles/tier3_* are added; existing
+      roles are NOT removed. Re-running existing playbooks stays
+      idempotent."
+    - "DECISION_BLOCKER: t3-w12-t1 is the vibe-core upgrade path. Until
+      that decision lands, no Tier 3.4+ work proceeds. The sub-plan
+      t3-upgrade-vibe-core is owned by gem-planner after the user picks."
+    - "LOADTEST PROGRESSION: Tier 1 = 10K msg/sec for 60s. Tier 2 =
+      25K msg/sec for 60s + 50K concurrent WS sessions simulated.
+      Tier 3 = 100K msg/sec + 200K WS sessions across 4 replicas. Each
+      tier's loadtest is a separate binary/configuration; gates are
+      evaluated at deploy time by ./scripts/check-tier-gate.sh."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLANNING ANALYSIS — HIGH complexity (full section)
+# ═══════════════════════════════════════════════════════════════════════════
+open_questions:
+  - question: |
+      Which path for the vibe-core upgrade?
+        Option A: Rewrite the gateway in Go (net/http + gorilla/websocket
+                  + a single-task model is not necessary in Go because
+                  goroutines are cheap). Estimated 3-4 months.
+        Option B: Keep D, bump to vibe-core 1.x + vibe-http 2.x. Per-
+                  listener pools expose actual OS-thread isolation. Estimated
+                  2-3 weeks of porting + regression test work.
+        Option C: Keep D, accept the single-pool cap at ~50K WS sessions
+                  per process. Spin more gateway replicas instead. Cheapest
+                  path; documents the cap as a known limit.
+    context: |
+      vibe-core 2.14 has a single shared TaskPool. With ~16 cores we have
+      ~64 workers today. At 50K active WS sessions with 25K msg/sec peak,
+      the fiber scheduler overhead is the dominant cost. Option B unlocks
+      per-listener pools at the cost of porting sessions.d, websocket.d,
+      rest.d to the new async API. Option C is operationally simpler but
+      caps the single-process ceiling. The decision affects every Tier 3
+      task downstream of w12.
+    type: decision_blocker
+    affects:
+      - t3-w12-t1-vibe-core-decision
+      - t3-w13-t1-multi-region-failover
+      - t3-w13-t2-200k-loadtest
+  - question: |
+      Statelesness — should session tokens be signed JWTs (HMAC-SHA256,
+      verifiable without a Redis hit) or opaque random strings (need an
+      O(1) Redis HGET to verify)?
+    context: |
+      JWTs scale slightly better at the edge (no Redis hit per WS message
+      header check), but they expire in the token alone — sliding refresh
+      is harder. Opaque tokens need Redis but allow instant revocation.
+      For IRC Fiber the user pool is small (< 1M) and Redis is fast, so
+      the HMAC verification cost on JWT may exceed the saved Redis hit.
+      Recommend starting with opaque tokens. Defer JWT migration until
+      profiled.
+    type: decision_blocker
+    affects:
+      - t2-w5-t1-stateless-sessions
+      - t2-w5-t2-network-config-cache
+  - question: |
+      Loadtest target tier numbers — are 50K+200K the right peaks for
+      OVH vs our upcoming enterprise customers?
+    context: |
+      ircfiber.com is a single-tenant IRC client front-end. The
+      "hundreds of thousands of users" requirement implies a future white-
+      label / embedded IRC SaaS tier. Capacity plan: 200K WS sessions =
+      ~50% headroom on the current OVH (16 cores / 32 GB) at 4 replicas.
+      Confirm with the user before locking the target.
+    type: decision_blocker
+    affects:
+      - t2-w8-t3-tier2-gate
+      - t3-w13-t2-200k-loadtest
+  - question: |
+      WS protocol v2 migration — co-exist or hard cutover?
+    context: |
+      Co-existence keeps one minor version of v1 parsing alive for ~1
+      release so the SPA can roll out without coordination. Hard
+      cutover avoids two parsers in the codebase. Tier 2 ships v2;
+      feature-flag `IRCFIBER_WS_PROTOCOL_V2_ENABLED=1` defaults true
+      on tier-2 deployments, false on tier-1 (rolls back cleanly).
+    type: decision_blocker
+    affects:
+      - t2-w6-t1-ws-protocol-v2
+      - t2-w6-t2-frame-coalescer
+
+assumptions:
+  - "IRC Fiber production deployment is currently functional (cloudflare
+    525 from earlier wedge resolved by `docker restart ircfiber-gateway`
+    at 21:40 UTC). ircfiber.com is serving 200s as of plan creation."
+  - "vibe-d 0.10.7 / vibe-core 2.14.0 / vibe-http 1.5.1 are the locked
+    versions for Tier 1+2. Tier 3 may bump them as part of t3-w12-t1."
+  - "Frontend messageBatcher.ts already coalesces per-channel frames with
+    200ms trailing-edge debounce and a 200-message hard cap. Server-side
+    coalescing in t1-w1-t1 is structural insurance, not a behavior change."
+  - "Engine still LPUSHes events to per-user Redis streams from
+    `source/ircfiber/irc/manager.d` (live path is pub/sub; recovery path
+    is the stream). Plan touches the live path only."
+  - "tests/irc_parity has 9 passing scenarios. The plan must keep all
+    9 green throughout Tier 1+2. Tier 3 may add new scenarios for
+    multi-replica behavior."
+  - "OVH production is one host (ircfiber-ovh-1) per
+    `deploy/inventories/production/hosts.ini`. Tier 3 adds additional
+    VM inventory entries; engine hosts are easy to add by repeating the
+    bootstrap pattern documented at the top of hosts.ini."
+  - "WebSocket drain pool is process-local in Tier 1+2. Tier 3 makes the
+    drain pool shared via Redis Streams (XADD + consumer group) so a
+    scaled-up gateway replica inherits in-flight frames from its peers
+    during a failover."
+  - "Caddy load balancer keeps WS affinity by sticky cookie. The
+    frontend's existing Caddy routes already strip+re-inject cookies;
+    the LB adds a `lb_route` cookie whose value is the gateway replica
+    ID."
+  - "MongoDB shard key on userId for user-owned collections, channelId
+    for messages (channelId is `(networkId, bufferName)` hashed). The
+    existing collections (`networks`, `users`, `buffers`,
+    `messages`) get sharded by an explicit `sh.shardCollection()`
+    migration step in the playbook, idempotent via `sh.status()`."
+
+pre_mortem:
+  overall_risk_level: high
+  critical_failure_modes:
+    - scenario: |
+        Tier 1's outbound queue silently drops messages and the frontend
+        notices "messages disappeared" under flood.
+      likelihood: medium
+      impact: high
+      mitigation: |
+        Bounded queue drops ONLY when capacity exceeded (default 500 frames
+        per session). Under normal typing load we never hit 50 frames
+        queued, let alone 500. Coalescing in JS-side messageBatcher means
+        any drop is invisible to the eye. Add a `coalescedN` counter to
+        the WS frame metadata so t1-w3-t2 surfaces it in /api/health.
+        Frontend t1-w4-t1 loadtest shows drop percentage must stay < 0.1%.
+    - scenario: |
+        Tier 2's stateless session tokens invalidate more often than
+        expected because of clock skew, and the frontend must re-auth
+        every few minutes.
+      likelihood: medium
+      impact: high
+      mitigation: |
+        Token TTL is 24 hours with 1-hour sliding-refresh on each WS
+        message. Re-auth only happens after 24h of disconnect, not on
+        minor clock drift. Mint tokens with NTP-corrected Unix seconds;
+        verify with `clock_gettime` not `Clock.currTime` on the validator
+        side. Add a /api/me/refresh endpoint that issues a new token
+        without a full login round-trip.
+    - scenario: |
+        Tier 3 Redis Cluster's shard hot-spotting: a single gateway
+        replica gets 80% of WS sessions and the slot it owns hits 90%
+        CPU, while other replicas are idle.
+      likelihood: medium
+      impact: high
+      mitigation: |
+        Use consistent-hashing on `userId % 16384` for slot assignment.
+        Enable Redis Cluster's `cluster-allow-reads-when-down no` to
+        fail closed (the frontend can show "service degraded" instead
+        of serving stale data). Caddy LB does session affinity by
+        sticky cookie but verifies with a heartbeat every 30s; if a
+        replica is unreachable the LB evicts it from the pool and
+        remaps its sessions.
+    - scenario: |
+        Tier 3 MongoDB sharded migration corrupts an in-flight IRC
+        server log buffer if the shard key isn't backfilled.
+      likelihood: low
+      impact: critical
+      mitigation: |
+        Run the `convertShardKeyToHash` migration in `JSMIGRATE_DRY_RUN=1`
+        first to print counts; deploy via `make update` which already
+        ships a janitor-migrate dry-run-then-apply pattern (see AGENTS.md).
+        The migration uses background index build + `mongomirror` if
+        the dataset is too large to migrate online. Roll back is
+        supported by un-sharding the collection (mongos does this
+        without data loss as long as no documents crossed chunks).
+    - scenario: |
+        Tier 3's vibe-core upgrade path (option B) breaks every
+        admin API endpoint due to vibe-http 2.x async change.
+      likelihood: medium
+      impact: high
+      mitigation: |
+        Drive the upgrade off a feature branch. Run the full `unittest`
+        test suite BEFORE merge. Re-run `tests/irc_parity` against a
+        local docker-compose up. Admin SPA e2e test (a Playwright spec
+        against the local dev server) covers 50+ admin endpoints; if
+        any break, the migration aborts. Each ported module lands as
+        its own PR — never bundling the upgrade with feature work.
+    - scenario: |
+        Tier 3 multi-region failover fails: gateway replica in region B
+        cannot reach Redis Cluster in region A because of network
+        partition, but Caddy still routes 50% of sessions to it.
+      likelihood: medium
+      impact: critical
+      mitigation: |
+        Each region's gateway replicas connect to a LOCAL Redis Cluster
+        replica. Cross-region writes use Redis Streams with explicit
+        consumer-group IDs so a region A replica can re-read its own
+        writes on recovery. Caddy's `health_uri` for each upstream is
+        `/api/health/local` which checks only LOCAL dependencies; if
+        local health fails, Caddy drops the replica from the LB.
+        Simulate this in t3-w13-t1 monthly.
+
+  coordination_notes:
+    - "Tier 1 (immediate freeze fix) is the HIGHEST value. Wave 1 alone
+      can ship and unblocks the prod site; waves 2-4 are hardening."
+    - "Tier 2 is single-process. It adds internal abstractions (stateless
+      sessions, protocol v2, coalescer) but does NOT change deploy
+      topology. The Caddy route, the docker-compose service count, and
+      the ansible role layout are unchanged."
+    - "Tier 3 introduces deploy changes. Re-running an existing
+      playbook (gateway, redis, mongo) remains idempotent. New work
+      is added under deploy/roles/tier3_* and new playbooks
+      (tier3_gateway_lb.yml, tier3_redis_cluster.yml, tier3_mongo_sharded.yml)."
+    - "Tier ordering is a HARD constraint: tier2 may not start until
+      tier1_gate_passed returns true. Same for tier3. The CLI helper
+      ./scripts/check-tier-gate.sh is the canonical gate."
+    - "Tier 3.4 (vibe-core upgrade) is the longest path. If the user
+      picks Option C (accept limits), tiers 3.1-3.3 still ship; t3-w13-t2
+      becomes a multi-replica validation only."
+    - "Loadtest progression MUST be reproducible. Each tier's loadtest
+      is a separate dub binary configuration and a separate shell
+      wrapper. The irc_parity tests stay green throughout."
+    - "ROADMAP COMMITMENT: We do NOT add tasks that aren't required by
+      an acceptance criterion, a tier gate, or a process-level
+      isolation requirement. Any task that survives this filter should
+      make the cut."
+
+contracts:
+  - from_task: t1-w1-t1
+    to_task: t1-w2-t1
+    interface: "UserSession.outbound Queue + dedicated drain fiber"
+    format: "D class field + runTask(callback)"
+  - from_task: t1-w1-t1
+    to_task: t1-w3-t2
+    interface: "Coalesced-frame counter on every WS frame published under flood"
+    format: "/api/health surfaces `gateway.outboundQueueMaxDepth` + `gateway.coalescedFramesTotal`"
+  - from_task: t1-w1-t2
+    to_task: t1-w3-t1
+    interface: "watchedRunTask exported from ircfiber.async with a public registry"
+    format: "D module + JSON `/api/admin/internal/fibers`"
+  - from_task: t1-w1-t3
+    to_task: t1-w4-t1
+    interface: "ws_yields_total counter incremented by yield() instrumentation"
+    format: "OTel metric + loadtest reads `gateway.ws_yields_total`"
+  - from_task: t1-w2-t2
+    to_task: t1-w4-t2
+    interface: "MongoCircuitBreaker.allowRequest() gate"
+    format: "OTel gauge `mongo_circuit_state` ∈ {0,1,2}"
+  - from_task: t1-w3-t2
+    to_task: t1-w3-t3
+    interface: "/api/health.gateway.longRunningFibers + /api/admin/internal/fibers"
+    format: "SigNoz alert rule attribute name = gateway_long_running_fiber_seconds"
+  - from_task: t2-w5-t1
+    to_task: t2-w5-t2
+    interface: "Stateless session token in Redis hash `irc:sessions:<userId>`"
+    format: "HMAC-signed opaque token + Redis GET, refreshed via /api/me/refresh"
+  - from_task: t2-w6-t1
+    to_task: t2-w6-t2
+    interface: "WS v2 frame shape {type, channel, payload, eid, batchSize[]?}"
+    format: "JSON-envelope over the same WebSocket transport; v1 parser kept 1 minor version"
+  - from_task: t2-w7-t1
+    to_task: t2-w7-t2
+    interface: "Per-user Redis stream batch-LPUSH from engine"
+    format: "MULTI + LPUSH batch + EXEC; gateway reads via pipeline"
+  - from_task: t2-w8-t1
+    to_task: t2-w8-t3
+    interface: "ircfiber-loadtest --tier 2 --rps 25000 --duration 60"
+    format: "JSON summary + /api/health p99 log; tier2 gate requires p99 < 200ms"
+  - from_task: t3-w9-t1
+    to_task: t3-w9-t3
+    interface: "Caddy load_balancer directive with lb_route cookie"
+    format: "Caddyfile.j2 snippet; frontend stores lb_route as cookie"
+  - from_task: t3-w10-t2
+    to_task: t3-w10-t3
+    interface: "Cluster-aware Redis client (vibe-d RedisClient per slot)"
+    format: "Driver class ircfiber.storage.redis.cluster.ClusterClient"
+  - from_task: t3-w11-t1
+    to_task: t3-w11-t2
+    interface: "Shard key on userId (user collections) and channelId (messages)"
+    format: "MongoDB `sh.shardCollection()` migration step in playbook; idempotent"
+  - from_task: t3-w12-t1
+    to_task: t3-w12-t2
+    interface: "Decision artifact (GO_REWRITE | D_BUMP | ACCEPT_LIMITS)"
+    format: "docs/decisions/2026-XX-XX-vibe-core-upgrade.md (ADR)"
+  - from_task: t3-w13-t1
+    to_task: t3-w13-t3
+    interface: "Multi-region chaos drill scenario script"
+    format: "Runbook + chaos-dryrun binary; tier3 gate requires drill PASS"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TASKS — Tier 1 (immediate freeze fix, 4 waves, 11 tasks)
+# ═══════════════════════════════════════════════════════════════════════════
+tasks:
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 1 — WAVE 1 (Per-session outbound queue + priority demotion)
+  # Goal: the WS read fiber returns to client immediately under flood.
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t1-w1-t1-outbound-queue
+    title: "Tier 1 — Per-session outbound queue + dedicated write fiber"
+    description: |
+      Decouple the WebSocket read fiber from the WebSocket write fiber so
+      that a flood of IRC events cannot block the gateway from accepting
+      client commands. Today `sessionManager.sendToSession(...)` writes
+      directly to `socket.send()` on whatever fiber holds the WS event
+      loop. With 10K msgs/sec, that fiber is busy in `socket.send` NIO
+      syscalls; the read fiber never gets time → HTTP also doesn't get
+      time → site freezes.
+
+      Implementation:
+
+      1. Add `Queue!string outbound` (bounded, capacity 500) and
+         `uint coalescedN` (track dropped messages for dev visibility)
+         fields to `UserSession`.
+      2. Change `sendToSession(UUID, string)` to enqueue instead of send:
+         drop-oldest on overflow (keeps newest for chat-tail coherence).
+      3. In `handleWebSocket()`, after `enterUpdateLoop`, spawn a dedicated
+         drain fiber via `runTask` that pops the queue 5ms at a time and
+         calls `socket.send`.
+      4. On disconnect, set `session.isActive = false` BEFORE the loop
+         exits, so any final-frame enqueue is silently dropped.
+      5. Add a `coalescedN` log line at disconnect with the dropped
+         count for diagnostics.
+    wave: 1
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - outbound-queue
+      - drain-fiber
+      - coalescing
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/session.d
+        description: Define UserSession struct + sendToSession
+      - path: source/ircfiber/api/websocket.d
+        description: Where handleWebSocket + redisEventListener live
+      - path: source/ircfiber/storage/buffer.d
+        description: sanitizeUtf8 used inside sendToSession
+      - path: frontend/src/lib/messageBatcher.ts
+        description: Existing 200ms trailing-edge debounce on the client
+    acceptance_criteria:
+      - "h1: UserSession.outbound is a bounded Queue!string with capacity 500"
+      - "h2: sendToSession never blocks; backpressure is queue-full + drop-oldest"
+      - "h3: drain fiber keeps the WS write side alive without contending with the read fiber"
+      - "h4: Existing unit tests in src/app_test.d still pass"
+      - "h5: irc_parity tests (9 scenarios) all remain green"
+      - "h6: coalescedN counter increments are logged at session disconnect"
+    success_criteria:
+      - "When 1 WebSocket session receives 10K events/sec, the gateway's CPU is < 50% (was 100%+ previously)"
+      - "While the flood runs, /health returns < 200ms p99 from a parallel curl loop"
+    handoff:
+      target_files:
+        - source/ircfiber/api/session.d
+        - source/ircfiber/api/websocket.d
+      do_not_reinvestigate:
+        - "Coalescing happens at the gateway-side queue, not the client"
+        - "Capacity 500 is per-session; total memory bound is sessions x 500 frames x ~2KB ≈ 10MB at 10 active sessions"
+      minimal_change: "Two-file diff. No public API change."
+      acceptance_checks:
+        - "Add `coalescedN: uint` to UserSession and increment on drop"
+        - "Track and log coalescedN non-zero per session at disconnect"
+
+  - id: t1-w1-t2-listener-priority
+    title: "Tier 1 — Demote redisEventListener + OTel span flush to background priority"
+    description: |
+      `redisEventListener` callback (websocket.d:662) and the OTel span
+      flush (app.d:211) both run on the shared fiber pool. With a flood,
+      the listener callback runs 10K times/sec — each invocation calls
+      `parseJsonString(msg)` which can take 1-10µs and yields nothing.
+      Over 10 seconds that's measurable but bounded; what tips over HTTP
+      is that the listener's fiber doesn't yield BEFORE the next callback,
+      so other fibers starve.
+
+      Implementation wraps 4 `runTask` calls with `TaskSettings(100)`:
+
+      - redisEventListener outer task
+      - OTel span flush task
+      - startEngineHealthMonitor (app.d:230)
+      - startShutdownListener (app.d:278)
+    wave: 1
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - listener-priority
+      - background-task-priority
+      - yield-cadence
+    dependencies:
+      - t1-w1-t1-outbound-queue
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/websocket.d
+        description: redisEventListener at lines 656-705
+      - path: source/app.d
+        description: Span flush at 211; engine health monitor at 230; shutdown listener at 278
+      - path: dub.packages-cache/vibe-core-2.14.0/source/vibe/core/task.d
+        description: TaskSettings struct (priority field semantics)
+    acceptance_criteria:
+      - "h1: redisEventListener task priority = 100 (background)"
+      - "h2: Span flush task priority = 100"
+      - "h3: Engine health monitor priority = 100"
+      - "h4: Shutdown listener priority = 100"
+      - "h5: HTTP-request fibers keep priority 65536 (default)"
+      - "h6: WebSocket read fiber priority = 65536 (default)"
+      - "h7: OTel metric `fiber_priority_dist` exported"
+    success_criteria:
+      - "After t1-w4-t1 runs 10K msg/sec load for 30s, the gateway reports 100+ high-priority fiber-scheduled events per second (HTTP/WS) and ~100 low-priority (background)"
+    handoff:
+      target_files:
+        - source/ircfiber/api/websocket.d
+        - source/app.d
+      do_not_reinvestigate:
+        - "Priority is a RATIO; do not expect preemption"
+        - "vibe-core 2.14 priority 65536 = task.basePriority; lower numbers get scheduled less frequently"
+      minimal_change: "Wrap 4 runTask(...) calls with TaskSettings(100)."
+      acceptance_checks:
+        - "Verify all 4 wrapper sites via grep`"
+
+  - id: t1-w1-t3-yield-cadence
+    title: "Tier 1 — Insert explicit yield() in replayMissedEvents + subscribe + performStateDump"
+    description: |
+      Three hot loops have implicit unbounded work without yielding:
+
+      1. `replayMissedEvents` (websocket.d:584-654) — loops over all
+         entries in the user's missed-events stream. After t1-w1-t1 the
+         send is just an enqueue, but the JSON parse +16-iteration
+         reversal still runs on the WS read fiber. Add `yield();
+         sleep(1.msecs);` every 50 iterations.
+      2. The Redis subscriber callback (websocket.d:662-694) — for each
+         msg, parses JSON. For 10K msgs/sec, that's 10K parseJsonString
+         calls/sec. Add `yield()` every 100 callbacks.
+      3. `performStateDump` (websocket.d:193) — when there are 10s of
+         buffers per network and tens of networks per user, the dump
+         building loop can run O(seconds). Add yield() every 50
+         netObj["buffers"] iterations.
+
+      Acceptance: the gateway reports a non-zero count of `yield()`
+      invocations per second under load (instrumented via a Counter).
+    wave: 1
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - yield-cadence
+      - hot-loop-mitigation
+    dependencies:
+      - t1-w1-t1-outbound-queue
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/websocket.d
+        description: replayMissedEvents 584, redisEventListener 656, performStateDump 193
+      - path: source/ircfiber/observability.d
+        description: Pre-existing OTel counters
+    acceptance_criteria:
+      - "h1: replayMissedEvents yields every 50 iterations"
+      - "h2: subscriber.listen body yields every 100 calls"
+      - "h3: performStateDump yields every 50 buffer iterations"
+      - "h4: Debug Counter `ws_yields_total` increments at the expected rate"
+    success_criteria:
+      - "Under 10K msg/sec flood, the gateway's `ws_yields_total` increments >= 100/sec"
+    handoff:
+      target_files:
+        - source/ircfiber/api/websocket.d
+      do_not_reinvestigate:
+        - "Yield MUST come before sleep; sleep without yield can deadlock if the fiber has other work pending"
+        - "Use sleep(1.msecs) NOT sleep(0.msecs) (the latter is a busy-wait)"
+      minimal_change: "Three places. Five lines total."
+      acceptance_checks:
+        - "Compare gateway CPU% before/after with same load test (expect ≤50%)"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 1 — WAVE 2 (Mongo off the WS read fiber)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t1-w2-t1-prefs-save-off-fiber
+    title: "Tier 1 — Move prefs.save + sync_dump to runWorkerTask"
+    description: |
+      `prefs.save(...)` (websocket.d:759-762) and `performStateDump`
+      (websocket.d:735-737) both do synchronous Mongo reads/writes on
+      the WS read fiber. When MongoDB auth/network glitches, these
+      become tight retry loops that pin the WS read fiber — and since
+      the same fiber is what HTTP routes must service, the whole site
+      stalls.
+
+      Implementation:
+
+      1. `prefs.save` becomes fire-and-forget `runWorkerTask`.
+      2. `performStateDump` uses `runWorkerTaskH` (awaitable) so the
+         result can be awaited by the WS read fiber WITHOUT blocking it.
+      3. `NetworkRepository.findByUserId` on sync command uses
+         `runWorkerTaskH` + awaitUninterruptible.
+
+      Caveat: `runWorkerTask` runs on the SAME `st_workerPool` as the
+      fiber scheduler workers — so a long runWorkerTask CAN starve
+      fibers. We mitigate by keeping each task to < 1ms of CPU work
+      (most of the time is spent in Mongo I/O, which yields).
+    wave: 2
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - runWorkerTask-pattern
+      - future-bridge
+      - prefs-save
+    dependencies:
+      - t1-w1-t1-outbound-queue
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/websocket.d
+        description: handleClientMessage("sync") at 731; buffer at 755
+      - path: source/ircfiber/storage/preferences.d
+        description: PreferencesRepository.save
+      - path: dub.packages-cache/vibe-core-2.14.0/source/vibe/core/core.d
+        description: runWorkerTask + runWorkerTaskH signatures
+    acceptance_criteria:
+      - "h1: prefs.save on buffer switch uses runWorkerTask; the WS read fiber does not block"
+      - "h2: performStateDump on sync command uses runWorkerTaskH + awaitUninterruptible"
+      - "h3: NetworkRepository.findByUserId on sync uses runWorkerTaskH"
+      - "h4: Errors in the worker task are logged but never propagate to the WS fiber"
+    success_criteria:
+      - "With MongoDB paused (iptables or simulated), the WS read fiber still services new connections within 100ms"
+    handoff:
+      target_files:
+        - source/ircfiber/api/websocket.d
+        - source/ircfiber/async.d
+        - source/ircfiber/db/preferences.d
+      do_not_reinvestigate:
+        - "UserPreferences must be cloned before crossing the worker boundary (it's a struct with strings)"
+        - "runWorkerTaskH + awaitUninterruptible is the awaitable form; .join() deadlocks on error"
+      minimal_change: "Add helpers in async.d; call them from 3 places in websocket.d."
+
+  - id: t1-w2-t2-mongodb-bounded-retry
+    title: "Tier 1 — Bounded retry + circuit breaker for Mongo writes"
+    description: |
+      During the recent wedge, MongoDB's `Failed to connect` error fired
+      a `logWarn` + retry every iteration — what made the gateway CPU
+      peg at 100%. The retry loop needs:
+
+      1. Bounded retry count (e.g. 5 retries with exponential backoff
+         up to 30s).
+      2. Circuit breaker: after N consecutive failures, the path
+         refuses to attempt Mongo for coolDown window (default 60s).
+         During cool-down, prefs.save silently no-ops, sync dump
+         returns the previous cached state. Goal: never let a Mongo
+         hiccup wedge the gateway.
+
+      Lives in `source/ircfiber/db/mongo.d`:
+
+      ```d
+      class MongoCircuitBreaker {
+          int state;            // closed, open, half_open
+          int failures;
+          SysTime openedAt;
+          long coolDownMs = 60_000;
+          bool allowRequest() { ... }
+          void recordFailure() { ... }
+          void recordSuccess() { ... }
+      }
+      ```
+
+      Every Mongo path wraps its call in `circuitBreaker.allowRequest()`.
+    wave: 2
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - circuit-breaker
+      - retry-with-backoff
+      - mongo-resilience
+    dependencies:
+      - t1-w2-t1-prefs-save-off-fiber
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/db/mongo.d
+        description: AppMongoConnection class
+      - path: source/ircfiber/storage/preferences.d
+        description: PreferencesRepository
+      - path: source/ircfiber/storage/network.d
+        description: NetworkRepository
+      - path: source/ircfiber/observability.d
+        description: OTel metrics pipeline
+    acceptance_criteria:
+      - "h1: MongoCircuitBreaker class with state machine (closed/open/half_open)"
+      - "h2: Default coolDown = 60s; configurable IRCFIBER_MONGO_CIRCUIT_COOLDOWN_MS"
+      - "h3: After 5 consecutive failures, breaker opens and all subsequent Mongo calls short-circuit"
+      - "h4: After coolDown expires, breaker enters half_open — next call attempt is real, success closes, failure reopens"
+      - "h5: OTel metric `mongo_circuit_state` exposed"
+      - "h6: SigNoz log when breaker state transitions"
+    success_criteria:
+      - "With Mongo down for 5 minutes, the gateway's `Failed to connect to MongoDB` log line appears AT MOST 1 time per state transition, not 100+ times per second"
+      - "While Mongo is down, /health responds in < 50ms"
+    handoff:
+      target_files:
+        - source/ircfiber/db/mongo.d
+        - source/ircfiber/storage/preferences.d
+        - source/ircfiber/storage/network.d
+        - source/ircfiber/observability.d
+      do_not_reinvestigate:
+        - "The breaker is process-local (not distributed). Each gateway/engine process has its own"
+        - "The half_open transition fires on the next Mongo call attempt after coolDown expires"
+      minimal_change: "New class in mongo.d. Wrap 4-5 existing Mongo call sites."
+
+  - id: t1-w2-t3-engine-health-priority
+    title: "Tier 1 — Engine health monitor + janitor: error budget + pause on fail"
+    description: |
+      `startEngineHealthMonitor` (app.d:230) runs an infinite loop with
+      `try { sleep(10.seconds); registry.healthCheckAll(); }`. Each
+      cycle calls Redis ops — fast on success, but on fail can take time.
+      With a Redis hiccup, this became a tight loop at 100% CPU.
+
+      Fix:
+
+      1. Add explicit error budget: per cycle, if healthCheckAll throws,
+         log at WARN and increment a counter. After 10 consecutive
+         failures, mark the engine "unknown" and STOP calling
+         healthCheckAll for 5 minutes. Re-arm after a successful call.
+
+      2. Add yield/sleep rate limit: each loop iteration must
+         sleep(10.seconds, ...) to back off even under bad-Redis
+         conditions.
+
+      Implementation: wrap the body in `try { healthCheckAll(); } catch
+      { consecutiveFailures++; sleep(10.seconds); continue; }`. After
+      10 failures, set isPaused = true; sleep(5.minutes) at the top of
+      the next iteration.
+    wave: 2
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - error-budget
+      - back-pressure-on-health-monitor
+      - pause-on-fail
+    dependencies:
+      - t1-w1-t2-listener-priority
+      - t1-w2-t2-mongodb-bounded-retry
+    conflicts_with: []
+    context_files:
+      - path: source/app.d
+        description: startEngineHealthMonitor at 230-268
+      - path: source/ircfiber/irc/engine_janitor.d
+        description: EngineJanitor.cycle pattern
+    acceptance_criteria:
+      - "h1: Engine health monitor has consecutive-failure counter"
+      - "h2: After 10 consecutive failures, monitor pauses for 5 minutes"
+      - "h3: After a successful healthCheckAll, failures reset to 0"
+      - "h4: Janitor cycle has equivalent error budget (lift-and-shift)"
+      - "h5: OTel counter `gateway_health_check_errors_total` exported"
+    success_criteria:
+      - "With Redis down for 30 minutes, the gateway CPU stays <= 10%"
+    handoff:
+      target_files:
+        - source/app.d
+        - source/ircfiber/irc/engine_janitor.d
+      do_not_reinvestigate:
+        - "Pause state is process-local, in-memory. Process restart starts fresh"
+      minimal_change: "Two 30-line refactors"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 1 — WAVE 3 (Watchdog + observability surface)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t1-w3-t1-fiber-watchdog
+    title: "Tier 1 — Fiber watchdog: detect + log long-running fibers"
+    description: |
+      Add a watchdog that walks the watchedRunTask registry every 5s and
+      reports any task that has been on a worker thread for > 5 seconds
+      without yielding. vibe-core 2.14 doesn't expose Task.lastYield, so
+      we use a wrapper helper `watchedRunTask(...)` that updates an
+      external map at each yield. The watchdog checks for stale entries.
+
+      Wrap all `runTask` sites in `app.d`, `websocket.d`, `app_engine.d`
+      with the helper.
+
+      Watchdog alerts via:
+      - OTel log (severity=warn, attribute.task=...)
+      - OTel metric `gateway_long_running_fiber_seconds` (gauge)
+      - In-memory counter visible via `/api/admin/internal/fibers`
+    wave: 3
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - watchdog
+      - fiber-tracking
+      - long-fiber-detection
+    dependencies:
+      - t1-w1-t2-listener-priority
+    conflicts_with: []
+    context_files:
+      - path: source/app.d
+        description: All runTask sites
+      - path: source/ircfiber/api/websocket.d
+        description: runTask inside handleWebSocket
+      - path: source/ircfiber/async.d
+        description: safeFiberRun helper as starting point
+    acceptance_criteria:
+      - "h1: `watchedRunTask` exported from source/ircfiber/async.d"
+      - "h2: Watchdog fires every 5s checking each watched task for lastYield staleness"
+      - "h3: Watchdog logs WARN with task ID, fiber ID, duration since last yield"
+      - "h4: OTel gauge `gateway_long_running_fiber_seconds` exported"
+      - "h5: Admin endpoint `GET /api/admin/internal/fibers` lists active fibers and last yield ms"
+      - "h6: IRCFIBER_DISABLE_WATCHDOG=1 disables the watchdog"
+    success_criteria:
+      - "When the gateway wedges (simulated by injecting a tight CPU spin into one task), the watchdog's log entry fires within 6 seconds"
+      - "Watchdog overhead is < 1% CPU when no fibers are long-running"
+    handoff:
+      target_files:
+        - source/ircfiber/async.d
+        - source/app.d
+        - source/ircfiber/api/websocket.d
+        - source/ircfiber/web/admin/api.d
+      do_not_reinvestigate:
+        - "The watchdog runs in a normal task on the shared pool. Idempotent — calling it twice is safe"
+        - "vibe-core 2.14 does NOT expose a public list of running tasks; we track our own"
+      minimal_change: "Extend async.d; 3 call-site swaps + 1 new admin endpoint"
+
+  - id: t1-w3-t2-gateway-internal-health
+    title: "Tier 1 — /api/health reports gateway contention surface"
+    description: |
+      Extend /api/health to surface gateway contention metrics so an
+      on-call engineer can spot a wedge before the load balancer's TCP
+      timeout:
+
+      ```json
+      {
+          "services": {"redis": {"ok": true}, "mongo": {"ok": true}, "connectionServers": {"ok": true}},
+          "gateway": {
+              "longRunningFibers": 0,
+              "outboundQueueMaxDepth": 12,
+              "outboundQueueCapacity": 500,
+              "prefsSaveInFlight": 0,
+              "coalescedFramesTotal": 0,
+              "workerThreadsTotal": 32,
+              "workerThreadsBusy": 4,
+              "uptimeSec": 3456
+          }
+      }
+      ```
+
+      The aggregation lives in source/ircfiber/api/rest.d. Export as JSON;
+      keep the existing top-level fields intact for Caddy healthcheck
+      compatibility.
+    wave: 3
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - health-endpoint
+      - contention-surface
+      - on-call-debug
+    dependencies:
+      - t1-w1-t1-outbound-queue
+      - t1-w3-t1-fiber-watchdog
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/rest.d
+        description: REST handlers including /health
+      - path: source/ircfiber/web/admin/api.d
+        description: Admin SPA APIs
+      - path: source/ircfiber/observability.d
+        description: OTel pipelines
+    acceptance_criteria:
+      - "h1: /api/health includes a `gateway` object with at least: longRunningFibers, outboundQueueMaxDepth, prefsSaveInFlight, coalescedFramesTotal, uptimeSec"
+      - "h2: Existing fields (services.redis.ok, services.mongo.ok, services.connectionServers.ok) unchanged"
+      - "h3: Endpoint responds in < 50ms even under 10K msg/sec flood"
+      - "h4: A debug endpoint /api/admin/internal/fibers returns the same data with per-fiber detail"
+    success_criteria:
+      - "curl /api/health during a flood reports non-zero outboundQueueMaxDepth and zero longRunningFibers"
+    handoff:
+      target_files:
+        - source/ircfiber/api/rest.d
+      do_not_reinvestigate:
+        - "Caddy's healthcheck reads `/health`, not `/api/health`. Caddyfile route order matches both to the gateway. Don't break the existing /health contract"
+      minimal_change: "Append a `gateway:` block to the /api/health handler"
+
+  - id: t1-w3-t3-signoz-watchdog-alert
+    title: "Tier 1 — SigNoz alert: gateway_fiber_wedge sustained for 30s"
+    description: |
+      Add a SigNoz alert that pages when the gateway has been in a
+      fiber-wedge state (longRunningFibers > 0 for 30 consecutive
+      seconds) — a single 5s stutter is normal during boot/peak. Alert
+      uses the OTel gauge `gateway_long_running_fiber_seconds` from
+      t1-w3-t1.
+
+      ```yaml
+      alert: gateway_fiber_wedge
+      query: |
+          attribute.name = gateway_long_running_fiber_seconds
+          AND value > 0
+      condition: count > 1
+      window: 30s
+      severity: critical
+      notify: ["slack:ircfiber-pagerduty"]
+      ```
+
+      First deploy runs in disabled: true for 24h so we can validate.
+    wave: 3
+    tier: 1
+    agent: gem-devops
+    covers:
+      - signoz-alert
+      - watchdog-page
+      - on-call
+    dependencies:
+      - t1-w3-t1-fiber-watchdog
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/logging/signoz-alerts.yml.j2
+        description: Existing alert rule YAML
+      - path: deploy/roles/logging/tasks/deploy-alerts.yml
+        description: Alert deployment task
+      - path: source/ircfiber/observability.d
+        description: OTel gauge plumbing
+    acceptance_criteria:
+      - "h1: New alert rule `gateway_fiber_wedge` defined in signoz-alerts.yml.j2"
+      - "h2: Alert deploys via `deploy-alerts.yml` (initially disabled)"
+      - "h3: After 24h validation, alert flips to enabled in a follow-up PR"
+      - "h4: Alert fires when gateway_long_running_fiber_seconds > 0 for 30 consecutive seconds"
+    success_criteria:
+      - "Alert evaluates correctly when injecting a wedge (no false negative within 35s)"
+    handoff:
+      target_files:
+        - deploy/roles/logging/signoz-alerts.yml.j2
+      do_not_reinvestigate:
+        - "Signoz alert deploy API uses POST /api/v2/rules. The deploy-alerts.yml task already POSTs the rules — just add the new rule to the YAML"
+      minimal_change: "Add one rule entry."
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 1 — WAVE 4 (Load test)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t1-w4-t1-loadtest-binary
+    title: "Tier 1 — New dub target ircfiber-loadtest, synthetic IRC flood"
+    description: |
+      New executable `ircfiber-loadtest` (dub config `loadtest`) that:
+
+      1. Connects to the same Redis the engine uses.
+      2. Selects one user (parameter `-u <userId>`) and opens a
+         subscriber on `irc:events:<userId>`.
+      3. For 60 seconds at a configurable rate (default 10K/sec),
+         calls `redis.publish("irc:events:<userId>", "<flood-event>")`
+         with synthetic PRIVMSG-shaped JSON.
+      4. Counts how many events the SUB side received.
+      5. Reports: targetRps, sent, received, dropPercent (computed via
+         /api/health coalescedN) — JSON to stdout.
+      6. Honors `--rps`, `--duration`, `--user`, `--redis-url`, `--tier`.
+
+      The test is a Redis-only flooder — no IRC sockets needed.
+    wave: 4
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - loadtest-binary
+      - flood-simulation
+      - synthetic-bench
+    dependencies:
+      - t1-w1-t1-outbound-queue
+      - t1-w3-t2-gateway-internal-health
+    conflicts_with: []
+    context_files:
+      - path: dub.sdl
+        description: New `loadtest` build configuration
+      - path: source/conn_holder/protocol.d
+        description: Reference for binary-frame IPC + build pattern
+      - path: source/consumer_test.d
+        description: Reference for Redis subscriber test harness
+    acceptance_criteria:
+      - "h1: New `loadtest` build configuration in dub.sdl"
+      - "h2: Binary `ircfiber-loadtest --tier 1 --rps 10000 --duration 60 --user <uid>` exits 0"
+      - "h3: Reports sent/received/drop as JSON to stdout"
+      - "h4: ./scripts/run-loadtest.sh wrapper builds + runs + summarizes results"
+      - "h5: Local + CI runs build it (CI does NOT execute the flood by default)"
+    success_criteria:
+      - "5 consecutive runs of ./scripts/run-loadtest.sh --tier 1 against localhost all succeed"
+    handoff:
+      target_files:
+        - dub.sdl
+        - source/loadtest/main.d
+        - scripts/run-loadtest.sh
+      do_not_reinvestigate:
+        - "Loadtest binary does NOT need MongoDB; only touches Redis pub/sub"
+        - "The `userId` parameter must be a real registered user so the gateway's subscription path is exercised"
+      minimal_change: "Add new dub config + 200-line D source + 50-line shell wrapper"
+
+  - id: t1-w4-t2-load-test-gate
+    title: "Tier 1 — Load-test p99 < 200ms gate in pre-deploy script"
+    description: |
+      Pre-deploy gate `./scripts/check-tier-gate.sh --tier 1`:
+
+      1. Spins up the docker-compose stack locally
+         (`docker compose -f docker-compose.test.yml up -d`).
+      2. Registers a test user + test network in Mongo.
+      3. Runs `./scripts/run-loadtest.sh --tier 1 --rps 10000 --duration 60`.
+      4. Polls /api/health every 5s during the flood; collects p50/p99/avg
+         latency.
+      5. Asserts p99 < 200ms and zero timeout errors.
+      6. Tears the stack down.
+      7. Exits 0 on PASS, 1 on FAIL.
+
+      Wire into `make pre-deploy` (existing target). Default execution
+      skips with a `[SKIP]` line if no docker compose available.
+
+      This gate is the proof that the structural isolation works. Without
+      it, we can revert to the wedged state without noticing.
+    wave: 4
+    tier: 1
+    agent: gem-implementer
+    covers:
+      - ci-gate
+      - perf-budget
+      - regression-guard
+    dependencies:
+      - t1-w4-t1-loadtest-binary
+    conflicts_with: []
+    context_files:
+      - path: docker-compose.test.yml
+        description: Test compose already used by parity tests
+      - path: tests/irc_parity/
+        description: Existing parity test scaffolding
+      - path: scripts/
+        description: Where shell scripts live
+      - path: Makefile
+        description: pre-deploy target
+    acceptance_criteria:
+      - "h1: scripts/check-tier-gate.sh --tier 1 runs the full gate"
+      - "h2: Gate exit code 0 if p99 < 200ms throughout, else 1"
+      - "h3: Gate prints PASS/FAIL summary suitable for CI logs"
+      - "h4: Gate is composed into existing `make pre-deploy` target"
+      - "h5: Running the gate against the unpatched gateway (revert HEAD) reproduces > 200ms p99"
+      - "h6: Gate blocks tier-2 rollout until it returns 0 (see t1-w4-t2-success_criteria above)"
+    success_criteria:
+      - "Gate fails when run against the original gateway code (pre-patch)"
+      - "Gate passes when run against the patched gateway code (HEAD)"
+      - "Running ./scripts/check-tier-gate.sh --tier 1 prints `TIER1_GATE_PASSED=true` on success"
+    handoff:
+      target_files:
+        - scripts/check-tier-gate.sh
+        - scripts/run-loadtest.sh
+        - Makefile
+        - .github/workflows/
+      do_not_reinvestigate:
+        - "The 60-second test duration is per CI run. Total CI time increases by ~70s"
+      minimal_change: "Add the gate script; one Makefile hook"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 2 — WAVE 5 (Stateless session tokens + Mongo-free hot path)
+  # Goal: eliminate MongoDB from the per-message WS hot path.
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t2-w5-t1-stateless-sessions
+    title: "Tier 2 — Stateless Redis-backed session tokens (no Mongo on WS hot path)"
+    description: |
+      Currently every WS reconnect calls `authenticateRequest` which
+      hits Mongo. Under 50K WS connections with frequent reconnects,
+      this saturates Mongo.
+
+      Tier 2 introduces opaque session tokens stored ONLY in a Redis
+      hash `irc:sessions:<userId>`. The token is HMAC-signed (key from
+      vault) so it can be verified statelessly; the per-userId Redis
+      hash is the source of truth for "is this token still valid" and
+      `lastSeenAt`.
+
+      Implementation:
+
+      1. New module `source/ircfiber/auth/session_token.d`:
+         - `mintToken(userId, ttl=24h)` returns `opaqueToken`
+         - `verifyToken(opaqueToken)` returns `Nullable!UserSession`
+         - Refresh-on-WS-message bumps `lastSeenAt` and rolls TTL.
+      2. New endpoint `POST /api/me/refresh` issues a new token
+         without a full login round-trip; sliding refresh is 1h.
+      3. WebSocket handler accepts the new token in the `Sec-WebSocket-
+         Protocol` header OR `Authorization: Bearer <token>`.
+      4. Mongo `authenticateRequest` becomes the FALLBACK path; tokens
+         minted by the new path skip it.
+
+      Load-test impact: WS connect latency drops by ~5-15ms (no Mongo
+      round trip), Mongo CPU drops ~30% under reconnect storms.
+    wave: 5
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - stateless-sessions
+      - token-rotation
+      - sliding-refresh
+    dependencies:
+      - t1-w4-t2-load-test-gate
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/auth.d
+        description: Existing authenticateRequest + hashPassword
+      - path: source/ircfiber/api/websocket.d
+        description: handleWebSocket auth path
+      - path: source/ircfiber/api/rest.d
+        description: Where /api/me/refresh will land
+      - path: source/ircfiber/storage/redis.d
+        description: Redis hash helpers
+    acceptance_criteria:
+      - "h1: New module ircfiber.auth.session_token with mintToken/verifyToken"
+      - "h2: Redis hash irc:sessions:<userId> stores {opaqueToken, lastSeenAt, ttl, mint}"
+      - "h3: WS handler accepts new tokens; old auth code is fallback"
+      - "h4: POST /api/me/refresh issues a 1h-sliding refreshed token"
+      - "h5: HMAC verifier uses clock_gettime, not Clock.currTime"
+      - "h6: Token rotation invalidates the old token within 100ms"
+    success_criteria:
+      - "50K concurrent WS sessions, reconnect-storm 1% per minute — Mongo CPU < 30% peak"
+      - "No full re-login required for token refresh within 24h of activity"
+    handoff:
+      target_files:
+        - source/ircfiber/auth.d
+        - source/ircfiber/auth/session_token.d
+        - source/ircfiber/api/websocket.d
+        - source/ircfiber/api/rest.d
+      do_not_reinvestigate:
+        - "Token TTL is 24h with 1h sliding refresh"
+        - "Verify with clock_gettime not Clock.currTime for skew resistance"
+      minimal_change: "New module + 3 call-site swaps + 1 endpoint"
+
+  - id: t2-w5-t2-network-config-cache
+    title: "Tier 2 — Network/prefs config cache in Redis hash + LRU"
+    description: |
+      `NetworkRepository.findByUserId` and `PreferencesRepository.load`
+      run on every WS connect AND on the periodic sync command. At
+      50K connections with 25K msg/sec, Mongo can't sustain this.
+
+      Tier 2 moves these reads to a Redis hash `irc:userconfig:<userId>`
+      that mirrors Mongo. The hash is populated by a periodic bulk-load
+      task (every 5 minutes) and on-demand by the gateway on a cache
+      miss. Writes go to Mongo (write-through) and to the hash
+      (write-behind via runWorkerTaskH).
+
+      Implementation:
+
+      1. New module `source/ircfiber/storage/userconfig_cache.d`:
+         - `NetworkConfig[] getNetworksForUser(UUID userId)`
+         - `UserPreferences getPrefsForUser(UUID userId)`
+         - Both backed by Redis hash; on miss, fall through to Mongo
+           and repopulate.
+      2. Bulk-loader task starts at boot: scan all `users` from Mongo,
+         populate `irc:userconfig:*` hashes.
+      3. Update invalidation: when `updateNetwork`, `updatePrefs` etc.
+         is called via REST, both Mongo AND the cache hash are updated.
+    wave: 5
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - config-cache
+      - write-through
+      - bulk-load
+    dependencies:
+      - t2-w5-t1-stateless-sessions
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/db/network.d
+        description: NetworkRepository
+      - path: source/ircfiber/db/preferences.d
+        description: PreferencesRepository
+      - path: source/ircfiber/api/rest.d
+        description: REST handlers that mutate configs
+    acceptance_criteria:
+      - "h1: New module ircfiber.storage.userconfig_cache with hash-backed reads"
+      - "h2: Redis hash `irc:userconfig:<userId>` populated at boot by bulk-loader"
+      - "h3: All REST endpoints that mutate prefs/networks also invalidate the cache"
+      - "h4: WS connect path serves from cache; Mongo is fallback only on miss"
+      - "h5: OTel metric `userconfig_cache_hits_total` + `userconfig_cache_misses_total`"
+    success_criteria:
+      - "After bulk-load completes, MongoDB `find` ops/sec drops by 80% on the WS hot path"
+    handoff:
+      target_files:
+        - source/ircfiber/storage/userconfig_cache.d
+        - source/ircfiber/api/rest.d
+        - source/ircfiber/api/websocket.d
+      do_not_reinvestigate:
+        - "Bulk-loader is best-effort; on failure it logs WARN and continues"
+      minimal_change: "New module + 4 call-site swaps + 1 boot task"
+
+  - id: t2-w5-t3-lru-prefs-cache
+    title: "Tier 2 — In-memory LRU cache for hot prefs (write-through to Redis hash)"
+    description: |
+      Even with the Redis-hash cache in t2-w5-t2, every WS message
+      bumps `lastSeenAt` on the prefs hash, which is a Redis HSET
+      round trip. Tier 2 adds an in-memory LRU keyed by userId that
+      caches the prefs struct itself; writes coalesce and flush to
+      Redis every 30s (not per-message).
+
+      Implementation in source/ircfiber/storage/prefs_lru.d:
+
+      - `LRU!UserPrefs` (size 5000) keyed by userId
+      - `getPrefs(userId)` returns from LRU; on miss, read Redis hash
+      - `setLastSeenAt(userId)` updates the in-memory copy only;
+        periodic flusher (every 30s) writes to Redis hash
+      - On process exit, flush all dirty entries before returning
+
+      This removes ~50K Redis HSET/sec from the steady-state cost.
+    wave: 5
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - lru-cache
+      - write-coalesce
+      - dirty-flush
+    dependencies:
+      - t2-w5-t2-network-config-cache
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/storage/preferences.d
+        description: Existing prefs read/write
+      - path: source/ircfiber/storage/buffer.d
+        description: Where LRU pattern is established (cache buffers)
+    acceptance_criteria:
+      - "h1: New module ircfiber.storage.prefs_lru with 5000-entry LRU"
+      - "h2: Periodic flusher writes dirty entries to Redis every 30s"
+      - "h3: WS message path does NOT touch Redis for lastSeenAt; only the flusher does"
+      - "h4: On graceful shutdown, all dirty entries are flushed before exit"
+      - "h5: OTel metric `prefs_lru_hits_total` + `prefs_lru_dirty_count`"
+    success_criteria:
+      - "With 50K WS sessions active, the gateway issues < 5 Redis HSET/sec for lastSeenAt (down from 50K/sec)"
+    handoff:
+      target_files:
+        - source/ircfiber/storage/prefs_lru.d
+        - source/ircfiber/api/websocket.d
+      do_not_reinvestigate:
+        - "The LRU key is userId (UUID), keyed in-process. No cross-process eviction"
+      minimal_change: "New module + WS handler swap"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 2 — WAVE 6 (WS protocol v2 + frame coalescer)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t2-w6-t1-ws-protocol-v2
+    title: "Tier 2 — WS protocol v2: {type, channel, payload, eid, batchSize?}"
+    description: |
+      v1 sends one JSON object per IRC event as one WS frame.
+      v2 introduces a frame envelope:
+
+        {
+          "v": 2,
+          "type": "irc_event" | "sync" | "stat_user" | ...,
+          "channel": "buffer-name-or-empty",
+          "payload": { ...the existing v1 JSON object... },
+          "eid": 12345,
+          "batchSize": 1,            // optional; >1 means N events were coalesced
+          "droppedBefore": 0         // optional; coalescedN from server queue
+        }
+
+      Two wire-encoding modes:
+        1. JSON envelope (default, backward compatible with v1 parser)
+        2. MessagePack envelope (optional via Sec-WebSocket-Protocol
+           header, opt-in by the SPA's configureWebSocket)
+
+      Co-exists with v1 for one minor version (router-side feature flag
+      `IRCFIBER_WS_PROTOCOL_V2_ENABLED=1`). Frontend adopts v2 in
+      t2-w6-t2.
+
+      Backend changes:
+        - websocket.d sendToSession takes an optional `(type, payload)`
+          struct instead of a raw string, builds the envelope
+        - Per-session flag `protocolVersion` defaults to 1 on first
+          connect, upgrades to 2 once the SPA sends the upgrade header
+    wave: 6
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - ws-protocol-v2
+      - envelope-shape
+      - back-compat
+    dependencies:
+      - t2-w5-t1-stateless-sessions
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/websocket.d
+        description: sendToSession call sites
+      - path: source/ircfiber/api/session.d
+        description: UserSession
+      - path: frontend/src/stores/wsConnection.svelte.ts
+        description: Frontend WS client
+    acceptance_criteria:
+      - "h1: WS frame envelope defined in source/ircfiber/api/ws_envelope.d"
+      - "h2: Both v1 and v2 parsers/renderers exist; v1 is the default"
+      - "h3: Feature flag IRCFIBER_WS_PROTOCOL_V2_ENABLED gates v2"
+      - "h4: Per-session protocolVersion tracks which version the SPA is using"
+      - "h5: Existing v1 frames still parse + render identically"
+      - "h6: OTel counter `ws_protocol_v2_frames_total` separate from v1"
+    success_criteria:
+      - "v2 envelope parses without loss across the existing irc_parity suite"
+      - "No frontend regression when feature flag is OFF (default in Tier 1 deployment)"
+    handoff:
+      target_files:
+        - source/ircfiber/api/ws_envelope.d
+        - source/ircfiber/api/session.d
+        - source/ircfiber/api/websocket.d
+      do_not_reinvestigate:
+        - "MessagePack dependency adds ~50KB to the binary; it is opt-in via header"
+      minimal_change: "New module + 1 enum field + 1 call-site swap"
+
+  - id: t2-w6-t2-frame-coalescer-frontend
+    title: "Tier 2 — Gateway write coalescer + frontend v2 parser"
+    description: |
+      Two-part task:
+
+      Backend coalescer (gateway-side):
+      - The drain fiber (from t1-w1-t1) coalesces N adjacent frames with
+        the same `channel` and `type` into a single envelope with
+        `batchSize: N`. This is structural insurance; the frontend's
+        messageBatcher.ts already does similar work, but server-side
+        coalescing reduces WS frame count from 25K/sec to ~2K/sec at
+        peak.
+      - Implementation in `source/ircfiber/api/drain_coalesce.d`:
+        a 5ms window per channel; if 5 frames arrive within 5ms on
+        the same channel, emit one batched frame and bump batchSize.
+
+      Frontend v2 parser:
+      - Update `frontend/src/stores/wsConnection.svelte.ts` to parse
+        v2 envelopes; if `batchSize > 1`, iterate `payload[]`.
+      - Keep v1 fallback — if `v: 1` or absent, parse as today.
+      - New unit tests in `wsConnection.v2.test.ts`.
+
+      Critical: the v2 parser MUST not duplicate frames or drop them
+      under coalescing.
+    wave: 6
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - frame-coalescing
+      - v2-parser
+      - back-compat-fallback
+    dependencies:
+      - t2-w6-t1-ws-protocol-v2
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/drain_coalesce.d
+        description: New module
+      - path: source/ircfiber/api/websocket.d
+        description: Drain fiber integration
+      - path: frontend/src/stores/wsConnection.svelte.ts
+        description: Frontend WS client
+      - path: frontend/src/lib/messageBatcher.ts
+        description: Existing client-side coalescer
+    acceptance_criteria:
+      - "h1: drain_coalesce module emits batched frames for adjacent same-channel events"
+      - "h2: Backend coalesces 25K msg/sec to < 2K WS frames/sec in the loadtest"
+      - "h3: Frontend v2 parser correctly handles `batchSize > 1` without duplication/drop"
+      - "h4: Frontend v1 parser unchanged; feature flag OFF = no behavior change"
+      - "h5: New unit tests in wsConnection.v2.test.ts pass"
+      - "h6: irc_parity suite still 9/9 green"
+    success_criteria:
+      - "Backend emits < 100 WS frames/sec when fed 25K msg/sec across 50 active sessions"
+      - "Frontend renders all 25K events per second with zero loss in the messageBatcher test"
+    handoff:
+      target_files:
+        - source/ircfiber/api/drain_coalesce.d
+        - source/ircfiber/api/websocket.d
+        - frontend/src/stores/wsConnection.svelte.ts
+      do_not_reinvestigate:
+        - "Coalescing window is 5ms; tune via env if needed"
+      minimal_change: "1 new backend module + frontend parser swap"
+
+  - id: t2-w6-t3-load-shedding-policy
+    title: "Tier 2 — Adaptive per-session backpressure (drop-not-block)"
+    description: |
+      When a single WS session's drain queue fills beyond 400/500 (80%),
+      it's stuck — typically because the client's network is slow.
+      Rather than block the drain fiber, the gateway marks the session
+      `flowControlled: true` and adds a `_server` warning event to the
+      queue telling the user to refresh.
+
+      Adaptive policy:
+
+      - When the queue fills: increment `droppedFramesTotal`.
+      - At 80% sustained for 5s: send a single warning event, then
+        start dropping NEW frames for that session (oldest are still
+        drop-oldest; new are dropped immediately).
+      - When the queue drains below 20%: reset flow control.
+      - Record flow-control events in OTel metrics.
+
+      Goal: 49 healthy sessions don't lose frames because 1 stuck
+      session is hogging the drain fiber.
+    wave: 6
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - adaptive-backpressure
+      - per-session-flow-control
+      - drop-not-block
+    dependencies:
+      - t1-w1-t1-outbound-queue
+      - t2-w6-t2-frame-coalescer-frontend
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/session.d
+        description: UserSession.outbound + flow control state
+      - path: source/ircfiber/api/websocket.d
+        description: drainOutboundLoop
+    acceptance_criteria:
+      - "h1: New `flowControlled` field on UserSession"
+      - "h2: When queue > 400 for 5s, mark flowControlled and emit a warning event"
+      - "h3: When queue < 100 sustained, reset flowControlled"
+      - "h4: OTel gauges `ws_flow_controlled_total` + `ws_dropped_frames_total`"
+      - "h5: Manual unit test: simulate one stuck session, verify other sessions still drain"
+    success_criteria:
+      - "With 1 stuck session at 25K msg/sec, the other 49 sessions' p99 frame delivery stays < 50ms"
+    handoff:
+      target_files:
+        - source/ircfiber/api/session.d
+        - source/ircfiber/api/websocket.d
+        - source/ircfiber/observability.d
+      do_not_reinvestigate:
+        - "The flow-controlled session's frames DO get dropped; we tolerate the loss"
+      minimal_change: "2 fields + 1 logic block"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 2 — WAVE 7 (Engine publish batching + Redis pipeline)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t2-w7-t1-engine-batch-publish
+    title: "Tier 2 — Engine batch-publishes events to per-user Redis stream"
+    description: |
+      Today the engine does one LPUSH per IRC event:
+
+      ```d
+      redis.lpush(RedisKeys.userStream(userId), eventJson);  // 1 round trip per event
+      ```
+
+      Tier 2 introduces a per-write-task batching scheme:
+
+      ```d
+      // Coalesce up to 100 events or 50ms, whichever first
+      auto batch = new Bson[100];
+      foreach (ev; events) {
+          batch ~= ...;
+          if (batch.length == 100) flush(batch);
+      }
+      flush(batch);
+      ```
+
+      Saves ~99% of Redis round trips on a 50K msg/sec fanout.
+
+      Lives in source/ircfiber/irc/manager.d. Existing code path is
+      preserved; the batching is opt-in via
+      `IRCFIBER_BATCHED_USERSTREAM=1`.
+    wave: 7
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - batch-publish
+      - redis-round-trip-reduction
+      - user-stream-coalesce
+    dependencies:
+      - t2-w6-t2-frame-coalescer-frontend
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/irc/manager.d
+        description: Where events are published
+      - path: source/ircfiber/storage/redis.d
+        description: lpush helper
+    acceptance_criteria:
+      - "h1: New batchLpush helper in redis.d with explicit maxBatchSize"
+      - "h2: manager.d uses batchLpush with cap 100 + window 50ms"
+      - "h3: Feature flag IRCFIBER_BATCHED_USERSTREAM=1 gates rollout"
+      - "h4: OTel counter `redis_batched_lpush_calls_total` + `redis_batched_lpush_events_total`"
+      - "h5: Idempotent: failed batches retry individually"
+    success_criteria:
+      - "At 25K msg/sec engine fanout, Redis LPUSH/sec drops by 99% (from 25K/sec to ~250/sec)"
+    handoff:
+      target_files:
+        - source/ircfiber/irc/manager.d
+        - source/ircfiber/storage/redis.d
+      do_not_reinvestigate:
+        - "Batching window is bounded by wall-clock, not by message count"
+      minimal_change: "1 new helper + 1 call-site swap"
+
+  - id: t2-w7-t2-gateway-pipeline-read
+    title: "Tier 2 — Gateway uses Redis pipeline for batch subscriber reads"
+    description: |
+      With 50K active WS sessions, the gateway's Redis subscriber
+      currently opens 50K Redis subscriptions (per-user channels). Under
+      the engine batch-publish from t2-w7-t1, this still spawns 50K
+      callbacks. Tier 2 introduces shared subscription:
+
+      - Use Redis Streams consumer groups instead of pub/sub. Each
+        gateway instance consumes from one stream per user (still
+        per-user, but the stream is a single XREADGROUP call).
+      - Migration path: phase out `irc:events:<userId>` pub/sub, phase
+        in `irc:stream:<userId>` XADD (which is already used for
+        replay, see RedisKeys.userStream).
+      - The live path becomes XREADGROUP > BLOCK 100 > consumer-group;
+        multiple gateways with the same group name load-balance the
+        stream naturally.
+
+      Caveat: XREADGROUP can't deliver to a specific user-subscriber
+      without a group-per-user. We use one consumer group per user
+      with the engine's hostname as the consumer name; a failover
+      repoints the gateway to the new consumer name.
+    wave: 7
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - stream-consumer-group
+      - shared-subscription
+      - failover-friendly
+    dependencies:
+      - t2-w7-t1-engine-batch-publish
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/websocket.d
+        description: redisEventListener
+      - path: source/ircfiber/redis/protocol.d
+        description: Stream key names
+    acceptance_criteria:
+      - "h1: New ConsumerGroup wrapper in source/ircfiber/storage/redis.d"
+      - "h2: websocket.d switches from pub/sub to XREADGROUP when IRCFIBER_STREAM_CONSUMER=1"
+      - "h3: Consumer name = gateway hostname + pid, repointable on failover"
+      - "h4: Pending messages re-deliverable via XPENDING + XCLAIM on heartbeat loss"
+    success_criteria:
+      - "With 50K active sessions, Redis SUBSCRIBE count drops from 50K to 1 (single XREADGROUP per user)"
+    handoff:
+      target_files:
+        - source/ircfiber/storage/redis.d
+        - source/ircfiber/api/websocket.d
+      do_not_reinvestigate:
+        - "PUB/SUB remains the default; XREADGROUP is opt-in"
+      minimal_change: "New wrapper + 1 call-site swap"
+
+  - id: t2-w7-t3-stream-replay-pipeline
+    title: "Tier 2 — Stream replay now uses XREAD (no LRANGE)"
+    description: |
+      Today `replayMissedEvents` uses LRANGE on the user's stream to
+      fetch missed events. Under 50K connections all reconnecting at
+      once, LRANGE on 50K keys at once floods Redis.
+
+      Tier 2 replaces LRANGE with XREAD COUNT 200 STREAMS
+      `irc:stream:<userId>` sinceEid, returning at most the events the
+      client actually missed. This is O(missed events), not O(stream
+      length).
+
+      Implementation in websocket.d replayMissedEvents:
+      - Replace `db.lrange(streamKey, 0, -1)` with XREAD.
+      - Keep the 200-cap (IRCCloud parity).
+      - Add OTel metric `stream_replay_xread_calls_total`.
+    wave: 7
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - xread-stream
+      - replay-optimization
+      - redis-fanout-reduction
+    dependencies:
+      - t2-w7-t2-gateway-pipeline-read
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/api/websocket.d
+        description: replayMissedEvents 584-654
+    acceptance_criteria:
+      - "h1: replayMissedEvents uses XREAD with COUNT 200 instead of LRANGE 0 -1"
+      - "h2: Stream returned events are identical to LRANGE-based path under the irc_parity harness"
+      - "h3: When stream is missing, replay no-ops (don't synthesize)"
+    success_criteria:
+      - "Simulated reconnect storm (50% of 50K users in 5s): Redis CPU < 30%"
+    handoff:
+      target_files:
+        - source/ircfiber/api/websocket.d
+      do_not_reinvestigate:
+        - "Backwards compatibility: feature flag IRCFIBER_STREAM_XREAD_REPLAY=1"
+      minimal_change: "Single function rewrite"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 2 — WAVE 8 (Tier 2 loadtest + gate)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t2-w8-t1-loadtest-tier2
+    title: "Tier 2 — Loadtest upgrade: 25K msg/sec + 50K WS sessions"
+    description: |
+      Extend `ircfiber-loadtest` to tier-2 mode:
+
+      - `--tier 2 --rps 25000 --duration 60 --sessions 50000`
+      - Spawns 50K simulated WS clients via a bundled Node child
+        process (`scripts/loadtest-ws-clients.js`) that opens WS
+        connections, subscribes to user events, and counts received
+        frames.
+      - The D process drives the producer side (Redis LPUSH at
+        25K/sec across the 50K user channels).
+      - Reports: per-session p50/p99 receive latency, dropPercent,
+        gateway CPU%, /api/health p99 latency.
+    wave: 8
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - tier-2-loadtest
+      - ws-client-simulator
+      - per-session-latency
+    dependencies:
+      - t2-w7-t3-stream-replay-pipeline
+      - t2-w6-t3-load-shedding-policy
+    conflicts_with: []
+    context_files:
+      - path: source/loadtest/main.d
+        description: D loadtest driver
+      - path: scripts/loadtest-ws-clients.js
+        description: New Node WS client simulator
+      - path: frontend/src/lib/messageBatcher.ts
+        description: Client-side coalescer (validates that v2 frames flow through)
+    acceptance_criteria:
+      - "h1: ircfiber-loadtest --tier 2 spawns 50K Node WS clients via child process"
+      - "h2: Reports per-session p50/p99 receive latency"
+      - "h3: Reports dropPercent from /api/health coalescedFramesTotal"
+      - "h4: ./scripts/run-loadtest.sh --tier 2 wrapper works headless (no GUI)"
+    success_criteria:
+      - "Runs to completion (60s) without leaking WS clients"
+    handoff:
+      target_files:
+        - source/loadtest/main.d
+        - scripts/loadtest-ws-clients.js
+        - scripts/run-loadtest.sh
+      do_not_reinvestigate:
+        - "The Node child process exits cleanly on signal"
+      minimal_change: "Driver extends tier-1 binary; new shell wrapper"
+
+  - id: t2-w8-t2-tier2-ci-gate
+    title: "Tier 2 — ./scripts/check-tier-gate.sh --tier 2"
+    description: |
+      Extend the gate to tier-2 mode:
+
+      ```bash
+      ./scripts/check-tier-gate.sh --tier 2 \
+          --sessions 50000 --rps 25000 --duration 60
+      ```
+
+      Asserts:
+      - 50K WS sessions established across the gateway
+      - 25K msg/sec sustained for 60s
+      - p99 /api/health latency < 200ms throughout
+      - dropPercent < 0.1%
+      - MongoDB CPU < 30% peak
+      - No WS client hung at end of test
+
+      Exits 0 on PASS, 1 on FAIL. Prints
+      `TIER2_GATE_PASSED=true|false`.
+
+      Wired into Makefile and CI alongside tier 1.
+    wave: 8
+    tier: 2
+    agent: gem-implementer
+    covers:
+      - ci-gate-tier2
+      - perf-budget-tier2
+      - regression-guard
+    dependencies:
+      - t2-w8-t1-loadtest-tier2
+    conflicts_with: []
+    context_files:
+      - path: scripts/check-tier-gate.sh
+        description: Gate orchestrator
+      - path: scripts/run-loadtest.sh
+        description: Tier-1 wrapper (extended to tier 2)
+      - path: Makefile
+        description: pre-deploy target
+    acceptance_criteria:
+      - "h1: Gate runs all tier-2 loadtest scenarios"
+      - "h2: Gate prints TIER2_GATE_PASSED=true on success"
+      - "h3: Tier 3 wave 9 work MAY NOT start until TIER2_GATE_PASSED=true"
+    success_criteria:
+      - "Gate passes on Tier-2 patched gateway"
+      - "Gate fails when statelesness is reverted"
+    handoff:
+      target_files:
+        - scripts/check-tier-gate.sh
+        - Makefile
+      do_not_reinvestigate:
+        - "Total CI time +~90s"
+      minimal_change: "Extend the existing gate script; one Makefile hook"
+
+  - id: t2-w8-t3-tier2-rollout-runbook
+    title: "Tier 2 — Rollout runbook (canary + bake + promote)"
+    description: |
+      Runbook docs/plan/20260704-thread-pool-isolation/rollout_tier2.md:
+
+      1. **Canary** — Deploy to one OVH gateway replica behind a
+         feature flag (IRCFIBER_WS_PROTOCOL_V2_ENABLED=canary,
+         IRCFIBER_BATCHED_USERSTREAM=canary).
+      2. **Bake** — Hold for 1 hour with synthetic load
+         (`./scripts/run-loadtest.sh --tier 2 --rps 5000`).
+      3. **Validate** — Read SigNoz panels:
+         - gateway.cpu_percent < 30%
+         - mongo.finds_per_sec drops by 80%
+         - ws.protocol_v2.drop_percent < 0.01
+      4. **Promote** — Flip env to enabled=true on all replicas.
+         Run tier-2 gate.
+      5. **Rollback** — Revert env to off; gateway restarts; verify
+         v1 path still works.
+
+      Files:
+      - docs/plan/.../rollout_tier2.md
+      - AGENTS.md update with the new flags + commands
+    wave: 8
+    tier: 2
+    agent: gem-documentation-writer
+    covers:
+      - canary-strategy
+      - runbook
+      - agents-md-update
+    dependencies:
+      - t2-w8-t2-tier2-ci-gate
+    conflicts_with: []
+    context_files:
+      - path: AGENTS.md
+        description: Existing agent docs
+      - path: scripts/check-tier-gate.sh
+        description: Gate interface
+    acceptance_criteria:
+      - "h1: rollout_tier2.md documents canary → bake → promote → rollback"
+      - "h2: Runbook references exact env vars and SigNoz panel URLs"
+      - "h3: AGENTS.md is updated with the new flags + commands"
+    success_criteria:
+      - "An on-call engineer can roll out Tier 2 following only the runbook"
+    handoff:
+      target_files:
+        - docs/plan/20260704-thread-pool-isolation/rollout_tier2.md
+        - AGENTS.md
+      do_not_reinvestigate:
+        - "The runbook is written, not the rollout itself"
+      minimal_change: "1 markdown file + AGENTS.md append"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 3 — WAVE 9 (Multi-replica gateway + Caddy load balancer)
+  # Goal: process-level isolation. Scale the gateway horizontally.
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t3-w9-t1-caddy-load-balancer
+    title: "Tier 3 — Caddy load_balancer + sticky-cookie WS affinity"
+    description: |
+      Add a Caddy v2 `load_balancer` directive in front of the gateway
+      fleet. Each gateway replica exports:
+
+      - /api/health/live — liveness (only local check)
+      - /api/health/ready — readiness (also checks Redis/Mongo, returns
+        503 if breaker is open)
+      - /api/health — full health (existing endpoint)
+
+      Caddy uses `health_uri /api/health/live` + `health_interval 5s`
+      to mark failed replicas dead and stop routing to them. Cookie
+      affinity: the first request sets a `lb_route` cookie = replica ID;
+      subsequent requests route to the same replica.
+
+      ```caddyfile
+      reverse_proxy ircfiber-gateway-1:8090 ircfiber-gateway-2:8090 ircfiber-gateway-3:8090 ircfiber-gateway-4:8090 {
+          lb_policy cookie lb_route
+          lb_try_duration 5s
+          health_uri /api/health/live
+          health_interval 5s
+          health_timeout 3s
+      }
+      ```
+
+      Implementation in `deploy/roles/caddy/templates/Caddyfile.j2`.
+    wave: 9
+    tier: 3
+    agent: gem-devops
+    covers:
+      - caddy-load-balancer
+      - sticky-cookie
+      - health-gated-routing
+    dependencies:
+      - t2-w8-t3-tier2-rollout-runbook
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/caddy/templates/Caddyfile.j2
+        description: Existing Caddyfile
+      - path: deploy/roles/gateway/
+        description: Gateway role
+    acceptance_criteria:
+      - "h1: Caddyfile.j2 has load_balancer with lb_policy cookie"
+      - "h2: New env var lb_route_set_domain is configurable per-host"
+      - "h3: Health_uri /api/health/live configured with 5s interval"
+      - "h4: Re-add HMAC validation for lb_route cookie so a malicious client can't pick a replica"
+    success_criteria:
+      - "Caddy upstream pools test: kill one gateway replica, Caddy evicts it within 5s, traffic migrates"
+    handoff:
+      target_files:
+        - deploy/roles/caddy/templates/Caddyfile.j2
+        - deploy/roles/caddy/defaults/main.yml
+      do_not_reinvestigate:
+        - "Caddy v2's load_balancer is built-in; no plugin needed"
+      minimal_change: "Caddyfile.j2 directive changes + 1 default"
+
+  - id: t3-w9-t2-gateway-multiple-replicas
+    title: "Tier 3 — Multi-replica gateway in docker-compose + ansible"
+    description: |
+      New ansible role `deploy/roles/tier3_gateway/` that creates
+      N gateway replicas (default N=4):
+
+      ```yaml
+      # docker-compose fragment
+      ircfiber-gateway-1:
+        image: irc-fiber:latest
+        container_name: ircfiber-gateway-1
+        command: ["/app/irc-fiber"]
+        ...
+      # x 4 replicas
+      ircfiber-gateway-2, -3, -4 with identical config except REPLICA_ID
+        env: IRCFIBER_GATEWAY_REPLICA_ID=gateway-N
+      ```
+
+      Shared volumes: uploads, logs.
+      Shared env: redis URL, mongo URL, signing secret for session
+      tokens (the gateway fleet must share the HMAC key).
+
+      Tasks:
+      1. Render per-replica env file
+      2. Create containers via community.docker.docker_container
+      3. Wait for each container's healthcheck to pass
+      4. Apply Caddyfile (calls into t3-w9-t1)
+    wave: 9
+    tier: 3
+    agent: gem-devops
+    covers:
+      - multi-replica-compose
+      - ansible-role-tier3-gateway
+      - replica-id
+    dependencies:
+      - t3-w9-t1-caddy-load-balancer
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/gateway/
+        description: Existing gateway role (single replica)
+      - path: docker-compose.yml
+        description: Existing compose
+    acceptance_criteria:
+      - "h1: New role deploy/roles/tier3_gateway/ creates 4 gateway replicas"
+      - "h2: New playbook playbooks/tier3_gateway.yml"
+      - "h3: Containers join the ircfiber + ircfiber_logging networks"
+      - "h4: 4 replicas share uploads + logs volumes"
+      - "h5: All 4 pass `docker inspect --format '{{.State.Health.Status}}'` healthy"
+    success_criteria:
+      - "Run `ansible-playbook playbooks/tier3_gateway.yml` against OVH; all 4 replicas healthy"
+    handoff:
+      target_files:
+        - deploy/roles/tier3_gateway/defaults/main.yml
+        - deploy/roles/tier3_gateway/tasks/main.yml
+        - deploy/roles/tier3_gateway/templates/env-replica.j2
+        - deploy/playbooks/tier3_gateway.yml
+      do_not_reinvestigate:
+        - "Replicas DO NOT coordinate via shared storage — each is independent"
+      minimal_change: "New role + new playbook"
+
+  - id: t3-w9-t3-frontend-affinity-cookie
+    title: "Tier 3 — Frontend sets + sends `lb_route` cookie"
+    description: |
+      The frontend `wsConnection.svelte.ts` must send the `lb_route`
+      cookie on every WS upgrade so the load balancer can pin the
+      session to its initial replica.
+
+      Implementation:
+
+      - On connect success, capture the `lb_route` cookie value.
+      - On reconnect, send the cookie via `document.cookie`.
+      - If the cookie expires (load balancer rebuilds the pool), the
+        SPA falls back to a fresh connection; the LB picks a new
+        replica and the session token retokenizes.
+
+      This requires browser support for cookies on WebSocket upgrade
+      headers, which is standard for all modern browsers (the cookie
+      is sent on the HTTP upgrade request).
+    wave: 9
+    tier: 3
+    agent: gem-implementer
+    covers:
+      - frontend-cookie-handling
+      - ws-upgrade-with-cookie
+    dependencies:
+      - t3-w9-t2-gateway-multiple-replicas
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/stores/wsConnection.svelte.ts
+        description: WS client
+    acceptance_criteria:
+      - "h1: Frontend reads Set-Cookie `lb_route` on first WS upgrade"
+      - "h2: Frontend sends `lb_route` cookie on subsequent reconnects"
+      - "h3: New unit test: mocked WS upgrade server returns Set-Cookie, frontend picks it up"
+    success_criteria:
+      - "Manual test against OVH: ws reconnect stays on the same replica (verified via admin API)"
+    handoff:
+      target_files:
+        - frontend/src/stores/wsConnection.svelte.ts
+      do_not_reinvestigate:
+        - "Cookie name `lb_route` is fixed by Caddy config"
+      minimal_change: "1 store modification + 1 test"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 3 — WAVE 10 (Redis Cluster + Sentinel)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t3-w10-t1-redis-sentinel-cluster
+    title: "Tier 3 — Redis Sentinel 3-node topology + failover playbook"
+    description: |
+      Deploy 3-node Redis Sentinel + 2 Redis shards (master + replica
+      each). Topology:
+
+      ```
+      shard1-master  shard1-replica
+      shard2-master  shard2-replica
+      sentinel-1 sentinel-2 sentinel-3   (quorum 2)
+      ```
+
+      Ansible role `deploy/roles/tier3_redis/`:
+      - Generates `redis-shard-N.conf` from template
+      - Generates `sentinel-N.conf` with `sentinel monitor mymaster
+        <shard-master-host> 6379 2`
+      - Generates `redis-cluster.trib` script (NOT used; cluster-mode
+        is disabled — we use Sentinel for HA, not Cluster, in this
+        tier-3.1 step). NOTE: actual Redis Cluster (slots) comes in
+        t3-w10-t2.
+      - Boots all 6 containers on the OVH host.
+
+      Playbook `playbooks/tier3_redis.yml` exposes the
+      `IRCFIBER_REDIS_URL=redis-sentinel://sentinel-1:26379/0` env to
+      gateway + engine.
+
+      Health-check: SIGUSR1 triggers failover via `redis-cli -p 26379
+      sentinel failover shard1-master`.
+    wave: 10
+    tier: 3
+    agent: gem-devops
+    covers:
+      - redis-sentinel
+      - multi-shard
+      - failover-playbook
+    dependencies:
+      - t3-w9-t3-frontend-affinity-cookie
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/redis/
+        description: Existing redis role (single instance)
+    acceptance_criteria:
+      - "h1: New role deploy/roles/tier3_redis/ creates 6 containers (2 shards x 2 nodes + 3 sentinels)"
+      - "h2: Sentinel auto-discovers both shards"
+      - "h3: Manual failover (SIGUSR1) promotes a replica within 5s"
+      - "h4: Sentinel-quorum is 2 (tolerates 1 sentinel failure)"
+    success_criteria:
+      - "Single Redis master kill → 0 dropped connections to the gateway fleet"
+    handoff:
+      target_files:
+        - deploy/roles/tier3_redis/defaults/main.yml
+        - deploy/roles/tier3_redis/tasks/main.yml
+        - deploy/roles/tier3_redis/templates/redis-shard.conf.j2
+        - deploy/roles/tier3_redis/templates/sentinel.conf.j2
+        - deploy/playbooks/tier3_redis.yml
+      do_not_reinvestigate:
+        - "Sentinels run as separate containers; not embedded in redis"
+      minimal_change: "New role + 2 templates + 1 playbook"
+
+  - id: t3-w10-t2-cluster-aware-d-client
+    title: "Tier 3 — Cluster-aware D Redis client (vibe-d per-slot)"
+    description: |
+      For TRUE horizontal Redis scaling (Tier 3.2), we need Redis
+      CLUSTER (not just Sentinel) so the keyspace can grow beyond one
+      machine's memory. Tier 3.2 = Redis Cluster with 16384 slots
+      distributed across 6 nodes (3 masters + 3 replicas).
+
+      The D side needs a cluster-aware client. vibe-d's RedisStorage is
+      single-connection. Tier 3.2 introduces:
+
+      - `source/ircfiber/storage/redis_cluster.d`:
+        - Class `RedisClusterClient` that maintains a `RedisConnection[N]`
+          pool, one per master node.
+        - Hashes keys via CRC16(key) % 16384 to pick the master.
+        - On `MOVED <slot> <host>:<port>` reply, re-routes the command.
+        - On `ASK <slot> <host>:<port>` reply, follows the redirect.
+      - All existing call sites continue to use `RedisStorage`'s public
+        API; `RedisClusterClient` is a drop-in.
+
+      Sunset t3-w10-t1's Sentinel setup; cluster-mode supersedes.
+    wave: 10
+    tier: 3
+    agent: gem-implementer
+    covers:
+      - redis-cluster
+      - crc16-routing
+      - moved-redirect
+    dependencies:
+      - t3-w10-t1-redis-sentinel-cluster
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/storage/redis.d
+        description: Existing single-connection client
+    acceptance_criteria:
+      - "h1: New class RedisClusterClient with per-master connection pool"
+      - "h2: hashSlot(key) routes keys to the correct master"
+      - "h3: MOVED reply triggers re-routing; ASK reply follows"
+      - "h4: Cluster topology cached for 30s; refreshed on PONG-fail"
+      - "h5: OTel metric `redis_cluster_routed_per_node_total`"
+    success_criteria:
+      - "Slot is uniform-distributed within ±5% across 3 masters"
+      - "MOVED is followed within 1 retry"
+    handoff:
+      target_files:
+        - source/ircfiber/storage/redis_cluster.d
+        - source/ircfiber/storage/redis.d
+      do_not_reinvestigate:
+        - "vibe-d's existing RedisClient can be adapted per-connection"
+      minimal_change: "New module + storage.d adapter"
+
+  - id: t3-w10-t3-multi-node-failover-drill
+    title: "Tier 3 — Multi-node failover dry-run + runbook"
+    description: |
+      Failover drill binary + runbook that simulates:
+
+      1. Kill primary shard master
+      2. Verify Sentinel promotes replica within 5s
+      3. Verify gateway fleet reconnects automatically
+      4. Verify WS session continuity (no client-side disconnect)
+
+      Implemented as `source/tools/redis_failover_test.d`:
+
+      ```bash
+      IRCFIBER_REDIS_URL=redis://sentinel-1:26379 \
+        dub run --config=redis-failover-test \
+        -- --action kill-master --shard 1
+      ```
+
+      The binary is invoked by the playbook via
+      `playbooks/tier3_redis_drill.yml`.
+
+      Validation: gateway logs show no errors during the 30s drill.
+    wave: 10
+    tier: 3
+    agent: gem-devops
+    covers:
+      - failover-drill
+      - chaos-engineering
+      - runbook
+    dependencies:
+      - t3-w10-t2-cluster-aware-d-client
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/tier3_redis/
+        description: Redis cluster role
+      - path: source/tools/
+        description: existing tool binaries
+    acceptance_criteria:
+      - "h1: New dub config `redis-failover-test`"
+      - "h2: Binary SIGUSRs the active master and waits for promotion"
+      - "h3: Exits 0 if failover < 5s AND no gateway errors in 30s window"
+      - "h4: Playbook `playbooks/tier3_redis_drill.yml` invokes it"
+    success_criteria:
+      - "Drill passes 10 consecutive times"
+    handoff:
+      target_files:
+        - source/tools/redis_failover_test.d
+        - dub.sdl
+        - deploy/playbooks/tier3_redis_drill.yml
+      do_not_reinvestigate:
+        - "Failover drill is destructive on a single shard master"
+      minimal_change: "1 binary + 1 dub config + 1 playbook"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 3 — WAVE 11 (MongoDB sharded cluster)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t3-w11-t1-mongodb-sharded-cluster
+    title: "Tier 3 — MongoDB sharded cluster deploy (config + 2 shards + mongos)"
+    description: |
+      Deploy a sharded MongoDB cluster:
+
+      ```
+      configsvr-1   configsvr-2   configsvr-3   (3-node RS)
+      shard1-rs1    shard1-rs2    shard1-rs3    (3-node RS)
+      shard2-rs1    shard2-rs2    shard2-rs3    (3-node RS)
+      mongos-1      mongos-2                    (2 mongos fronting it)
+      ```
+
+      Total: 11 containers for Mongo.
+
+      Shard keys:
+      - `users` collection → `{_id: 1}` (already sharded by ObjectId)
+      - `networks` collection → `{userId: 1}`
+      - `buffers` (messages) collection → `{networkId: 1, bufferName: 1}` hashed
+      - `messages` collection → `{channelId: 1, eid: 1}` (compound; balances by network+channel)
+      - `preferences` collection → `{userId: 1}`
+
+      Ansible role `deploy/roles/tier3_mongo/`:
+      - Renders mongod.conf per node (configsvr/shard RS member)
+      - Initiates replica sets via `mongosh --eval 'rs.initiate()'`
+      - Connects mongos to configsvr, adds shards
+      - Runs `sh.shardCollection()` for each coll with the right key
+    wave: 11
+    tier: 3
+    agent: gem-devops
+    covers:
+      - mongodb-sharding
+      - shard-key-design
+      - mongos-routing
+    dependencies:
+      - t3-w10-t3-multi-node-failover-drill
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/mongo/
+        description: Existing single-instance role
+    acceptance_criteria:
+      - "h1: New role deploy/roles/tier3_mongo/ deploys 11 containers"
+      - "h2: All shard collections created with the correct shard key"
+      - "h3: mongos is the only endpoint gateway + engine connect to (URL changes)"
+      - "h4: Migration is idempotent via sh.status() check"
+    success_criteria:
+      - "Run `mongo` via mongos and confirm `db.networks.getShardDistribution()` shows data on both shards"
+    handoff:
+      target_files:
+        - deploy/roles/tier3_mongo/defaults/main.yml
+        - deploy/roles/tier3_mongo/tasks/main.yml
+        - deploy/roles/tier3_mongo/templates/mongod-shard.conf.j2
+        - deploy/roles/tier3_mongo/templates/mongod-configsvr.conf.j2
+        - deploy/roles/tier3_mongo/templates/init-shards.js.j2
+        - deploy/playbooks/tier3_mongo.yml
+      do_not_reinvestigate:
+        - "Existing mongo role stays; new role is opt-in via tier3_mongo.yml"
+      minimal_change: "New role + 4 templates + 1 playbook"
+
+  - id: t3-w11-t2-shard-migration-tool
+    title: "Tier 3 — janitor-migrate-style shard-migrate for existing data"
+    description: |
+      Migrate the EXISTING Mongo data into the sharded cluster with zero
+      downtime. New tool `janitor-shard-migrate.d`:
+
+      ```bash
+      dub build --config=janitor-shard-migrate
+      JSMIGRATE_DRY_RUN=1 ./janitor-shard-migrate \
+        --src=mongodb://mongo-direct:27017 \
+        --dst=mongodb://mongos-1:27017
+      ```
+
+      Steps:
+      1. List all collections + counts
+      2. For each, run `mongodump` → `mongorestore --sharded-from-dump`
+         against the destination.
+      3. For ongoing writes during the migration, the gateway's tier-3
+         D client switches writes to mongos as soon as both ends are
+         verified consistent (lag < 1s).
+      4. Cutover: gateway's `IRCFIBER_MONGO_URL` is updated via the
+         ansible role; gateway restarts; mongos is now sole writer.
+
+      Rollback: switch `IRCFIBER_MONGO_URL` back to the direct
+      connection (read-only) and `mongodump` again.
+    wave: 11
+    tier: 3
+    agent: gem-implementer
+    covers:
+      - shard-migration
+      - online-cutover
+      - rollback
+    dependencies:
+      - t3-w11-t1-mongodb-sharded-cluster
+    conflicts_with: []
+    context_files:
+      - path: source/tools/janitor_migrate.d
+        description: Existing migration tool pattern
+    acceptance_criteria:
+      - "h1: New dub config `janitor-shard-migrate`"
+      - "h2: Binary supports --src / --dst + --dry-run"
+      - "h3: Cutover verified by hash of network count before/after"
+      - "h4: Rollback playbook exists and is tested"
+    success_criteria:
+      - "Migration completes in < 30 minutes for the existing dataset"
+      - "Zero data loss verified by hash"
+    handoff:
+      target_files:
+        - source/tools/janitor_shard_migrate.d
+        - dub.sdl
+        - deploy/playbooks/tier3_mongo_cutover.yml
+      do_not_reinvestigate:
+        - "Mongorestore is the right tool; do not reinvent"
+      minimal_change: "1 binary + 1 dub config + 1 cutover playbook"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 3 — WAVE 12 (vibe-core upgrade decision_blocker)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t3-w12-t1-vibe-core-decision
+    title: "Tier 3 — DECISION_BLOCKER: vibe-core upgrade path (Go / D-bump / accept-limits)"
+    description: |
+      **This is a decision_blocker.** Tier 3.4+ may not start until
+      this resolves.
+
+      Decision:
+      - **Option A — Go rewrite**: Replace the D gateway with a Go
+        gateway. Goroutines are cheap. Cap raises to ~500K WS
+        sessions per process. Estimated 3-4 months.
+      - **Option B — D-lib bump**: Bump to vibe-core 1.x + vibe-http
+        2.x. Per-listener pools expose real OS-thread isolation.
+        Estimated 2-3 weeks porting + regression tests.
+      - **Option C — Accept limits**: Keep D as is. Horizontal scale
+        via multiple gateway replicas (already in t3-w9-t2). Cap of
+        ~50K WS sessions per single gateway replica. Operationally
+        simplest; documents the limit.
+
+      **Deliverable**: docs/decisions/2026-XX-XX-vibe-core-upgrade.md
+      (ADR). After user picks, this task becomes the seed of
+      sub-plan t3-upgrade-vibe-core.
+
+      **Sub-plan t3-upgrade-vibe-core**: created by gem-planner AFTER
+      the decision, scoped to Option A, B, or C.
+    wave: 12
+    tier: 3
+    agent: gem-planner
+    covers:
+      - adr
+      - decision_blocker
+      - sub-plan-seed
+    dependencies:
+      - t3-w11-t2-shard-migration-tool
+    conflicts_with: []
+    context_files:
+      - path: dub.sdl
+        description: Current version pins
+      - path: docs/plan/20260630-admin-signoz-logs-panel/plan.yaml
+        description: ADR format used previously
+    acceptance_criteria:
+      - "h1: ADR lists the three options with trade-offs table"
+      - "h2: User + ircfiber-staff pick exactly one"
+      - "h3: ADR is committed under docs/decisions/"
+      - "h4: After commitment, gem-planner seeds sub-plan t3-upgrade-vibe-core"
+    success_criteria:
+      - "Tier 3.4 work MAY NOT START until this ADR is merged"
+    handoff:
+      target_files:
+        - docs/decisions/2026-XX-XX-vibe-core-upgrade.md
+      do_not_reinvestigate:
+        - "The decision is the OUTPUT of this task; do not pick FOR the user"
+      minimal_change: "Single ADR markdown"
+
+  - id: t3-w12-t2-policy-doc
+    title: "Tier 3 — Per-process-cap policy doc (always-published, even if Option C)"
+    description: |
+      Regardless of the option chosen in t3-w12-t1, publish a public
+      docs/SCALING.md that lists the per-replica caps and how to scale
+      horizontally:
+
+      - Per-replica WebSocket connection cap (default 50K)
+      - Per-replica msg/sec cap (default 25K)
+      - How to scale via Tier 3.1 multi-replica gateway
+      - Cost projections for 50K / 100K / 500K users
+
+      This doc is the enterprise-grade SLA statement. Sales / business
+      can quote against it.
+    wave: 12
+    tier: 3
+    agent: gem-documentation-writer
+    covers:
+      - scaling-policy
+      - sla-doc
+      - capacity-planning
+    dependencies:
+      - t3-w12-t1-vibe-core-decision
+    conflicts_with: []
+    context_files:
+      - path: AGENTS.md
+        description: Existing agent docs
+    acceptance_criteria:
+      - "h1: docs/SCALING.md exists with the per-replica caps"
+      - "h2: AGENTS.md references docs/SCALING.md"
+    success_criteria:
+      - "External reviewer can find the SLA without reading the source"
+    handoff:
+      target_files:
+        - docs/SCALING.md
+        - AGENTS.md
+      do_not_reinvestigate:
+        - "The cap numbers are best-effort estimates; update as profiled"
+      minimal_change: "1 markdown + AGENTS.md append"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TIER 3 — WAVE 13 (Tier 3 verification: 200K WS, multi-region chaos)
+  # ══════════════════════════════════════════════════════════════════════
+  - id: t3-w13-t1-multi-region-failover-sim
+    title: "Tier 3 — Multi-region failover simulation (chaos drill)"
+    description: |
+      Chaos drill that simulates a multi-region failover scenario.
+
+      Two OVH-equivalent VMs are spun up:
+      - region-A: gateway replica x2 + Redis Cluster shard 1
+      - region-B: gateway replica x2 + Redis Cluster shard 2
+
+      Steps:
+      1. Establish 100K WS sessions spread across region-A and -B
+         (50/50).
+      2. SIGKILL one region-A gateway replica.
+      3. Caddy evicts the dead replica within 5s; remaining replicas
+         absorb the load.
+      4. SIGKILL region-A's Redis primary.
+      5. Sentinel promotes a replica; sessions reconnect automatically.
+      6. Verify: dropPercent < 0.5%, p99 frame delivery < 200ms.
+
+      Tool: `source/tools/chaos_region_failover.d` (D) + a
+      `playbooks/tier3_chaos_drill.yml` runner.
+    wave: 13
+    tier: 3
+    agent: gem-devops
+    covers:
+      - chaos-drill
+      - multi-region
+      - failover-validation
+    dependencies:
+      - t3-w12-t2-policy-doc
+    conflicts_with: []
+    context_files:
+      - path: source/tools/
+        description: existing tool binaries
+    acceptance_criteria:
+      - "h1: New dub config `chaos-region-failover`"
+      - "h2: Playbook `tier3_chaos_drill.yml` invokes the drill"
+      - "h3: Drill prints PASS/FAIL summary"
+      - "h4: Drill is gated behind admin RBAC token"
+    success_criteria:
+      - "Drill passes 5 consecutive times in CI against local docker-compose"
+    handoff:
+      target_files:
+        - source/tools/chaos_region_failover.d
+        - dub.sdl
+        - deploy/playbooks/tier3_chaos_drill.yml
+      do_not_reinvestigate:
+        - "Chaos is destructive on a single region"
+      minimal_change: "1 binary + 1 dub config + 1 playbook"
+
+  - id: t3-w13-t2-200k-ws-loadtest
+    title: "Tier 3 — 200K WS sessions loadtest (50K x 4 replicas)"
+    description: |
+      Extend `ircfiber-loadtest` to `--tier 3`:
+
+      - `--tier 3 --rps 100000 --duration 120 --sessions 200000`
+      - 4 parallel Node sub-processes, each spawning 50K WS clients
+        pointed at a different gateway replica (via the `lb_route`
+        cookie).
+      - 100K msg/sec distributed across 200K user channels (0.5
+        msg/sec/user avg).
+      - Reports: per-replica CPU, per-replica RPS, dropPercent,
+        /api/health p99 per replica.
+
+      Goal: prove the Tier-3 architecture can hold 200K WS at 100K
+      msg/sec distributed.
+    wave: 13
+    tier: 3
+    agent: gem-implementer
+    covers:
+      - tier-3-loadtest
+      - multi-replica-driver
+      - per-replica-metrics
+    dependencies:
+      - t3-w13-t1-multi-region-failover-sim
+    conflicts_with: []
+    context_files:
+      - path: source/loadtest/main.d
+        description: D loadtest driver
+      - path: scripts/loadtest-ws-clients.js
+        description: Tier-2 simulator (extended)
+    acceptance_criteria:
+      - "h1: ircfiber-loadtest --tier 3 --rps 100000 --duration 120 --sessions 200000"
+      - "h2: Per-replica CPU + RPS in the JSON report"
+      - "h3: drops at < 0.1% of total messages"
+      - "h4: p99 /api/health per replica < 200ms"
+    success_criteria:
+      - "5 consecutive runs pass on OVH-tier hardware (4 replicas x 16-core)"
+    handoff:
+      target_files:
+        - source/loadtest/main.d
+        - scripts/loadtest-ws-clients.js
+        - scripts/run-loadtest.sh
+      do_not_reinvestigate:
+        - "Memory for 200K WS clients = ~6GB resident (Node)"
+      minimal_change: "Driver tier flag + tier-3 driver spawn"
+
+  - id: t3-w13-t3-tier3-ci-gate
+    title: "Tier 3 — ./scripts/check-tier-gate.sh --tier 3"
+    description: |
+      Extends the gate to tier-3:
+
+      ```bash
+      ./scripts/check-tier-gate.sh --tier 3 \
+          --sessions 200000 --rps 100000 --duration 120
+      ```
+
+      Asserts:
+      - 200K WS sessions held by 4 gateway replicas
+      - 100K msg/sec sustained 120s with p99 < 200ms
+      - dropPercent < 0.1%
+      - Mongo CPU < 50% peak (now sharded)
+      - Redis Cluster keys distributed ±10% across 3 masters
+      - Chaos drill (t3-w13-t1) passes 5 times
+
+      Exits 0 + `TIER3_GATE_PASSED=true` on PASS.
+    wave: 13
+    tier: 3
+    agent: gem-implementer
+    covers:
+      - ci-gate-tier3
+      - perf-budget-tier3
+      - regression-guard
+    dependencies:
+      - t3-w13-t2-200k-ws-loadtest
+    conflicts_with: []
+    context_files:
+      - path: scripts/check-tier-gate.sh
+        description: Gate orchestrator (extended to tier 3)
+      - path: Makefile
+        description: pre-deploy target
+    acceptance_criteria:
+      - "h1: Gate runs all tier-3 loadtest scenarios"
+      - "h2: Gate prints TIER3_GATE_PASSED=true on success"
+      - "h3: Promotion to OVH production is BLOCKED if TIER3_GATE_PASSED != true"
+    success_criteria:
+      - "Gate passes on Tier-3 patched gateway fleet"
+    handoff:
+      target_files:
+        - scripts/check-tier-gate.sh
+        - Makefile
+      do_not_reinvestigate:
+        - "Total CI time +~150s"
+      minimal_change: "Extend the existing gate script; one Makefile hook"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RETROSPECTIVE — what we WISH we had known sooner
+# ═══════════════════════════════════════════════════════════════════════════
+retrospective:
+  what_worked:
+    - "T+0 diagnosis was fast: docker stats + curl + docker logs on OVH
+      immediately revealed the gateway pegged at 100% CPU; Caddy behind
+      it returned 525 from Cloudflare"
+    - "vibe-core 2.14 source was readable in ~/.dub/packages — pivot to
+      alternative API (priority + worker task) was straightforward"
+    - "The irc_parity test harness (9 scenarios) stays green throughout
+      Tier 1 — every reload keeps the engine → gateway → client path
+      observable"
+    - "Tier separation forced us to commit to scopes. Tier 1 fixes the
+      freeze and ships; Tier 2 is structural scaling; Tier 3 is
+      deploy isolation. No scope creep across tiers."
+  what_we_wish_we_knew_earlier:
+    - "vibe-d 0.10 has a single shared pool — there's no clean way to
+      add per-concern pools without bumping. Tier 3 should have been
+      on the roadmap at v1 launch"
+    - "MongoDB connection storm handling MUST be a first-class concern
+      at design time. The current `_ = db.findOne()` pattern in
+      healthCheck silently masks auth failures behind generic errors"
+    - "Watchdog pattern (long-running fiber detection) should have been
+      there from day 1"
+    - "mongo-init.js was stale relative to the running gateway env;
+      the discrepancy masked the real wedge from being debugged via
+      environment inspection alone. Add an env-assertion step at boot"
+    - "Caddy load balancing is invisible from inside the gateway. We
+      need explicit gateway-internal metrics (outbound queue depth,
+      pref save latency) to spot a wedge BEFORE the LB times out.
+      Added in Tier 1 wave 3."
+  future_thinking:
+    - "Tier 3.4 (vibe-core upgrade) is the longest path. If Option B
+      wins, schedule it AFTER enterprise customers are locked in
+      (the migration risk is real)"
+    - "Long-term: a dedicated IRC event forwarder process (separate
+      binary, Kafka-style) would give real process-level isolation.
+      This is the architecture Twitter / Discord / Slack use. Tier 3
+      moves us closer but stops at Sentinel + Cluster"
+    - "Frontend messageBatcher.ts is already a 200ms debounce. Server-
+      side coalescing in t1-w1-t1 is structural insurance, not a
+      behavior change visible to users."
+    - "If Option C (accept limits) wins, the SLA is documented in
+      docs/SCALING.md. If Option A (Go rewrite) wins, we have a real
+      issue-tracking story for the migration (~3-4 months)."
+  questions_to_revisit:
+    - "Does t1-w1-t1's drop-oldest queue introduce eid ordering issues?
+      Confirm with irc_parity tests AND with the new wsConnection.v2.test.ts"
+    - "How does TaskSettings(100) interact with the io-worker-pool under
+      flood? Need to loadtest for a full second"
+    - "Is the lb_route cookie HMAC verification actually safe against
+      a malicious client picking a stale-but-valid replica? Profile
+      with `httperf` style benchmarking"
+    - "At 200K WS sessions, what does the gateway's resident memory
+      look like (vibe.d's fiber stack allocation per WS connection)?"
+    - "Does the Redis Cluster MOVED reply storm during a resharding
+      degrade gateway p99 below 200ms?"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXECUTION ORDER (run in waves; each tier gated by the previous)
+# ═══════════════════════════════════════════════════════════════════════════
+execution_order:
+  tier_1:
+    wave_1: [t1-w1-t1-outbound-queue, t1-w1-t2-listener-priority, t1-w1-t3-yield-cadence]
+    wave_2: [t1-w2-t1-prefs-save-off-fiber, t1-w2-t2-mongodb-bounded-retry, t1-w2-t3-engine-health-priority]
+    wave_3: [t1-w3-t1-fiber-watchdog, t1-w3-t2-gateway-internal-health, t1-w3-t3-signoz-watchdog-alert]
+    wave_4: [t1-w4-t1-loadtest-binary, t1-w4-t2-load-test-gate]
+  tier_2:
+    wave_5: [t2-w5-t1-stateless-sessions, t2-w5-t2-network-config-cache, t2-w5-t3-lru-prefs-cache]
+    wave_6: [t2-w6-t1-ws-protocol-v2, t2-w6-t2-frame-coalescer-frontend, t2-w6-t3-load-shedding-policy]
+    wave_7: [t2-w7-t1-engine-batch-publish, t2-w7-t2-gateway-pipeline-read, t2-w7-t3-stream-replay-pipeline]
+    wave_8: [t2-w8-t1-loadtest-tier2, t2-w8-t2-tier2-ci-gate, t2-w8-t3-tier2-rollout-runbook]
+  tier_3:
+    wave_9: [t3-w9-t1-caddy-load-balancer, t3-w9-t2-gateway-multiple-replicas, t3-w9-t3-frontend-affinity-cookie]
+    wave_10: [t3-w10-t1-redis-sentinel-cluster, t3-w10-t2-cluster-aware-d-client, t3-w10-t3-multi-node-failover-drill]
+    wave_11: [t3-w11-t1-mongodb-sharded-cluster, t3-w11-t2-shard-migration-tool]
+    wave_12: [t3-w12-t1-vibe-core-decision, t3-w12-t2-policy-doc]
+    wave_13: [t3-w13-t1-multi-region-failover-sim, t3-w13-t2-200k-ws-loadtest, t3-w13-t3-tier3-ci-gate]
+
+parallelization:
+  - "Tier 1 wave 1: t1-w1-t1 first (queue + drain fiber), then
+    t1-w1-t2 and t1-w1-t3 in parallel"
+  - "Tier 1 wave 2: t1-w2-t1 first (prefs save), then t1-w2-t2 +
+    t1-w2-t3 in parallel"
+  - "Tier 1 wave 3: t1-w3-t1 first (watchdog), then t1-w3-t2 +
+    t1-w3-t3 in parallel"
+  - "Tier 1 wave 4: sequential (binary, then gate)"
+  - "Tier 2 wave 5: t2-w5-t1 first (stateless sessions), then
+    t2-w5-t2 + t2-w5-t3 in parallel"
+  - "Tier 2 wave 6: t2-w6-t1 first (v2 protocol), then t2-w6-t2 +
+    t2-w6-t3 in parallel"
+  - "Tier 2 wave 7: t2-w7-t1 first (engine batch publish), then
+    t2-w7-t2 + t2-w7-t3 in parallel"
+  - "Tier 2 wave 8: sequential (loadtest, gate, runbook)"
+  - "Tier 3 wave 9: t3-w9-t1 first (caddy), then t3-w9-t2 + t3-w9-t3
+    in parallel"
+  - "Tier 3 wave 10: t3-w10-t1 first (sentinel), then t3-w10-t2 +
+    t3-w10-t3 in parallel"
+  - "Tier 3 wave 11: t3-w11-t1 first (cluster), then t3-w11-t2"
+  - "Tier 3 wave 12: t3-w12-t1 first (decision), then t3-w12-t2"
+  - "Tier 3 wave 13: t3-w13-t1 + t3-w13-t2 in parallel, then t3-w13-t3"
+  - "TIER GATING: Tier 2 may NOT start until TIER1_GATE_PASSED=true.
+    Tier 3 may NOT start until TIER2_GATE_PASSED=true. The CLI helper
+    ./scripts/check-tier-gate.sh is the canonical gate"
+
+estimated_effort:
+  tier_1:
+    wave_1: "0.5 days total (3 tasks)"
+    wave_2: "2.5 days total (3 tasks)"
+    wave_3: "2.5 days total (3 tasks)"
+    wave_4: "1.5 days total (2 tasks)"
+    tier_1_total: "7 days"
+  tier_2:
+    wave_5: "5 days total (stateless sessions + caches)"
+    wave_6: "5 days total (protocol v2 + coalescer + shedding)"
+    wave_7: "3 days total (engine pipeline)"
+    wave_8: "3 days total (loadtest + gate + runbook)"
+    tier_2_total: "16 days"
+  tier_3:
+    wave_9: "4 days total (Caddy + multi-replica + frontend)"
+    wave_10: "8 days total (Redis Sentinel + Cluster + D client + drill)"
+    wave_11: "10 days total (Mongo sharded + migration)"
+    wave_12: "1 day (decision) + 1 day (policy doc)"
+    wave_13: "8 days total (chaos + loadtest + gate)"
+    wave_12_extended_if_option_a: "60-90 days (Go rewrite)"
+    wave_12_extended_if_option_b: "10-15 days (D-lib bump)"
+    wave_12_extended_if_option_c: "0 days (accept limits, ship as is)"
+    tier_3_minimum_total: "32 days (Option C) to 110 days (Option A)"
+  total_minimum: "55 days (7 + 16 + 32)"
+  total_maximum_option_a: "133 days (7 + 16 + 110)"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ROLLOUT PLAN — week-by-week schedule with explicit gates
+# ═══════════════════════════════════════════════════════════════════════════
+rollout_plan:
+  week_1_tier_1:
+    goal: "Eliminate the immediate prod freeze"
+    tasks:
+      - t1-w1-t1-outbound-queue
+      - t1-w1-t2-listener-priority
+      - t1-w1-t3-yield-cadence
+      - t1-w2-t1-prefs-save-off-fiber
+      - t1-w2-t2-mongodb-bounded-retry
+      - t1-w2-t3-engine-health-priority
+      - t1-w3-t1-fiber-watchdog
+      - t1-w3-t2-gateway-internal-health
+      - t1-w3-t3-signoz-watchdog-alert
+      - t1-w4-t1-loadtest-binary
+    ship_gate:
+      - "TIER1_GATE_PASSED=true (./scripts/check-tier-gate.sh --tier 1)"
+      - "9/9 irc_parity scenarios green"
+      - "No prod 525 errors in the 24h post-deploy window"
+      - "Wedge detection: at least one alert has fired and been validated
+        in the disabled-then-enabled flow"
+    ship_to: "OVH prod via make update"
+    do_not_ship_until: "All four waves merged AND the tier-1 loadtest
+      gate is green"
+
+  week_2_to_3_tier_2:
+    goal: "Single-process scale to 50K users / 25K msg/sec"
+    tasks:
+      - t2-w5-t1-stateless-sessions
+      - t2-w5-t2-network-config-cache
+      - t2-w5-t3-lru-prefs-cache
+      - t2-w6-t1-ws-protocol-v2
+      - t2-w6-t2-frame-coalescer-frontend
+      - t2-w6-t3-load-shedding-policy
+      - t2-w7-t1-engine-batch-publish
+      - t2-w7-t2-gateway-pipeline-read
+      - t2-w7-t3-stream-replay-pipeline
+      - t2-w8-t1-loadtest-tier2
+      - t2-w8-t2-tier2-ci-gate
+      - t2-w8-t3-tier2-rollout-runbook
+    ship_gate:
+      - "TIER2_GATE_PASSED=true"
+      - "9/9 irc_parity still green"
+      - "Canary + bake + promote done per the rollout runbook"
+    ship_to: "OVH prod via make update + the canary flow"
+    do_not_ship_until:
+      - "t1 has shipped and is stable for 7 days"
+      - "TIER2_GATE_PASSED=true"
+      - "frontend wsConnection.v2.test.ts and drain_coalesce tests pass"
+
+  week_4_to_8_tier_3_1_to_3_2:
+    goal: "Process-level isolation via multi-replica + Redis Sentinel"
+    tasks:
+      - t3-w9-t1-caddy-load-balancer
+      - t3-w9-t2-gateway-multiple-replicas
+      - t3-w9-t3-frontend-affinity-cookie
+      - t3-w10-t1-redis-sentinel-cluster
+      - t3-w10-t2-cluster-aware-d-client
+      - t3-w10-t3-multi-node-failover-drill
+    ship_gate:
+      - "Single-replica failover test passes 10 times"
+      - "4 replica loadtest: p99 < 200ms with 50K WS sessions distributed"
+    ship_to: "OVH prod via deploy/playbooks/tier3_gateway.yml +
+      deploy/playbooks/tier3_redis.yml"
+    do_not_ship_until:
+      - "t2 has shipped and is stable for 14 days"
+      - "Caddy LB failover test passes 10 times"
+      - "Red is Cluster MOVED-reply-degradation stays < 5% p99"
+
+  week_9_to_10_tier_3_3_mongo_sharded:
+    goal: "MongoDB sharded cluster + migration"
+    tasks:
+      - t3-w11-t1-mongodb-sharded-cluster
+      - t3-w11-t2-shard-migration-tool
+    ship_gate:
+      - "Shard key distribution ±10% across both shards"
+      - "Migration completes < 30 minutes, zero data loss (hash verified)"
+      - "Rollback playbook tested"
+    ship_to: "OVH prod via deploy/playbooks/tier3_mongo.yml + the
+      cutover playbook"
+    do_not_ship_until:
+      - "t3.1+3.2 are stable for 7 days"
+      - "Dry-run cutover verified by hash match"
+
+  week_11_to_12_tier_3_4_decision_and_scaling_doc:
+    goal: "vibe-core upgrade decision + scaling policy publication"
+    tasks:
+      - t3-w12-t1-vibe-core-decision
+      - t3-w12-t2-policy-doc
+    ship_gate:
+      - "ADR merged under docs/decisions/"
+      - "docs/SCALING.md published"
+      - "Sub-plan t3-upgrade-vibe-core seeded by gem-planner (if not Option C)"
+    ship_to: "Git only (no deploy)"
+    do_not_ship_until:
+      - "User picks an option"
+
+  week_13_plus_tier_3_5_verification:
+    goal: "200K WS / 100K msg/sec verification + chaos"
+    tasks:
+      - t3-w13-t1-multi-region-failover-sim
+      - t3-w13-t2-200k-ws-loadtest
+      - t3-w13-t3-tier3-ci-gate
+    ship_gate:
+      - "TIER3_GATE_PASSED=true"
+      - "Multi-region chaos drill passes 5 consecutive times"
+      - "Per-replica caps documented in docs/SCALING.md"
+    ship_to: "OVH prod (i.e. the tier-3 architecture is the prod target)"
+    do_not_ship_until:
+      - "All prior tier 3.x waves are stable for 7 days"
+      - "TIER3_GATE_PASSED=true"
+    after_tier_3:
+      - "If Option C won, the plan ends here with the scaling doc."
+      - "If Option B won, the sub-plan t3-upgrade-vibe-core starts; +2-3 weeks"
+      - "If Option A won, the sub-plan t3-upgrade-vibe-core starts; +3-4 months"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUB-PLAN SEED — to be filled by gem-planner after t3-w12-t1 resolution
+# ═══════════════════════════════════════════════════════════════════════════
+sub_plan_seed:
+  plan_id: t3-upgrade-vibe-core
+  parent_plan_id: 20260704-thread-pool-isolation
+  blocked_on: t3-w12-t1-vibe-core-decision
+  options:
+    option_a_go_rewrite:
+      owner: gem-planner
+      estimate_days: "60-90"
+      deliverables:
+        - "RFC: ircfiber-gateway-go"
+        - "Goroutine-based WS handler"
+        - "Per-listener HTTP pools (net/http Server pattern)"
+        - "Migration playbook + zero-downtime cutover"
+    option_b_d_lib_bump:
+      owner: gem-planner
+      estimate_days: "10-15"
+      deliverables:
+        - "Port session.d to async vibe-http 2.x patterns"
+        - "Port websocket.d to per-listener pools"
+        - "Port rest.d and admin/*.d"
+        - "Regression test: 9/9 irc_parity"
+    option_c_accept_limits:
+      owner: gem-implementer
+      estimate_days: "1"
+      deliverables:
+        - "docs/SCALING.md finalized"
+        - "AGENTS.md updated with multi-replica scaling playbook"
+        - "Sales collaterals 50K / 100K / 500K user capacity table"

@@ -1,0 +1,10 @@
+---
+firewall_allow_ssh: true
+firewall_allow_http: true
+firewall_allow_https: true
+firewall_open_engine_admin: true
+firewall_open_mongo_to_docker: true
+firewall_open_tailscale_subnet: "100.64.0.0/10"
+firewall_open_docker_subnet: "172.30.0.0/16"
+firewall_extra_tcp_ports: []
+firewall_extra_udp_ports: []

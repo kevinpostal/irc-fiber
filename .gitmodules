@@ -1,0 +1,9 @@
+[submodule "site"]
+	path = site
+	url = https://github.com/kevinpostal/ircfiber-site.git
+[submodule "engine"]
+	path = engine
+	url = https://github.com/kevinpostal/ircfiber-engine.git
+[submodule "common"]
+	path = common
+	url = https://github.com/kevinpostal/ircfiber-common.git

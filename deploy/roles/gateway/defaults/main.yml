@@ -1,0 +1,20 @@
+---
+gateway_container_name: ircfiber-gateway
+gateway_no_new_privileges: true
+gateway_ulimits:
+  nofile:
+    soft: 65536
+    hard: 65536
+gateway_healthcheck_interval: 30s
+gateway_healthcheck_timeout: 10s
+gateway_healthcheck_retries: 3
+gateway_healthcheck_start_period: 40s
+# When set, the gateway's admin password is reset to this on every start
+ # vault_ircfiber_admin_password overrides default — no hardcoded value
+ircfiber_admin_password_reset: "{{ vault_ircfiber_admin_password | default('') }}"
+
+gateway_replica_count: 1
+# Blue/green: when true, also run ircfiber-gateway-green alongside the
+# primary so Caddy can load-balance with health checks.
+gateway_bluegreen: true
+gateway_replica_sticky: true

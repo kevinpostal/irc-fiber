@@ -1,0 +1,46 @@
+# {{ ansible_managed }}
+# IRC Fiber — Redis configuration
+# Bound to all interfaces for resilience; Tailscale may flap but loopback/bridge stay.
+# Protected-mode off, no password — network-level isolation via firewall + Tailscale ACL.
+
+bind 0.0.0.0
+# network-level isolation provides the security boundary.
+protected-mode no
+port {{ redis_port }}
+tcp-backlog 511
+timeout 0
+tcp-keepalive 60
+
+# Auth disabled: the IRC Fiber D client (vibe-d RedisStorage) calls
+# connectRedis(host, port) without an auth parameter, so it can't pass
+# a password. The container is bound only to the host's Tailscale
+# interface, so network-level isolation provides the security boundary.
+# If you need stronger auth, either patch the D code to call db.auth()
+# after connect, or run a sidecar that strips the AUTH command.
+#
+# requirepass {{ vault_redis_password }}
+
+# Persistence
+{% if redis_appendonly %}
+appendonly yes
+appendfilename "appendonly.aof"
+appendfsync everysec
+{% else %}
+save 3600 1 300 100
+{% endif %}
+
+# Memory — volatile-lru protects critical non-TTL keys (irc:assignments,
+# irc:servers, irc:server:ovh) from eviction. Only TTL keys (state,
+# scrollback, dedup, leases) are evictable. Prior allkeys-lru evicted the
+# assignments hash at 19:55Z 2026-08-20 (canonical 0 + mirror 20 => monitor
+# killed engine). See monitor assignments_empty fix.
+maxmemory {{ redis_maxmemory }}
+maxmemory-policy volatile-lru
+
+# Logging
+loglevel notice
+logfile ""
+
+# Misc
+databases 16
+always-show-logo no

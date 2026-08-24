@@ -1,0 +1,318 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "IRC engine connection lifecycle: TCP open, TLS handshake, REGISTER, CAP negotiation, SASL auth, welcome, disconnects, reconnect attempts. One row per network.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Connection events timeline",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "id": 100,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "title": "Connection events by type (rate / sec)",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 1},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "spanNulls": false, "showPoints": "never"},
+          "color": {"mode": "palette-classic"}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (event) (rate({job=\"ircfiber_containers\", component=\"engine-ovh\", event=~\"tcp_open|tls_handshake|register_sending|register_complete|welcome|cap_negotiating|cap_negotiated|sasl_authenticate|sasl_success|sasl_fail|disconnected|reconnect_scheduled|reconnect_attempt\"}[$__interval]))",
+          "legendFormat": "{{event}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Per-network",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 10},
+      "collapsed": false,
+      "id": 101,
+      "panels": []
+    },
+    {
+      "id": 2,
+      "title": "TCP / TLS / register success rate (last 1h)",
+      "type": "stat",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 11},
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(count_over_time({job=\"ircfiber_containers\", event=\"tcp_open\"}[1h]))",
+          "legendFormat": "TCP opens",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "TLS handshake success rate",
+      "type": "stat",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 11},
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(count_over_time({job=\"ircfiber_containers\", event=\"tls_handshake\"}[1h]))",
+          "legendFormat": "TLS handshakes",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Welcomes received",
+      "type": "stat",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 11},
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(count_over_time({job=\"ircfiber_containers\", event=\"welcome\"}[1h]))",
+          "legendFormat": "Welcomes",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Disconnects (last 1h)",
+      "type": "stat",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 11},
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "red", "value": 5}
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(count_over_time({job=\"ircfiber_containers\", event=\"disconnected\"}[1h]))",
+          "legendFormat": "Disconnects",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Reconnects scheduled (last 1h)",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 17},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (network) (rate({job=\"ircfiber_containers\", event=\"reconnect_scheduled\"}[$__interval]))",
+          "legendFormat": "{{network}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "TLS failures by network (last 1h)",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 17},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (network) (rate({job=\"ircfiber_containers\", event=\"tls_fail\"}[$__interval]))",
+          "legendFormat": "{{network}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "SASL",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 25},
+      "collapsed": false,
+      "id": 102,
+      "panels": []
+    },
+    {
+      "id": 8,
+      "title": "SASL events (last 1h)",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 26},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (event, mechanism) (rate({job=\"ircfiber_containers\", event=~\"sasl_authenticate|sasl_success|sasl_fail\"}[$__interval]))",
+          "legendFormat": "{{event}} ({{mechanism}})",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Live event log",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 34},
+      "collapsed": false,
+      "id": 103,
+      "panels": []
+    },
+    {
+      "id": 9,
+      "title": "Live connection events",
+      "type": "logs",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 35},
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "{job=\"ircfiber_containers\", component=\"engine-ovh\", event=~\"tcp_open|tls_handshake|register_sending|register_complete|welcome|cap_negotiating|cap_negotiated|sasl_authenticate|sasl_success|sasl_fail|disconnected|reconnect_scheduled|reconnect_attempt|tls_fail|tls_plain_fallback|numeric\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["ircfiber", "irc", "engine", "lifecycle"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "IRC Connection Lifecycle",
+  "uid": "ircfiber-connection-lifecycle",
+  "version": 1,
+  "weekStart": ""
+}

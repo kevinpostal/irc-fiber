@@ -1,0 +1,13 @@
+---
+# Deploy pre-built SigNoz alert rules + default notification channel.
+# Usage:
+#   ansible-playbook playbooks/signoz_alerts.yml
+#   ansible-playbook playbooks/signoz_alerts.yml -e signoz_alert_webhook_default=https://hooks.slack.com/services/...
+
+- name: Deploy SigNoz alert rules + channels
+  hosts: all
+  become: false
+  gather_facts: false
+  roles:
+    - role: signoz_alerts
+      tags: [signoz_alerts]

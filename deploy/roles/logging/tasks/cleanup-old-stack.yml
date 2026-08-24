@@ -1,0 +1,43 @@
+---
+# Cleanup task file: remove old observability stack after migration to SigNoz.
+# Idempotent — exit 0 if items already absent.
+
+- name: Stop old logging stack containers (Loki/Promtail/Tempo/otel-collector/Prometheus)
+  community.docker.docker_container:
+    name: "{{ item }}"
+    state: absent
+    force_kill: true
+  loop:
+    - "{{ loki_container_name | default('ircfiber-loki') }}"
+    - "{{ promtail_container_name | default('ircfiber-promtail') }}"
+    - "{{ tempo_container_name | default('ircfiber-tempo') }}"
+    - "{{ otelcol_container_name | default('ircfiber-otel-collector') }}"
+    - "{{ prometheus_container_name | default('ircfiber-prometheus') }}"
+  ignore_errors: true
+
+- name: Remove old logging stack volumes
+  community.docker.docker_volume:
+    name: "{{ item }}"
+    state: absent
+  loop:
+    - ircfiber_loki_data
+    - ircfiber_loki_config
+    - ircfiber_promtail_config
+    - ircfiber_promtail_positions
+    - ircfiber_tempo_data
+    - ircfiber_tempo_config
+    - ircfiber_otelcol_config
+    - ircfiber_prometheus_data
+  ignore_errors: true
+
+- name: Remove old logging stack config directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/ircfiber/loki
+    - /etc/ircfiber/promtail
+    - /etc/ircfiber/tempo
+    - /etc/ircfiber/otel-collector
+    - /etc/ircfiber/prometheus
+  ignore_errors: true

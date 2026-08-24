@@ -1,0 +1,8 @@
+---
+# Per-host overrides for ircfiber.example.com
+# This is the combined gateway + backend + engine host (single-VM deployment).
+
+# The engine runs on the same VM as the gateway
+ircfiber_engine_id: "localengine"
+ircfiber_engine_bind_address: "0.0.0.0"
+ircfiber_engine_admin_port: 8091

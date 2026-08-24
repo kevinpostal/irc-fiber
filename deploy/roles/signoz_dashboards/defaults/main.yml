@@ -1,0 +1,14 @@
+---
+# SigNoz New Relic-style dashboards
+# Pushes pre-built JSON dashboards via /api/v1/dashboards.
+# Idempotent: matches by title and re-creates on change.
+
+signoz_dashboards_container: "signoz-signoz"
+signoz_dashboards_dir: "/etc/ircfiber/signoz-dashboards"
+# Default org ID for the deployment (the root user's org from signoz_users)
+signoz_dashboards_org_id: "019f1235-79b1-787f-b4a9-370824295f2f"
+# How many dashboard files to push (1-indexed for ordering)
+signoz_dashboards_files:
+  - "01_overview.json"
+  - "02_infrastructure.json"
+  - "03_services.json"

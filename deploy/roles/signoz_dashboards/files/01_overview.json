@@ -1,0 +1,470 @@
+{
+  "title": "IRC Fiber — Overview",
+  "description": "New Relic-style landing dashboard. Golden signals across all services on the OVH host. Auto-refreshes every 30s.",
+  "tags": ["ircfiber", "overview", "landing", "newrelic"],
+  "version": "v5",
+  "layout": [
+    {"h": 1, "i": "row-services", "w": 24, "x": 0, "y": 0, "static": false, "moved": false},
+    {"h": 3, "i": "stat-services", "w": 6, "x": 0, "y": 1, "static": false, "moved": false},
+    {"h": 3, "i": "stat-errors", "w": 6, "x": 6, "y": 1, "static": false, "moved": false},
+    {"h": 3, "i": "stat-throughput", "w": 6, "x": 12, "y": 1, "static": false, "moved": false},
+    {"h": 3, "i": "stat-apdex", "w": 6, "x": 18, "y": 1, "static": false, "moved": false},
+    {"h": 1, "i": "row-golden", "w": 24, "x": 0, "y": 4, "static": false, "moved": false},
+    {"h": 8, "i": "latency", "w": 12, "x": 0, "y": 5, "static": false, "moved": false},
+    {"h": 8, "i": "throughput", "w": 12, "x": 12, "y": 5, "static": false, "moved": false},
+    {"h": 8, "i": "errors", "w": 12, "x": 0, "y": 13, "static": false, "moved": false},
+    {"h": 8, "i": "saturation", "w": 12, "x": 12, "y": 13, "static": false, "moved": false},
+    {"h": 1, "i": "row-host", "w": 24, "x": 0, "y": 21, "static": false, "moved": false},
+    {"h": 8, "i": "host-cpu", "w": 8, "x": 0, "y": 22, "static": false, "moved": false},
+    {"h": 8, "i": "host-mem", "w": 8, "x": 8, "y": 22, "static": false, "moved": false},
+    {"h": 8, "i": "host-disk", "w": 8, "x": 16, "y": 22, "static": false, "moved": false},
+    {"h": 1, "i": "row-footer", "w": 24, "x": 0, "y": 30, "static": false, "moved": false},
+    {"h": 6, "i": "recent-errors", "w": 12, "x": 0, "y": 31, "static": false, "moved": false},
+    {"h": 6, "i": "recent-traces", "w": 12, "x": 12, "y": 31, "static": false, "moved": false}
+  ],
+  "widgets": [
+    {
+      "id": "row-services",
+      "panelTypes": "row",
+      "title": "Summary"
+    },
+    {
+      "id": "stat-services",
+      "panelTypes": "value",
+      "title": "Active services",
+      "description": "Distinct service names in the last 5 min",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.cpu.utilization", "dataType": "float64"},
+            "timeAggregation": "count",
+            "spaceAggregation": "sum",
+            "filters": {"items": [], "op": "AND"},
+            "filter": {"expression": ""},
+            "groupBy": [{"key": "service.name", "dataType": "string", "type": "tag"}],
+            "having": {"expression": "sum(count()) > 0"},
+            "orderBy": [],
+            "limit": 100,
+            "legend": "{{service.name}}"
+          }],
+          "queryFormulas": [{"queryName": "F1", "expression": "count(A)", "legend": "services", "disabled": false}]
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "stat-errors",
+      "panelTypes": "value",
+      "title": "Error rate (last 5m)",
+      "description": "Caddy 5xx + ircfiber-error logs",
+      "yAxisUnit": "percent",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "logs",
+              "aggregateOperator": "count",
+              "filters": {"items": [{"key": {"key": "severity_text", "type": "tag"}, "op": "=", "value": "ERROR"}], "op": "AND"},
+              "filter": {"expression": "severity_text = ERROR"},
+              "groupBy": [],
+              "having": {"expression": ""},
+              "orderBy": [],
+              "limit": null,
+              "stepInterval": 300
+            }
+          ],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "stat-throughput",
+      "panelTypes": "value",
+      "title": "Caddy requests (5m)",
+      "description": "Throughput from Caddy access logs",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "logs",
+            "aggregateOperator": "count",
+            "filter": {"expression": "service.name = caddy"},
+            "filters": {"items": [{"key": {"key": "service.name", "type": "tag"}, "op": "=", "value": "caddy"}], "op": "AND"},
+            "groupBy": [],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 300
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "stat-apdex",
+      "panelTypes": "value",
+      "title": "Apdex (last 5m)",
+      "description": "NR-style: 1.0 = all requests < T threshold (T=0.5s). Computed from caddy response durations.",
+      "yAxisUnit": "none",
+      "thresholds": [
+        {"thresholdValue": 0.85, "thresholdColor": "#facc15"},
+        {"thresholdValue": 0.5, "thresholdColor": "#ef4444"}
+      ],
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "logs",
+              "aggregateOperator": "count",
+              "filter": {"expression": "service.name = caddy"},
+              "filters": {"items": [{"key": {"key": "service.name", "type": "tag"}, "op": "=", "value": "caddy"}], "op": "AND"},
+              "groupBy": [],
+              "having": {"expression": ""},
+              "orderBy": [],
+              "limit": null,
+              "stepInterval": 300
+            },
+            {
+              "queryName": "B",
+              "dataSource": "logs",
+              "aggregateOperator": "count",
+              "filter": {"expression": "service.name = caddy AND http.server.request.duration < 0.5"},
+              "filters": {"items": [{"key": {"key": "service.name", "type": "tag"}, "op": "=", "value": "caddy"}], "op": "AND"},
+              "groupBy": [],
+              "having": {"expression": ""},
+              "orderBy": [],
+              "limit": null,
+              "stepInterval": 300
+            }
+          ],
+          "queryFormulas": [{"queryName": "F1", "expression": "(B + 0.5*(A-B)) / A", "legend": "apdex", "disabled": false}]
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "row-golden",
+      "panelTypes": "row",
+      "title": "Golden signals (Caddy HTTP)"
+    },
+    {
+      "id": "latency",
+      "panelTypes": "graph",
+      "title": "Request duration p50 / p95 / p99",
+      "description": "Latency quantiles parsed from caddy log durations",
+      "yAxisUnit": "s",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "p50",
+              "dataSource": "logs",
+              "aggregateOperator": "p50",
+              "aggregateAttribute": {"key": "http.server.request.duration", "dataType": "float64"},
+              "filter": {"expression": "service.name = caddy"},
+              "filters": {"items": [{"key": {"key": "service.name", "type": "tag"}, "op": "=", "value": "caddy"}], "op": "AND"},
+              "groupBy": [],
+              "having": {"expression": ""},
+              "orderBy": [],
+              "limit": null,
+              "stepInterval": 60
+            },
+            {
+              "queryName": "p95",
+              "dataSource": "logs",
+              "aggregateOperator": "p95",
+              "aggregateAttribute": {"key": "http.server.request.duration", "dataType": "float64"},
+              "filter": {"expression": "service.name = caddy"},
+              "filters": {"items": [{"key": {"key": "service.name", "type": "tag"}, "op": "=", "value": "caddy"}], "op": "AND"},
+              "groupBy": [],
+              "having": {"expression": ""},
+              "orderBy": [],
+              "limit": null,
+              "stepInterval": 60
+            },
+            {
+              "queryName": "p99",
+              "dataSource": "logs",
+              "aggregateOperator": "p99",
+              "aggregateAttribute": {"key": "http.server.request.duration", "dataType": "float64"},
+              "filter": {"expression": "service.name = caddy"},
+              "filters": {"items": [{"key": {"key": "service.name", "type": "tag"}, "op": "=", "value": "caddy"}], "op": "AND"},
+              "groupBy": [],
+              "having": {"expression": ""},
+              "orderBy": [],
+              "limit": null,
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "p50", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "p50", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "throughput",
+      "panelTypes": "graph",
+      "title": "Requests per minute (by status code)",
+      "yAxisUnit": "rpm",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "logs",
+            "aggregateOperator": "count",
+            "filter": {"expression": "service.name = caddy"},
+            "filters": {"items": [{"key": {"key": "service.name", "type": "tag"}, "op": "=", "value": "caddy"}], "op": "AND"},
+            "groupBy": [{"key": "http.response.status_code", "dataType": "string", "type": "tag"}],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 60
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "errors",
+      "panelTypes": "graph",
+      "title": "Error rate over time",
+      "yAxisUnit": "percent",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "logs",
+              "aggregateOperator": "count",
+              "filter": {"expression": "service.name = caddy AND http.response.status_code >= 400"},
+              "filters": {"items": [
+                {"key": {"key": "service.name", "type": "tag"}, "op": "=", "value": "caddy"},
+                {"key": {"key": "http.response.status_code", "type": "tag"}, "op": ">=", "value": "400"}
+              ], "op": "AND"},
+              "groupBy": [],
+              "having": {"expression": ""},
+              "orderBy": [],
+              "limit": null,
+              "stepInterval": 60
+            },
+            {
+              "queryName": "B",
+              "dataSource": "logs",
+              "aggregateOperator": "count",
+              "filter": {"expression": "service.name = caddy"},
+              "filters": {"items": [{"key": {"key": "service.name", "type": "tag"}, "op": "=", "value": "caddy"}], "op": "AND"},
+              "groupBy": [],
+              "having": {"expression": ""},
+              "orderBy": [],
+              "limit": null,
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": [{"queryName": "F1", "expression": "(A/B)*100", "legend": "%", "disabled": false}]
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "saturation",
+      "panelTypes": "graph",
+      "title": "Container CPU saturation",
+      "description": "Caddy container CPU% over time — proxy for 'how busy is the service'",
+      "yAxisUnit": "percent",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "container.cpu.percent", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "avg",
+            "filter": {"expression": "container.name = ircfiber-caddy"},
+            "filters": {"items": [{"key": {"key": "container.name", "type": "tag"}, "op": "=", "value": "ircfiber-caddy"}], "op": "AND"},
+            "groupBy": [],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 30
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "row-host",
+      "panelTypes": "row",
+      "title": "OVH host (203.0.113.10)"
+    },
+    {
+      "id": "host-cpu",
+      "panelTypes": "graph",
+      "title": "Host CPU",
+      "yAxisUnit": "percent",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.cpu.utilization", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "avg",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [{"key": "state", "dataType": "string", "type": "tag"}],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 30
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "host-mem",
+      "panelTypes": "graph",
+      "title": "Host memory",
+      "yAxisUnit": "bytes",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.memory.usage", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "sum",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [{"key": "state", "dataType": "string", "type": "tag"}],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 30
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "host-disk",
+      "panelTypes": "graph",
+      "title": "Filesystem utilization",
+      "yAxisUnit": "percent",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.filesystem.utilization", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "avg",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [{"key": "filesystem.mode", "dataType": "string", "type": "tag"}],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 60
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "row-footer",
+      "panelTypes": "row",
+      "title": "Recent activity"
+    },
+    {
+      "id": "recent-errors",
+      "panelTypes": "list",
+      "title": "Recent errors",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "logs",
+            "filter": {"expression": "severity_text = ERROR"},
+            "filters": {"items": [{"key": {"key": "severity_text", "type": "tag"}, "op": "=", "value": "ERROR"}], "op": "AND"},
+            "groupBy": [],
+            "having": {"expression": ""},
+            "orderBy": [{"columnName": "timestamp", "order": "desc"}],
+            "limit": 20,
+            "selectFields": [
+              {"name": "service.name", "field": "service.name", "fieldDataType": "string", "type": ""},
+              {"name": "body", "field": "body", "fieldDataType": "string", "type": ""}
+            ]
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "recent-traces",
+      "panelTypes": "list",
+      "title": "Recent traces",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "traces",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [],
+            "having": {"expression": ""},
+            "orderBy": [{"columnName": "timestamp", "order": "desc"}],
+            "limit": 20,
+            "selectFields": [
+              {"name": "service.name", "field": "service.name", "fieldDataType": "string", "type": ""},
+              {"name": "name", "field": "name", "fieldDataType": "string", "type": ""},
+              {"name": "durationNano", "field": "durationNano", "fieldDataType": "float64", "type": ""}
+            ]
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    }
+  ]
+}

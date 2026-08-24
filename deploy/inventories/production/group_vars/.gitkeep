@@ -1,0 +1,5 @@
+# vault.yml is intentionally not committed.
+# Create it from the example:
+#   cp group_vars/vault.example.yml group_vars/vault.yml
+#   $EDITOR group_vars/vault.yml
+#   ansible-vault encrypt group_vars/vault.yml

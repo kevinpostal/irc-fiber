@@ -1,0 +1,122 @@
+---
+- name: Preflight — backup dir exists
+  ansible.builtin.file:
+    path: "{{ backup_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Set timestamp fact
+  ansible.builtin.set_fact:
+    backup_ts: "{{ '%Y%m%d-%H%M%S' | strftime }}-{{ inventory_hostname_short }}"
+
+- name: Backup MongoDB
+  ansible.builtin.command: >
+    docker exec {{ mongo_container_name }}
+      mongodump
+      --username={{ vault_mongo_app_username }}
+      --password={{ vault_mongo_app_password }}
+      --authenticationDatabase={{ mongo_initdb_database }}
+      --archive
+      --gzip
+  register: mongo_dump_raw
+  changed_when: false
+  no_log: true
+  when:
+    - mongo_container_name is defined
+    - groups['ircfiber_backend'] is defined
+    - inventory_hostname in groups['ircfiber_backend']
+
+- name: Write mongo dump to file
+  ansible.builtin.copy:
+    content: "{{ mongo_dump_raw.stdout }}"
+    dest: "{{ backup_dir }}/mongo-{{ backup_ts }}.archive"
+    owner: root
+    group: root
+    mode: "0640"
+  when:
+    - mongo_dump_raw is defined
+    - mongo_dump_raw.stdout is defined
+
+- name: Snapshot redis AOF
+  ansible.builtin.command: >
+    docker exec {{ redis_container_name }}
+      sh -c 'cp /data/appendonly.aof /tmp/appendonly-{{ backup_ts }}.aof && cat /tmp/appendonly-{{ backup_ts }}.aof'
+  register: redis_aof_raw
+  changed_when: false
+  when:
+    - redis_container_name is defined
+    - groups['ircfiber_backend'] is defined
+    - inventory_hostname in groups['ircfiber_backend']
+
+- name: Write redis AOF snapshot
+  ansible.builtin.copy:
+    content: "{{ redis_aof_raw.stdout }}"
+    dest: "{{ backup_dir }}/redis-{{ backup_ts }}.aof"
+    owner: root
+    group: root
+    mode: "0640"
+  when:
+    - redis_aof_raw is defined
+    - redis_aof_raw.stdout is defined
+
+- name: Clean up old backups
+  ansible.builtin.find:
+    paths: "{{ backup_dir }}"
+    age: "{{ backup_keep_days }}d"
+    recurse: false
+  register: old_backups
+  changed_when: false
+
+- name: Remove expired backups
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ old_backups.files }}"
+  when: old_backups.files | length > 0
+
+- name: List backup contents
+  ansible.builtin.command: ls -lh {{ backup_dir }}
+  register: backup_listing
+  changed_when: false
+
+- name: Show backup listing
+  ansible.builtin.debug:
+    var: backup_listing.stdout_lines
+
+- name: Upload backups to S3 (optional)
+  when:
+    - backup_s3_enabled | bool
+    - backup_s3_bucket | length > 0
+    - vault_aws_access_key | length > 0
+  block:
+    - name: Install awscli (if S3 upload enabled)
+      ansible.builtin.apt:
+        name: awscli
+        state: present
+        update_cache: true
+
+    - name: Push mongo backup to S3
+      ansible.builtin.command: >-
+        aws s3 cp {{ backup_dir }}/mongo-{{ backup_ts }}.archive
+        s3://{{ backup_s3_bucket }}/{{ backup_s3_prefix }}mongo-{{ backup_ts }}.archive
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ vault_aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ vault_aws_secret_key }}"
+        AWS_DEFAULT_REGION: "{{ backup_s3_region }}"
+      changed_when: true
+      no_log: true
+      when: mongo_dump_raw is defined
+
+    - name: Push redis backup to S3
+      ansible.builtin.command: >-
+        aws s3 cp {{ backup_dir }}/redis-{{ backup_ts }}.aof
+        s3://{{ backup_s3_bucket }}/{{ backup_s3_prefix }}redis-{{ backup_ts }}.aof
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ vault_aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ vault_aws_secret_key }}"
+        AWS_DEFAULT_REGION: "{{ backup_s3_region }}"
+      changed_when: true
+      no_log: true
+      when: redis_aof_raw is defined

@@ -1,0 +1,23 @@
+---
+# Restart the Caddy container (not just `caddy reload`) when the
+# Caddyfile changes. A `caddy reload` is the cheaper option, but
+# it reads the file via the bind mount, and Docker bind mounts have
+# a footgun: when Ansible re-renders the Caddyfile via the standard
+# `template` module (temp file + atomic rename), the old inode at
+# the bind mount source is unlinked, but the running container is
+# still attached to it (`mountinfo` shows `//deleted` next to the
+# source path). A subsequent `caddy reload` re-reads the deleted
+# inode, not the new file at the path, so the in-memory config
+# never picks up the change. Restarting the container gives it a
+# fresh bind mount against the current inode, so the new config
+# is the one loaded at startup.
+#
+# Cost: a brief WebSocket reconnect window for the gateway's
+# long-lived /ws clients (Caddy terminates the proxy connections
+# during restart). Acceptable because Caddyfile changes are rare
+# and the gateway's WebSocket clients auto-reconnect.
+- name: Restart caddy
+  community.docker.docker_container:
+    name: "{{ caddy_container_name }}"
+    state: started
+    restart: true

@@ -1,0 +1,115 @@
+---
+# One-shot cleanup: re-create engine container without the legacy
+# `ircfiber-holder-sockets-<id>` volume mount, then drop the orphan
+# volume and prune dangling images.
+#
+# The conn-holder daemon is archived (see archived/conn-holder/). Older
+# deploys mounted its sockets volume onto the engine container at
+# /var/run/ircfiber (read-only). The current engine role specifies
+# `volumes: []`, so when ansible re-applies it, `docker_container`
+# detects the drift (mount present in running container, absent from
+# spec) and recreates the engine container cleanly. The recreate
+# does drop IRC sockets — a graceful handoff does NOT cover spec drift;
+# the engine process restarts, sends QUIT to the IRC server, then the
+# new engine re-issues the auto-join JOINs from config.autoJoinChannels.
+# For TLS networks (the OVH path) this is a ~few-seconds reconnect;
+# plain-TCP networks would be a true zero-disconnect via SCM_RIGHTS.
+#
+# Idempotent — every step is a no-op when the artefact is gone.
+
+- name: Re-create engine container without legacy holder volume mount
+  hosts: ircfiber_engines
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  vars:
+    # Mirror the engine role's defaults so this ad-hoc can address the
+    # container before the role is applied.
+    engine_container_name: "ircfiber-engine-{{ ircfiber_engine_id }}"
+  tasks:
+    - name: Show pre-cleanup engine mounts
+      ansible.builtin.shell: |
+        docker inspect {{ engine_container_name }} \
+          --format '{% raw %}{{range .Mounts}}{{.Type}} {{.Name}} -> {{.Destination}} (rw={{.RW}}){{"\n"}}{{end}}{% endraw %}' \
+          2>&1 || echo "(engine not present)"
+      register: pre_mounts
+      changed_when: false
+
+    - name: Re-apply engine role to recreate container with current spec
+      ansible.builtin.include_role:
+        name: engine
+      # `docker_container` detects drift (volumes: [] vs existing mount)
+      # and recreates the container. The engine process restarts; a
+      # ~few-seconds soft-reconnect on TLS networks is the only user-
+      # visible side effect.
+
+    - name: Wait for the new engine container to be healthy
+      ansible.builtin.shell: |
+        for i in $(seq 1 120); do
+          status=$(docker inspect {{ engine_container_name }} \
+                    --format '{% raw %}{{ .State.Health.Status }}{% endraw %}' 2>/dev/null)
+          # Tolerate absent health status (no healthcheck configured) and
+          # `starting` for the first 60s; require `healthy` after.
+          if [ "$status" = "healthy" ] || [ -z "$status" ]; then
+            echo "engine healthy after ${i}s (status=$status)"
+            exit 0
+          fi
+          if [ $i -eq 30 ] && [ "$status" = "starting" ]; then
+            echo "engine still starting at 30s — accepting"
+          fi
+          sleep 1
+        done
+        echo "engine did not become healthy in 120s; current status:"
+        docker inspect {{ engine_container_name }} --format '{% raw %}{{ .State.Health.Status }}{% endraw %}'
+        docker logs --tail 20 {{ engine_container_name }} 2>&1
+        exit 1
+      register: engine_health
+      changed_when: false
+
+    - name: Confirm engine mounts no longer include legacy holder volume
+      ansible.builtin.shell: |
+        mounts=$(docker inspect {{ engine_container_name }} \
+                   --format '{% raw %}{{range .Mounts}}{{.Type}} {{.Name}} {{.Destination}} {{end}}{% endraw %}' \
+                   2>/dev/null)
+        if echo "$mounts" | grep -q 'ircfiber-holder-sockets'; then
+          echo "WARN: legacy holder mount still present"
+          echo "$mounts"
+          exit 1
+        fi
+        echo "engine mounts are clean:"
+        echo "$mounts"
+      register: post_mounts
+      changed_when: false
+
+    - name: Remove now-orphaned ircfiber-holder sockets volume
+      community.docker.docker_volume:
+        name: "ircfiber-holder-sockets-{{ ircfiber_engine_id }}"
+        state: absent
+      register: vol_remove
+
+    - name: Prune dangling images (old engine builder sha, etc.)
+      ansible.builtin.shell: |
+        echo "=== dangling images BEFORE prune ==="
+        docker images -f "dangling=true" --format "{% raw %}{{ .ID }} {{ .CreatedSince }} {{ .Size }}{% endraw %}"
+        docker image prune -f 2>&1 | tail -3 || true
+      register: prune_dangling
+      changed_when: "'Total reclaimed space' in prune_dangling.stdout"
+
+    - name: Final state snapshot
+      ansible.builtin.shell: |
+        echo "=== engine mounts ==="
+        docker inspect {{ engine_container_name }} \
+          --format '{% raw %}{{range .Mounts}}{{.Type}} {{.Name}} -> {{.Destination}} ({{if .RW}}rw{{else}}ro{{end}}){{"\n"}}{{end}}{% endraw %}' 2>&1
+        echo "=== holder artefacts ==="
+        docker ps -a --filter name=holder --format "{% raw %}{{ .Names }} {{ .Status }}{% endraw %}" || true
+        docker volume ls | grep -E "holder|ircfiber-holder" || echo "(no holder volumes)"
+        echo "=== stale upstream images (>= 9d unused) ==="
+        docker images --format "{% raw %}{{ .Repository }}:{{ .Tag }} {{ .ID }} {{ .Size }} {{ .CreatedSince }}{% endraw %}" \
+          | grep -E "kevindpostal|holder" | head -5
+      register: final_snapshot
+      changed_when: false
+
+    - name: Print final state to operator log
+      ansible.builtin.debug:
+        msg: "{{ final_snapshot.stdout_lines }}"

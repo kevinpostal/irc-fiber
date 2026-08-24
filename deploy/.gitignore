@@ -1,0 +1,21 @@
+# Ansible artifacts
+*.retry
+.facts/
+*.pyc
+__pycache__/
+
+# Encrypted vault files (group_vars/vault.yml, host_vars/*/vault.yml) are
+# operator secrets — never commit. The .example.yml template IS committed.
+inventories/**/vault.yml
+inventories/**/vault.yml.*
+
+# Decrypted fact caches
+.fact_cache/
+*.fcache
+
+# Local backup scratch
+backups/
+*.tar.gz
+*.archive
+**/hosts.ini
+**/vps-efb4b52d.yml

@@ -1,0 +1,22 @@
+apiVersion: 1
+
+# Provision Grafana with SigNoz as the primary datasource.
+# Old Loki/Tempo/Prometheus datasources remain in the DB for
+# backward compatibility but will no longer be provisioned.
+deleteDatasources: []
+
+datasources:
+  # ─── SigNoz (unified logs + metrics + traces) ───────────────────────────
+  # Replaces the earlier Loki/Tempo/Prometheus trio. SigNoz combined image
+  # runs on the ircfiber_logging network; port 8080 is the API endpoint.
+  # The API key is provisioned by the signoz_mcp role.
+  # Uses Infinity datasource plugin (yesoreyeram-infinity-datasource)
+  # which must be installed via GF_INSTALL_PLUGINS.
+  - name: SigNoz
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    url: http://signoz:8080
+    jsonData:
+      allowUndeclaredFields: true
+      apiKey: {{ signoz_grafana_api_key }}
+    editable: false

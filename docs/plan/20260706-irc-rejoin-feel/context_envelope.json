@@ -1,0 +1,369 @@
+{
+  "context_envelope": {
+    "meta": {
+      "plan_id": "20260706-irc-rejoin-feel",
+      "created_at": "2026-07-06T22:47:00Z",
+      "last_updated": "2026-07-06T23:10:00Z",
+      "version": 2
+    },
+    "tech_stack": [
+      {
+        "name": "Svelte 5",
+        "version": "5.x",
+        "usage_context": "Frontend component framework; uses runes ($state, $derived, $effect, $props) — no Svelte 3 store syntax",
+        "config_files": [
+          "frontend/svelte.config.js",
+          "frontend/vite.config.ts"
+        ]
+      },
+      {
+        "name": "TypeScript",
+        "version": "5.x",
+        "usage_context": "All frontend .ts and .svelte files typed; strict mode",
+        "config_files": [
+          "frontend/tsconfig.json"
+        ]
+      },
+      {
+        "name": "vitest",
+        "version": "2.x",
+        "usage_context": "Two projects: 'lib' (Node, fast) and 'client' (headless Chromium for Svelte components + stores)",
+        "config_files": [
+          "frontend/vitest.config.ts"
+        ]
+      },
+      {
+        "name": "vibe.d (D backend)",
+        "version": "current",
+        "usage_context": "IRC engine — UNTOUCHED by this plan. No D code changes. No wire protocol changes.",
+        "config_files": []
+      }
+    ],
+    "conventions": [
+      "Svelte 5 runes only — no `class:name`, use `:class={...}`. Bind via `$props()`. State via `$state()`, derived via `$derived()` / `$derived.by()`.",
+      "Rune-based exports: `export const foo: Set<X> = $state(new Set())` — sets are reactive state.",
+      "Frontend test pattern: 1131+ existing vitest assertions; use existing `createNetwork` / `createBuffer` helpers in ircStore.svelte.test.ts (around line 200-300).",
+      "Synchronous state-machine setters in ircStore.svelte.ts; mutations are direct because runes auto-react.",
+      "Buffer-level fields added over time are namespaced by W-plan ID in comments (W1-T06, W7-T01, W1-T08). Preserve these markers when editing nearby code.",
+      "Markdown plan artifacts: plan.yaml + context_envelope.json + plan-summary.md committed to docs/plan/<plan-id>/",
+      "Reuse-before-rewrite principle: helper extraction preferred over inline body duplication (see AGENTS.md reuse_notes).",
+      "Frontend /local proxy endpoints are reachable via VITE_SIGNOZ_URL etc. — no env tweaks needed for the IRC rejoin work."
+    ],
+    "constraints": {
+      "hard": [
+        "No engine (D backend) changes. The Vibe.d source under source/ircfiber/ is out of scope.",
+        "No wire protocol changes. WS message shapes and Redis snapshot keys are frozen.",
+        "Frontend only — TypeScript + Svelte 5 under frontend/src/.",
+        "W1-T06 invariants must not regress: activeJoinList guards buffersToDelete wire deletion.",
+        "W7-T01 invariants must not regress: pendingJoins dedup blocks re-issuance; isJoinPending is the only path-cancel mechanism for URL auto-join.",
+        "Resetpendingstate at WS reconnect (lines 448-457) preserves activeJoinList but clears pendingJoins + joinInFlight + pendingIsJoined + pendingConfirmations. New code must not widen what gets reset.",
+        "JOIN for self at ircStore.svelte.ts:1710-1738 + JOIN-failure at 1740-1780 handlers stay authoritative for state transitions on echo. (Canonical line range used across all three plan artifacts.)",
+        "Behavior change: /cycle /hop /rejoin drop PART-before-JOIN. Logged in docs/CHANGELOG.md."
+
+      ],
+      "soft": [
+        "match IRCCloud visual feel: italic + opacity for in-flight sidebar row.",
+        "Minimize blast radius: one new helper + four delegate calls; no new exported state types.",
+        "No new external dependencies. No new env vars. No new mock infrastructure beyond vi.mock for reconnectNetwork if it isn't already mocked."
+      ],
+      "compatibility": [
+        "Browser target: same as existing app (modern Chromium for tests via vitest-browser).",
+        "Existing 1131+ vitest cases must stay green. Component + store + lib projects all green."
+      ],
+      "security_requirements": [
+        "No security-sensitive changes — review at review_depth=lightweight skips security audit.",
+        "JOIN commands go through sendRaw which already rate-limits. Helper reuses it; no new wire surface."
+      ]
+    },
+    "architecture_snapshot": {
+      "key_dirs": [
+        "frontend/src/stores/ — ircStore.svelte.ts (state machine), wsConnection.svelte.ts (transport), preferences.svelte.ts (localStorage), api.ts (REST + reconnect)",
+        "frontend/src/components/ — BufferHeader.svelte, ChannelContextMenu.svelte, Sidebar.svelte, MemberList.svelte, InputArea.svelte, ServerLogContextMenu.svelte, JoinModal.svelte, ChannelSwitcher.svelte, ConnectionStatus.svelte",
+        "frontend/src/lib/ — utils.ts (stripPrefix, normalizeChannelName), messageHandler.ts, messageBuilder.ts, slashCommands.ts",
+        "frontend/src/App.svelte — root component, switchToBuffer + maybeAutoJoinChannel auto-join path"
+      ],
+      "patterns": [
+        "Single-store state machine: ircStore.svelte.ts owns buffer + network state. Components read via $derived selectors and call named exports to mutate.",
+        "Setters do NOT bubble through events — they directly mutate the $state proxy. Components observe via reactive selectors.",
+        "Sync snapshots vs event-driven state: updateNetworkFromSync at ircStore.svelte.ts:1073 reconciles per-buffer sync deltas; pendingIsJoined + joinInFlight flags guard against WS-round-trip clobber.",
+        "Click-time idempotency: every rejoin path consults pendingJoins via isJoinPending before sending JOIN."
+      ],
+      "key_components": [
+        {
+          "name": "ircStore.svelte.ts",
+          "location": "frontend/src/stores/ircStore.svelte.ts",
+          "responsibility": [
+            "Network + buffer state (ircState proxy)",
+            "Active join tracking (activeJoinList, recordJoin, clearActiveJoin)",
+            "Pending JOIN dedup (pendingJoins, markJoinPending, clearJoinPending, isJoinPending)",
+            "Per-buffer rejoin flags (joinInFlight, joinError, pendingIsJoined, pendingConfirmations)",
+            "Sync reconciliation (updateNetworkFromSync with 2-of-2 confirm guard)",
+            "buffersToDelete handler (handleBuffersToDelete, uses activeJoinList + pinned/archived/hidden guards)",
+            "WS-reconnect reset hook (resetPendingState clears joinInFlight+pendingIsJoined+pendingConfirmations; preserves activeJoinList)",
+            "Per-buffer IRC event handlers (updateChannelUsers at line 1629 covers JOIN/PART/KICK/QUIT/NICK/MODE/353/etc.)"
+          ]
+        },
+        {
+          "name": "App.svelte",
+          "location": "frontend/src/App.svelte",
+          "responsibility": [
+            "Boot sequence",
+            "WebSocket lifecycle (onOpen calls resetPendingState)",
+            "switchToBuffer → URL nav path",
+            "maybeAutoJoinChannel (line 545) — the canonical pre-existing rejoin initiator for URL/sidebar-click auto-joins. Sets joinInFlight+joinError+pendingIsJoined+markJoinPending+recordJoin before sendRaw. Wave 1 of this plan delegates this body into the new initiateRejoin helper but preserves the early-return guards (already-joined, !connected, isJoinPending)."
+          ]
+        }
+      ]
+    },
+    "research_digest": {
+      "relevant_files": [
+        {
+          "path": "frontend/src/stores/ircStore.svelte.ts",
+          "purpose": [
+            "Single source of buffer state + state-machine transitions. Hosts activeJoinList + pendingJoins + per-buffer in-flight flags.",
+            "line 388-423: W1-T06 + W7-T01 helpers",
+            "line 448-457: resetPendingState",
+            "line 463-488: handleBuffersToDelete wire handler",
+            "line 1073-1509: updateNetworkFromSync (the sync clobber guard architecture, INCLUDING the 'two confirming syncs' mechanism at 1378-1412)",
+            "line 1629-1981: updateChannelUsers — per-event IRC message handler. JOIN for self at 1710-1738 sets pendingIsJoined+pendingConfirmations quartet and adds self-nick to buf.users (1720-1727). JOIN failure (471/473/etc.) at 1740-1780 sets joinError. PART/KICK for self at 1804-1823 clears flags."
+          ],
+          "confidence": 0.97
+        },
+        {
+          "path": "frontend/src/components/BufferHeader.svelte",
+          "purpose": [
+            "Active buffer header. Hosts the join-inflight-chip (line 174-178) + join-error-chip (line 179-184).",
+            "line 125-145: rejoin() — current implementation sets joinError=null, joinInFlight=true, markJoinPending, recordJoin. Does NOT set pendingIsJoined+pendingConfirmations (the bug). Includes a `if (!activeNetwork.connected) reconnectNetwork()` branch.",
+            "plan target: this rejoin becomes a one-liner delegate to initiateRejoin(networkId, name, { allowReconnect: true })."
+          ],
+          "confidence": 0.97
+        },
+        {
+          "path": "frontend/src/components/ChannelContextMenu.svelte",
+          "purpose": [
+            "Right-click menu for inactive/joined channels. Hosts the Rejoin item (line 244).",
+            "line 89-93: rejoin() — current implementation is a stripped `sendRaw(networkId, 'JOIN ' + buf.name); onClose();`. Sets ZERO state flags. Highest priority bug — context-menu Rejoin exposes buffers to buffersToDelete on WS resume because recordJoin is never called."
+          ],
+          "confidence": 0.97
+        },
+        {
+          "path": "frontend/src/lib/slashCommands.ts",
+          "purpose": [
+            "Slash-command interpreter. /cycle /hop /rejoin all bind at line 201-206 to a handler that resolves the channel from target and currently calls sendRaw('PART <chan>') followed by sendRaw('JOIN <chan> + key') (PART-before-JOIN).",
+            "Wave 1 behavior change: drop the PART-before-JOIN; delegate to initiateRejoin helper with allowReconnect=false. Matches IRCCloud 'just rejoin' semantics. Logged in docs/CHANGELOG.md.",
+            "Same bug class as ChannelContextMenu — sends JOIN without state-machine init, but additionally has the PART side-effect that clobbers isJoined."
+          ],
+          "confidence": 0.95
+        },
+        {
+          "path": "frontend/src/App.svelte",
+          "purpose": [
+            "Root component. switchToBuffer (line 512) → maybeAutoJoinChannel (line 545).",
+            "maybeAutoJoinChannel is the CORRECT pre-existing example — it sets joinInFlight+joinError+pendingIsJoined+markJoinPending+recordJoin before sendRaw. Plan target: refactor this body into the shared initiateRejoin helper, preserving the early-return guards (line 552-557)."
+          ],
+          "confidence": 0.97
+        },
+        {
+          "path": "frontend/src/components/Sidebar.svelte",
+          "purpose": [
+            "Sidebar with Pinned + Active + Inactive + Archived channel sections, plus conversations/DM queries. Renders buffer-item li at FOUR channel sites: lines 150 (Pinned), 251 (Active), 293 (Inactive), 364 (Archived). Line 324 is `<li class=\"buffer conversation buffer-item\">` — DM/conversation site, deliberately excluded (DMs never have joinInFlight).",
+            "Plan target: add `:class={ 'buffer-item--joining': b.joinInFlight }` at each of the four channel sites + a CSS block for the modifier."
+          ],
+          "confidence": 0.96
+        },
+        {
+          "path": "frontend/src/stores/ircStore.svelte.test.ts",
+          "purpose": [
+            "Vitest test suite for the store. Existing 1131+ assertions cover: updateNetworkFromSync, phantom buffers, MODE/MEMBER/JOIN/PART handlers, buffersToDelete, sync guard for in-flight JOIN (line 1302-1348), self-nick in userlist (line 1350-1380), JOIN failure handling.",
+            "Plan target: add a new describe('initiateRejoin', ...) block after line 1348."
+          ],
+          "confidence": 0.97
+        },
+        {
+          "path": "frontend/src/components/BufferHeader.test.ts",
+          "purpose": [
+            "Component test for header. Existing rejoin-click test at line 287-305 asserts sendRaw('JOIN #ircfiber').",
+            "Plan target: extend the test to also assert joinInFlight=true + chip in document."
+          ],
+          "confidence": 0.92
+        },
+        {
+          "path": "frontend/src/components/ChannelContextMenu.test.ts",
+          "purpose": [
+            "Existing tests cover visibility of Rejoin item (line 74+) and various menu actions.",
+            "Plan target: add new test exercising click-Rejoin → state transitions."
+          ],
+          "confidence": 0.90
+        },
+        {
+          "path": "frontend/src/components/Sidebar.test.ts",
+          "purpose": [
+            "Existing tests cover .buffer-item.unread, .highlight, .active. Inactive section (line 355+) covers isJoined:false placement.",
+            "Plan target: new describe('joining modifier') block."
+          ],
+          "confidence": 0.93
+        },
+        {
+          "path": "frontend/src/lib/slashCommands.test.ts",
+          "purpose": [
+            "Does NOT currently exist (verified via glob).",
+            "Plan target: CREATE file with three test cases /cycle /hop /rejoin asserting (a) buf.joinInFlight=true, (b) pendingJoins.has(normalized), (c) sendRaw called with 'JOIN <chan>' exactly once."
+          ],
+          "confidence": 0.90
+        }
+      ],
+      "patterns_found": [
+        {
+          "name": "Rejoin state-machine quartet",
+          "category": "invariants",
+          "confidence": 0.97,
+          "example_location": [
+            "frontend/src/stores/ircStore.svelte.ts:1730-1732",
+            "frontend/src/stores/ircStore.svelte.ts:1770-1772 (the 443 already-in-channel branch)",
+            "frontend/src/App.svelte:561-565"
+          ]
+        },
+        {
+          "name": "Sync clobber 2-of-2 confirm guard",
+          "category": "state-machine",
+          "confidence": 0.96,
+          "example_location": [
+            "frontend/src/stores/ircStore.svelte.ts:1392-1412"
+          ]
+        },
+        {
+          "name": "JOIN self-echo userlist pre-populate",
+          "category": "store-handler",
+          "confidence": 0.96,
+          "example_location": [
+            "frontend/src/stores/ircStore.svelte.ts:1710-1738",
+            "frontend/src/stores/ircStore.svelte.ts:1720-1727 (the dedup line within the block)"
+          ]
+        },
+        {
+          "name": "353 in-place promotion",
+          "category": "store-handler",
+          "confidence": 0.95,
+          "example_location": [
+            "frontend/src/stores/ircStore.svelte.ts:1696-1701"
+          ]
+        }
+      ],
+      "gotchas": [
+        {
+          "text": "setActiveBuffer auto-creates phantoms with isJoined=false. Sync handler at line 1385-1391 phantoms differently from real buffers — the joinInFlight=true guard at 1388 prevents sync from adopting a phantom into isJoined=true. The slash/URL-nav paths use maybeAutoJoinChannel which already handles this. The Wave 1 helper must apply the same quartet (joinInFlight=true + pendingIsJoined=true) for phantoms too.",
+          "confidence": 0.95
+        },
+        {
+          "text": "resetPendingState at WS reconnect does NOT clear activeJoinList (line 440-443). This is by design — activeJoinList is a short-term buffersToDelete guard that must survive the WS-resume window so freshly-joined buffers aren't reaped before the sync confirms them. InitiateRejoin calling recordJoin is therefore correct: it survives WS resume via the design.",
+          "confidence": 0.99
+        },
+        {
+          "text": "Both .join-inflight-chip (BufferHeader line 174) and .join-error-chip (line 179) render in an {:else if} chain — failure response REPLACES the optimistic joining state, not transiently shows both. Therefore 'no flicker on 473' is structurally guaranteed — no animation suppression code needed.",
+          "confidence": 0.92
+        },
+        {
+          "text": "ChannelContextMenu renders the Rejoin item only when isActive === false (line 243-244). isActive derives from buf.isJoined !== false AND net.connected. So on a disconnected network, the menu shows Rejoin, but the engine's connected state means clicking it triggers a JOIN that won't reach the IRC server — currently BufferHeader.rejoin's reconnectNetwork branch is the right pattern.",
+          "confidence": 0.90
+        },
+        {
+          "text": "IRCCloud visual vocabulary is opacity/italic for joining (no spinner). Using opacity transitions keeps it fast and avoids competing with the .join-inflight-chip spinning dot already in BufferHeader.",
+          "confidence": 0.85
+        },
+        {
+          "text": "Task T2 (prePopulateOwnNick at click time): the dedup uses stripPrefix so a 353 follow-up with `@me` does NOT create a duplicate. Existing 353 in-place promotion at line 1696-1701 reads the existing entry, sets nick='@me' (with prefix char), and updates prefix='@' and category.",
+          "confidence": 0.95
+        },
+        {
+          "text": "WS-reconnect race: clicking Rejoin on a disconnected network fires reconnectNetwork (BufferHeader allowReconnect=true) AND recordJoin in one frame. After WS resume, resetPendingState clears pendingJoins + joinInFlight + pendingIsJoined + pendingConfirmations but PRESERVES activeJoinList. A subsequent sync that arrives before the engine's JOIN-echo has propagated can show isJoined=false for one round-trip. W3-T04 test #10 documents this flicker window. The user's helpers do NOT currently mark the buffer in a separate reconnectQueue (would survive resetPendingState) — out of scope.",
+          "confidence": 0.85
+        }
+      ]
+    },
+    "prior_decisions": [
+      {
+        "decision": "The sync-clobber architecture (2-of-2 confirming sync guard + joinInFlight short-circuit) is correct. Do not redesign.",
+        "rationale": [
+          "Existing test coverage at ircStore.svelte.test.ts:860-1348 pins the architecture in place.",
+          "W7-T01 plan shipped the pendingIsJoined + pendingConfirmations quartet specifically to handle WS-round-trip race.",
+          "Marginal change is to make every rejoin entry point conform; invasive redesign risks regressions."
+        ],
+        "confidence": 0.97
+      },
+      {
+        "decision": "Extract initiateRejoin rather than inline the fix in each of the 4 entry points.",
+        "rationale": [
+          "Allows a single test suite to pin the invariants.",
+          "Prevents re-occurrence if a future rejoin entry point is added.",
+          "Matches the user's 'reuse, don't rewrite' guidance — maybeAutoJoinChannel is the canonical pre-existing pattern.",
+          "AGENTS.md reuse principle mandates this."
+        ],
+        "confidence": 0.96
+      },
+      {
+        "decision": "sidebar gets .buffer-item--joining modifier rather than a separate component.",
+        "rationale": [
+          "Lightest-touch change preserving existing visual vocabulary (.unread / .highlight).",
+          "Avoids new component lifecycle wiring for a single visual flag.",
+          "User acceptance explicitly calls out 'within 50ms' — class binding is the lowest-latency reactivity primitive in Svelte 5."
+        ],
+        "confidence": 0.92
+      },
+      {
+        "decision": "prePopulateOwnNick at click time uses stripPrefix dedup — same rule as 353 handler.",
+        "rationale": [
+          "The 353 in-place promotion at line 1696 depends on stripped-nick dedup. Pre-population must not break that.",
+          "Test at ircStore.svelte.test.ts:1378-1398 'does not duplicate own nick when 353 arrives after JOIN' confirms the rule."
+        ],
+        "confidence": 0.95
+      },
+      {
+        "decision": "Sidebar mirror modifier .buffer-item--joining applies to ALL FOUR channel buffer-item sites (150 Pinned, 251 Active, 293 Inactive, 364 Archived) and explicitly excludes line 324 (DM/conversation).",
+        "rationale": [
+          "All four channel sections can contain a buffer that has just been clicked for rejoin (Pinned channels are reachable via the pinned index). Conversations (DMs) never have joinInFlight because /join does not target a user.",
+          "Style vocabulary: matches existing .buffer-item.unread / .buffer-item.highlight modifier classes (italic + reduced opacity)."
+        ],
+        "confidence": 0.93
+      },
+      {
+        "decision": "Drop PART-before-JOIN from /cycle /hop /rejoin (slashCommands.ts:205-206). Wire only a single JOIN via initiateRejoin.",
+        "rationale": [
+          "PART-before-JOIN clobbers isJoined=true mid-flow and breaks the optimistic Joining chip — the core UX bug this plan is fixing.",
+          "IRCCloud's /cycle semantics is 'just rejoin' — PART is implicit when the user explicitly chooses to rejoin from the channel view.",
+          "Behavior change is logged in docs/CHANGELOG.md under the next release."
+        ],
+        "confidence": 0.90
+      }
+    ],
+    "reuse_notes": [
+      {
+        "path": "frontend/src/stores/ircStore.svelte.ts",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/components/BufferHeader.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/components/ChannelContextMenu.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/lib/slashCommands.ts",
+        "trust": "medium"
+      },
+      {
+        "path": "frontend/src/App.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/components/Sidebar.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/stores/ircStore.svelte.test.ts",
+        "trust": "high"
+      }
+    ]
+  }
+}

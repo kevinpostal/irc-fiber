@@ -1,0 +1,14 @@
+---
+- name: Skip if docker_registry_url is empty
+  ansible.builtin.meta: end_play
+  when:
+    - docker_registry_url | length == 0
+    - registry_login_skip_when_unset | bool
+
+- name: Log in to the Docker registry
+  community.docker.docker_login:
+    registry: "{{ docker_registry_url }}"
+    username: "{{ vault_docker_registry_username }}"
+    password: "{{ vault_docker_registry_password }}"
+    reauthorize: true
+  no_log: true

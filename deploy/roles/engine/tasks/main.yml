@@ -1,0 +1,132 @@
+---
+- name: Preflight — IRCFIBER_SERVER_ID must be set per-host
+  ansible.builtin.assert:
+    that:
+      - ircfiber_engine_id is defined
+      - ircfiber_engine_id | length > 0
+      - ircfiber_engine_id != inventory_hostname
+      - ircfiber_engine_id != inventory_hostname_short
+    fail_msg: >-
+      ircfiber_engine_id must be set per-host in host_vars/<hostname>.yml
+      or via inline inventory vars. The group default was removed because
+      '{{ inventory_hostname_short }}' would leak as a bogus server ID,
+      creating duplicate engine registrations in Redis.
+      Set ircfiber_engine_id explicitly for this host (e.g. 'ovh').
+
+- name: Discover this host's Tailscale IPv4 address
+  ansible.builtin.command: tailscale ip -4
+  register: tailscale_ip_raw
+  changed_when: false
+  failed_when: tailscale_ip_raw.rc != 0
+  check_mode: false
+
+- name: Set host_tailscale_ip fact
+  ansible.builtin.set_fact:
+    host_tailscale_ip: "{{ tailscale_ip_raw.stdout | trim | split('\n') | first | trim }}"
+
+- name: Resolve backend Tailscale IP (where mongo & redis live)
+  ansible.builtin.set_fact:
+    backend_tailscale_ip: >-
+      {{ hostvars[groups['ircfiber_backend'][0]]['backend_tailscale_ip']
+         | default(hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
+            | default(host_tailscale_ip)) }}
+
+- name: Pull ircfiber-engine image (registry configured)
+  community.docker.docker_image:
+    name: "{{ ircfiber_engine_image_full }}"
+    source: pull
+    state: present
+  when: docker_registry_url | length > 0
+  # Note: when docker_registry_url is empty, the ircfiber_image role has
+  # already built the image on this host via docker build.
+
+- name: Ensure engine config dir exists
+  ansible.builtin.file:
+    path: "/etc/ircfiber/engine"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Render engine env file
+  ansible.builtin.template:
+    src: env.j2
+    dest: "/etc/ircfiber/engine/env-{{ ircfiber_engine_id }}"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Restart engine
+
+# Read env_file into a dict and pass via env: (NOT env_file:) so the
+# docker_container module compares values against the running container
+# and recreates it when env content drifts. With env_file: the module
+# never compares values, which is how the engine got stuck with a stale
+# MONGO_URL after a vault rotation on 2026-07-04 (real outage).
+# The engine uses graceful handoff to migrate IRC sockets during the
+# recreate, so users don't see a disconnect.
+- name: Slurp engine env file from target
+  ansible.builtin.slurp:
+    src: "/etc/ircfiber/engine/env-{{ ircfiber_engine_id }}"
+  register: _engine_env_raw
+
+- name: Parse engine env into a dict
+  vars:
+    _raw_lines: "{{ (_engine_env_raw.content | b64decode).split('\n') | reject('match', '^\\s*#') | map('trim') | reject('equalto', '') | list }}"
+    _pairs: "{{ _raw_lines | map('split', '=', 1) | list }}"
+  ansible.builtin.set_fact:
+    _engine_env: "{{ dict(_pairs) }}"
+
+- name: Run Mullvad sidecars (tailscale userspace SOCKS5, scalable 2→5)
+  when: mullvad_sidecars | length > 0
+  community.docker.docker_container:
+    name: "tailscale-mullvad-{{ item.name }}"
+    image: "{{ mullvad_sidecar_image }}"
+    state: started
+    restart_policy: unless-stopped
+    # Userspace: no NET_ADMIN needed; SOCKS5 on :1055 for engine to dial via
+    env:
+      TS_AUTHKEY: "{{ vault_tailscale_authkey }}"
+      TS_HOSTNAME: "ovh-mullvad-{{ item.name }}"
+      TS_EXTRA_ARGS: "--exit-node={{ item.exit_node }} --exit-node-allow-lan-access=true --advertise-tags={{ tailscale_tags }}"
+      TS_USERSPACE: "true"
+      TS_SOCKS5_SERVER: ":{{ item.port | default(mullvad_sidecar_socks_port) }}"
+      TS_STATE_DIR: "/var/lib/tailscale"
+    volumes:
+      - "mullvad-{{ item.name }}-state:/var/lib/tailscale"
+    networks:
+      - name: "{{ docker_ircfiber_network }}"
+    labels:
+      com.ircfiber.component: "mullvad-sidecar"
+      com.ircfiber.mullvad_name: "{{ item.name }}"
+  loop: "{{ mullvad_sidecars }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Run ircfiber-engine
+  community.docker.docker_container:
+    name: "{{ engine_container_name }}"
+    image: "{{ ircfiber_engine_image_full }}"
+    state: started
+    restart_policy: unless-stopped
+    command: ["/usr/local/bin/ircfiber-engine-entrypoint.sh"]
+    networks:
+      - name: "{{ docker_ircfiber_network }}"
+      # Join the logging network so the engine can push OTLP traces to
+      # the otel-collector. Required for distributed tracing.
+      - name: ircfiber_logging
+    env: "{{ _engine_env }}"
+    volumes: []
+    security_opts:
+      - "no-new-privileges:true"
+    ulimits:
+      - "nofile:65536:65536"
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/local/bin/ircfiber-engine-healthcheck.sh"]
+      interval: "{{ engine_healthcheck_interval }}"
+      timeout: "{{ engine_healthcheck_timeout }}"
+      retries: "{{ engine_healthcheck_retries }}"
+      start_period: "{{ engine_healthcheck_start_period }}"
+    labels:
+      com.ircfiber.component: "engine"
+      com.ircfiber.version: "{{ ircfiber_version }}"
+      com.ircfiber.engine_id: "{{ ircfiber_engine_id }}"

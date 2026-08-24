@@ -1,0 +1,89 @@
+---
+# Deploy SigNoz alert rules to the SigNoz API.
+# Reads the canonical alert_rules.yml from the signoz_alerts role
+# (single source of truth) and POSTs each rule to
+# signoz-query-service:8080/api/v2/rules. Idempotent: checks for
+# existing rule by name before creating/updating.
+#
+# Gated by deploy_signoz_alerts (default false) in main.yml.
+# Requires: signoz_api_key (from vault or env) or signoz_api_key_file.
+#
+# 2026-07-13: previously this task tried to render a non-existent
+# signoz-alerts.yml.j2 template. The actual source of truth is the
+# signoz_alerts role's files/alert_rules.yml. We read from that path
+# directly. The signoz_alerts role pushes the same rules via a
+# different code path; this task is the alternative API-key-based
+# deploy (used by deploys that don't have vault_signoz_admin_password
+# available but DO have a signoz_api_key file).
+
+- name: Read SigNoz API key from vault file
+  ansible.builtin.slurp:
+    src: "{{ signoz_api_key_file | default('/etc/ircfiber/signoz-mcp/.api_key') }}"
+  register: signoz_api_key_b64
+  when: signoz_api_key is not defined
+  no_log: true
+
+- name: Set signoz_api_key fact
+  ansible.builtin.set_fact:
+    signoz_api_key: "{{ signoz_api_key_b64.content | b64decode | trim }}"
+  when: signoz_api_key is not defined
+  no_log: true
+
+- name: Read canonical alert rules
+  ansible.builtin.slurp:
+    src: "{{ playbook_dir }}/../signoz_alerts/files/alert_rules.yml"
+  register: rendered_alerts
+  delegate_to: localhost
+  become: false
+
+- name: Parse rendered alert rules
+  ansible.builtin.set_fact:
+    alert_rules_list: "{{ (rendered_alerts.content | b64decode | from_yaml_all) | flatten }}"
+
+- name: Fetch existing SigNoz alert rules
+  ansible.builtin.uri:
+    url: "{{ signoz_api_url | default('http://signoz-query-service:8080') }}/api/v2/rules"
+    method: GET
+    headers:
+      SIGNOZ-API-KEY: "{{ signoz_api_key }}"
+    status_code: [200]
+  register: existing_rules
+
+- name: Build existing alert names map
+  ansible.builtin.set_fact:
+    existing_alert_names: >-
+      {{
+        (existing_rules.json.data | default([]))
+        | items2dict(key_name='alert', value_name='id')
+      }}
+
+- name: Create or update each SigNoz alert rule
+  ansible.builtin.uri:
+    url: "{{ signoz_api_url | default('http://signoz-query-service:8080') }}/api/v2/rules"
+    method: "{{ 'PUT' if item.alert in existing_alert_names else 'POST' }}"
+    headers:
+      SIGNOZ-API-KEY: "{{ signoz_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body: "{{ item }}"
+    status_code: [200, 201]
+  loop: "{{ alert_rules_list }}"
+  loop_control:
+    label: "{{ item.alert | default(item.name) }}"
+  register: alert_deploy_results
+
+- name: Verify all rules deployed
+  ansible.builtin.assert:
+    that:
+      - "{{ alert_deploy_results.results | length == alert_rules_list | length }}"
+      - >-
+        {{
+          alert_deploy_results.results
+          | selectattr('status', 'equalto', 200)
+          | list | length == alert_rules_list | length
+        }}
+    success_msg: "All {{ alert_rules_list | length }} SigNoz alert rules deployed successfully"
+    fail_msg: >-
+      Expected {{ alert_rules_list | length }} rules deployed, got {{ alert_deploy_results.results | length }}
+      with status codes:
+      {{ alert_deploy_results.results | map(attribute='status') | join(', ') }}

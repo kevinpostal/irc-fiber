@@ -1,0 +1,17 @@
+# IRC Fiber — conntrack / nf_conntrack tuning
+# Managed by Ansible (conntrack role). Do not edit manually.
+# Applied via `sysctl --system` and persisted across reboots.
+# Note: nf_conntrack_buckets and hashsize are aliases on Linux; final value is hashsize (262144).
+
+net.netfilter.nf_conntrack_max = {{ conntrack_max }}
+net.netfilter.nf_conntrack_buckets = {{ conntrack_buckets }}
+net.netfilter.nf_conntrack_tcp_timeout_close = {{ conntrack_tcp_timeouts.close }}
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = {{ conntrack_tcp_timeouts.close_wait }}
+net.netfilter.nf_conntrack_tcp_timeout_established = {{ conntrack_tcp_timeouts.established }}
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = {{ conntrack_tcp_timeouts.fin_wait }}
+net.netfilter.nf_conntrack_tcp_timeout_last_ack = {{ conntrack_tcp_timeouts.last_ack }}
+net.netfilter.nf_conntrack_tcp_timeout_max_retrans = {{ conntrack_tcp_timeouts.max_retrans }}
+net.netfilter.nf_conntrack_tcp_timeout_syn_recv = {{ conntrack_tcp_timeouts.syn_recv }}
+net.netfilter.nf_conntrack_tcp_timeout_syn_sent = {{ conntrack_tcp_timeouts.syn_sent }}
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = {{ conntrack_tcp_timeouts.time_wait }}
+net.netfilter.nf_conntrack_tcp_timeout_unacknowledged = {{ conntrack_tcp_timeouts.unacknowledged }}

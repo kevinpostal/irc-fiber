@@ -1,0 +1,41 @@
+---
+# IRC Fiber — IRC daemon (Ergo) defaults
+
+# Container restart
+ircd_restart_policy: "unless-stopped"
+
+# Data persistence (ports and image defined in group_vars/all.yml)
+ircd_data_mount: "/ircd-data"
+
+# Network
+ircd_ircfiber_net_alias: "ircd"
+
+# Server identity
+ircd_server_name: "irc.ircfiber.com"
+ircd_network_name: "IRC Fiber"
+ircd_admins:
+  - name: "IRC Fiber Admin"
+    email: "[email protected]"
+
+# Registration
+ircd_allow_registration: true
+ircd_require_sasl: false
+
+# Limits
+ircd_max_channels_per_account: 100
+ircd_max_nicks_per_account: 5
+ircd_message_max_length: 4096
+ircd_ip_limits_connections: 5
+ircd_ip_limits_duration: 10m
+
+# Oper
+ircd_oper_name: "admin"
+ircd_oper_vhost: "staff"
+
+# Default channel users auto-join on connect
+ircd_default_channels: []
+#  - "#ircfiber"
+#  - "#general"
+
+# Logging
+ircd_log_level: "info"

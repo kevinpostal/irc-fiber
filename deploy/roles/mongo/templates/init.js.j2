@@ -1,0 +1,22 @@
+// {{ ansible_managed }}
+// IRC Fiber — Mongo init script
+// Runs once on first boot of the mongo container (when /data/db is empty).
+// Creates the ircfiber database and the app user used by gateway & engine.
+
+const targetDb = '{{ mongo_initdb_database }}';
+const rootUser = '{{ vault_mongo_root_username }}';
+const appUser  = '{{ vault_mongo_app_username }}';
+const appPass  = '{{ vault_mongo_app_password }}';
+
+db = db.getSiblingDB('admin');
+db.auth(rootUser, process.env.MONGO_INITDB_ROOT_PASSWORD);
+
+db = db.getSiblingDB(targetDb);
+db.createUser({
+  user: appUser,
+  pwd: appPass,
+  roles: [
+    { role: 'readWrite', db: targetDb },
+    { role: 'dbAdmin',   db: targetDb }
+  ]
+});

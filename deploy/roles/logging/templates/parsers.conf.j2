@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+# Parsers for Fluent Bit — referenced by fluent-bit.conf via Parsers_File.
+# Separate file required because Fluent Bit 3.x rejects inline [PARSER]
+# sections in the main configuration (they must be in parsers_file).
+
+[PARSER]
+    Name        docker
+    Format      json
+    Time_Key    time
+    Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+    Time_Keep   On
+
+[PARSER]
+    Name        engine_json
+    Format      json
+    Time_Key    time
+    Time_Format %Y-%m-%dT%H:%M:%S.%Lz
+    Time_Keep   On

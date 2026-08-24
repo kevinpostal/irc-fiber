@@ -1,0 +1,714 @@
+{
+  "context_envelope": {
+    "meta": {
+      "plan_id": "20260630-admin-signoz-logs-panel",
+      "created_at": "2026-06-30T21:42:00Z",
+      "last_updated": "2026-06-30T22:30:00Z",
+      "version": 2
+    },
+    "tech_stack": [
+      {
+        "name": "Svelte 5",
+        "version": "5.19.0",
+        "usage_context": "Admin SPA runtime; runes ($state, $derived, $props, $effect) per App.svelte pattern",
+        "config_files": ["frontend/package.json"]
+      },
+      {
+        "name": "TypeScript",
+        "version": "~5.7.3",
+        "usage_context": "Strict typing for signoz.ts, logsStore.ts, logsLiveTail.ts; Svelte 5 props inference",
+        "config_files": ["frontend/tsconfig.json"]
+      },
+      {
+        "name": "Vite",
+        "version": "^6.0.11",
+        "usage_context": "Dev server proxy rules for SigNoz endpoints; build target",
+        "config_files": ["frontend/vite.config.ts"]
+      },
+      {
+        "name": "Vitest",
+        "version": "^4.1.8",
+        "usage_context": "Two projects: lib (node, no DOM) for signoz.ts; client (chromium) for stores and Svelte components",
+        "config_files": ["frontend/vite.config.ts:101-138"]
+      },
+      {
+        "name": "Tailwind 4",
+        "version": "^4.3.1",
+        "usage_context": "Existing admin SPA styling; new components use existing design tokens (bg-surface, text-text, border-border, etc.)",
+        "config_files": ["frontend/vite.config.ts"]
+      },
+      {
+        "name": "SigNoz v0.130 (combined image)",
+        "version": "v0.130+",
+        "usage_context": "REST API on :8080 (signoz-signoz:8080); v5 query builder + v1 services + WS /ws/logs/v5/{orgId}",
+        "config_files": ["deploy/roles/signoz/templates/"]
+      },
+      {
+        "name": "Caddy v2",
+        "version": "v2.x",
+        "usage_context": "Reverse proxy + SIGNOZ-API-KEY header injection on /signoz/* and /api/v1..5/* paths; auto WebSocket upgrade inside reverse_proxy",
+        "config_files": ["deploy/roles/caddy/templates/Caddyfile.j2"]
+      },
+      {
+        "name": "Ansible",
+        "version": "2.x",
+        "usage_context": "signoz_mcp role provisions EDITOR API key file; caddy role renders Caddyfile and reloads caddy container",
+        "config_files": ["deploy/roles/signoz_mcp/tasks/main.yml", "deploy/roles/caddy/tasks/main.yml"]
+      }
+    ],
+    "conventions": [
+      "Svelte 5 runes everywhere (no legacy reactive $: syntax) - see App.svelte and existing admin components",
+      "Stores in frontend/src/admin/stores/*.ts export named writables + fetch function (mirror dashboard.ts)",
+      "Pure utility modules in frontend/src/lib/*.ts have no Svelte dependency and run in the lib project (node, fast)",
+      "Client tests run in headless chromium with fileParallelism:false - keep fixtures deterministic",
+      "Toast pattern via stores/ui.ts toast/toastError/toastWarn - ToastViewport mounted once at App.svelte level",
+      "localStorage keys prefixed with ircfiber:admin: to namespace admin modules",
+      "Persisted-store pattern: persisted(key, initial) factory in stores/ui.ts:8-19 wraps writable + localStorage",
+      "ASCII-only in code/edit output - no curly quotes, em-dashes, smart characters",
+      "Existing focus guard pattern: <svelte:window onkeydown={handler} /> with target.tagName check (see NetworkForm.svelte:199)"
+    ],
+    "constraints": {
+      "hard": [
+        "SIGNOZ-API-KEY must NEVER appear in browser-side code or cURL export (Caddy injects server-side only)",
+        "All log API calls use relative URLs (/api/... not https://signoz.../api/...)",
+        "No new npm dependency without explicit user approval - roll offset-based virtualization in-house",
+        "WS reconnect backoff must cap at 30s and stop after 10 consecutive failures (prevent reconnect storms)",
+        "Component tests must use vitest client project (chromium) and follow fileParallelism:false rule",
+        "Lib tests must use vitest lib project (node) - signoz.ts must not import from svelte/",
+        "AGENTS.md section must explain WHY iframe was abandoned (failed Caddy fixes at 7795a73 + 287d089) to prevent re-litigation"
+      ],
+      "soft": [
+        "Prefer pure functions in lib/ over classes (matches fuzzyMatch.ts, autolinker.ts style)",
+        "Prefer Svelte 5 derived stores over manual subscriptions",
+        "Prefer template strings for cURL format (readable + grep-friendly)",
+        "Consider future SavedView backend migration - keep savedViews.ts API stable"
+      ],
+      "compatibility": [
+        "Svelte 5 runes ($state, $derived, $props, $effect) only - no $: reactive statements in new code",
+        "SigNoz API contract pinned to v0.130 - if upgraded, audit endpoint paths and WS payload format",
+        "Hash-based router (no SvelteKit) - use admin/lib/router.ts match/navigate primitives",
+        "Tailwind 4 with @theme tokens (no raw color values)"
+      ],
+      "security_requirements": [
+        "SIGNOZ-API-KEY is server-side only - Caddy injects via header_up; browser never sees it",
+        "Saved views are user-local (localStorage) - no shared server-side persistence in v1",
+        "WS connection uses same-origin /signoz/ws/logs/* path - inherits Caddy SIGNOZ-API-KEY injection",
+        "cURL export omits any auth header (server-side injection only)"
+      ]
+    },
+    "architecture_snapshot": {
+      "key_dirs": [
+        "frontend/src/lib - pure utility modules (no Svelte deps); lib project test target",
+        "frontend/src/admin/stores - writable stores + fetch functions; client project test target",
+        "frontend/src/admin/components - reusable Svelte components (Cards, KpiCards, ToastViewport)",
+        "frontend/src/admin/components/logs - NEW directory for Logs panel components",
+        "frontend/src/admin/pages - top-level pages (Dashboard, Servers, Logs, etc.); App.svelte router",
+        "frontend/src/admin/lib - admin-specific utils (api-client with {ok,data} envelope, format, router)",
+        "deploy/roles/caddy - Caddy v2 reverse proxy + TLS + SIGNOZ-API-KEY header injection",
+        "deploy/roles/signoz_mcp - SigNoz API key provisioning (EDITOR service account)"
+      ],
+      "patterns": [
+        "Mirror dashboard.ts store pattern: named writable exports + named fetch fn + lastFetchedAt guard",
+        "Mirror polling.ts polling pattern (NOT used here; debounce only, but reference for global toggles)",
+        "Mirror notifications.ts/lib pattern: pure functions + vi.stubGlobal for tests",
+        "Mirror ConfirmDialog.svelte modal pattern for FilterCheatsheet.svelte",
+        "Mirror NetworkForm.svelte svelte:window onkeydown pattern for keyboard shortcuts",
+        "Mirror MessageList.svelte scroll-windowing concept (much simpler - fixed row height, no key tracking)"
+      ],
+      "key_components": [
+        {
+          "name": "signoz.ts",
+          "location": "frontend/src/lib/signoz.ts (NEW)",
+          "responsibility": [
+            "Pure typed fetch wrapper for /api/v5/query_range",
+            "Pure typed fetch wrapper for /api/v1/services, /api/v1/logs/fields, /api/v1/values",
+            "Pure typed fetch wrapper for /api/v1/user (org ID discovery)",
+            "wsUrl(orgId) helper for live-tail connection",
+            "ApiError class with status code passthrough",
+            "15s default timeout, AbortSignal support"
+          ]
+        },
+        {
+          "name": "logsStore.ts",
+          "location": "frontend/src/admin/stores/logsStore.ts (NEW)",
+          "responsibility": [
+            "LogsState writable (query, services, severities, timeRange, results, loading, error, live, wsReady, expandedRowIds, lastQueryBody)",
+            "Debounced runQuery (200ms coalescing)",
+            "cancelQuery aborts in-flight AbortController",
+            "Persists lastQuery to localStorage ircfiber:admin:logs:lastQuery"
+          ]
+        },
+        {
+          "name": "logsLiveTail.ts",
+          "location": "frontend/src/admin/stores/logsLiveTail.ts (NEW)",
+          "responsibility": [
+            "WebSocket connection management for /signoz/ws/logs/v5/{orgId}",
+            "Exponential backoff 1s->30s with +/-20% jitter, 10-failure cap",
+            "ready + error writables for toolbar status pill",
+            "Idempotent start/stop"
+          ]
+        },
+        {
+          "name": "savedViews.ts",
+          "location": "frontend/src/admin/stores/savedViews.ts (NEW)",
+          "responsibility": [
+            "localStorage CRUD for SavedView records",
+            "LRU prune at 50 entries with toast warning",
+            "Stable API surface for future SigNoz SavedView backend"
+          ]
+        },
+        {
+          "name": "LogRow.svelte",
+          "location": "frontend/src/admin/components/logs/LogRow.svelte (NEW)",
+          "responsibility": [
+            "Renders timestamp / severity chip / service / truncated body / trace_id link",
+            "Expand toggle for inline JSON pretty-print",
+            "Severity tone class per level (debug/info/warn/error/fatal)"
+          ]
+        },
+        {
+          "name": "LogTable.svelte",
+          "location": "frontend/src/admin/components/logs/LogTable.svelte (NEW)",
+          "responsibility": [
+            "Offset-based virtualization (fixed 32px row height + 20-row overscan)",
+            "scrollTop -> startIndex derivation",
+            "Manages expandedRowIds state for inline JSON",
+            "Auto-scroll on first live emit, scroll-restoration debounce"
+          ]
+        },
+        {
+          "name": "LogsToolbar.svelte",
+          "location": "frontend/src/admin/components/logs/LogsToolbar.svelte (NEW)",
+          "responsibility": [
+            "Query text input + service multi-select + severity chips + time picker + live toggle",
+            "Copy-as-cURL button (clipboard API, no auth header)",
+            "Live status pill (Live / Reconnecting / Live unavailable)"
+          ]
+        },
+        {
+          "name": "FilterCheatsheet.svelte",
+          "location": "frontend/src/admin/components/logs/FilterCheatsheet.svelte (NEW)",
+          "responsibility": [
+            "Modal overlay listing supported SigNoz log filter fields with examples",
+            "Triggered by ? keypress; closes on Esc or backdrop click",
+            "role=dialog, aria-modal=true, focus trap"
+          ]
+        },
+        {
+          "name": "Logs.svelte",
+          "location": "frontend/src/admin/pages/Logs.svelte (REWRITE)",
+          "responsibility": [
+            "PageHeader with title + Open SigNoz link to http://100.126.197.92:3003/logs",
+            "View dropdown + Save view button (driven by savedViews)",
+            "Hosts LogsToolbar + LogTable in Card",
+            "Empty / loading / error states with reset and retry",
+            "Auth failure -> toastError('SigNoz API key may have been rotated...')",
+            "Keyboard shortcuts (/, Esc, ?) via svelte:window onkeydown"
+          ]
+        }
+      ]
+    },
+    "research_digest": {
+      "relevant_files": [
+        {
+          "path": "frontend/src/admin/pages/Logs.svelte",
+          "purpose": ["Current placeholder - to be rewritten (only has tailnet listener link)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/caddy/templates/Caddyfile.j2",
+          "purpose": ["Caddyfile that already proxies /api/v1..5/* + /signoz/* with SIGNOZ-API-KEY header"],
+          "confidence": 1.0
+        },
+        {
+          "path": "deploy/roles/signoz_mcp/tasks/main.yml",
+          "purpose": ["Provisions the EDITOR service-account SIGNOZ-API-KEY used by Caddy"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/vite.config.ts",
+          "purpose": ["Current dev proxy block; missing SigNoz-specific routes (gap)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/admin/lib/api-client.ts",
+          "purpose": ["Existing admin API client with {ok,data} envelope unwrap - NOT used by signoz.ts (SigNoz API does not use envelope)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/admin/stores/dashboard.ts",
+          "purpose": ["Store pattern reference (named writables + fetch fn + lastFetchedAt guard)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/admin/stores/polling.ts",
+          "purpose": ["Polling helper pattern (not used in logs; debounce only)"],
+          "confidence": 0.9
+        },
+        {
+          "path": "frontend/src/admin/stores/ui.ts",
+          "purpose": ["toast/toastError/toastSuccess helpers + persisted() factory"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/admin/components/EmptyState.svelte",
+          "purpose": ["Empty-state component pattern"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/admin/components/Card.svelte",
+          "purpose": ["Card pattern for table container"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/admin/components/PageHeader.svelte",
+          "purpose": ["PageHeader with actions slot"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/admin/components/ToastViewport.svelte",
+          "purpose": ["Toast viewport (already mounted at app shell)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/admin/App.svelte",
+          "purpose": ["Router already wires match('/logs', path) -> Logs page (line 49)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/components/MessageList.svelte",
+          "purpose": ["Existing scroll-windowing reference (much heavier than what LogTable needs)"],
+          "confidence": 0.8
+        },
+        {
+          "path": "frontend/src/lib/fuzzyMatch.ts",
+          "purpose": ["Pattern for pure-function lib modules (eligible for lib project tests)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "frontend/src/lib/notifications.test.ts",
+          "purpose": ["vi.stubGlobal pattern reference for lib tests"],
+          "confidence": 1.0
+        },
+        {
+          "path": "docs/OBSERVABILITY.md",
+          "purpose": ["SigNoz API contracts and curl examples (lines 220-310)"],
+          "confidence": 1.0
+        },
+        {
+          "path": "AGENTS.md",
+          "purpose": ["Existing 'Admin -> SigNoz logs integration' section to be rewritten"],
+          "confidence": 1.0
+        }
+      ],
+      "patterns_found": [
+        {
+          "name": "Pure utility lib pattern",
+          "category": "frontend-architecture",
+          "confidence": 1.0,
+          "example_location": ["frontend/src/lib/fuzzyMatch.ts", "frontend/src/lib/autolinker.ts"]
+        },
+        {
+          "name": "Named writables + named fetch function store pattern",
+          "category": "frontend-architecture",
+          "confidence": 1.0,
+          "example_location": ["frontend/src/admin/stores/dashboard.ts", "frontend/src/admin/stores/redis.ts"]
+        },
+        {
+          "name": "Hash-based router with match/navigate primitives",
+          "category": "frontend-architecture",
+          "confidence": 1.0,
+          "example_location": ["frontend/src/admin/lib/router.ts"]
+        },
+        {
+          "name": "Persisted writable factory (localStorage-backed)",
+          "category": "frontend-architecture",
+          "confidence": 1.0,
+          "example_location": ["frontend/src/admin/stores/ui.ts:8-19"]
+        },
+        {
+          "name": "svelte:window onkeydown with focus guard",
+          "category": "frontend-ux",
+          "confidence": 0.9,
+          "example_location": ["frontend/src/components/NetworkForm.svelte:199", "frontend/src/components/SettingsPage.svelte:31"]
+        },
+        {
+          "name": "Toast pattern via stores/ui.ts",
+          "category": "frontend-ux",
+          "confidence": 1.0,
+          "example_location": ["frontend/src/admin/stores/ui.ts:69-83"]
+        },
+        {
+          "name": "Modal overlay with focus trap",
+          "category": "frontend-ux",
+          "confidence": 0.8,
+          "example_location": ["frontend/src/admin/components/ConfirmDialog.svelte"]
+        },
+        {
+          "name": "Windowed scroll rendering with renderStart + scrollTop",
+          "category": "frontend-perf",
+          "confidence": 0.7,
+          "example_location": ["frontend/src/components/MessageList.svelte:178-280"]
+        }
+      ],
+      "gotchas": [
+        {
+          "text": "Caddy already injects SIGNOZ-API-KEY on /signoz/* and /api/v1..5/* paths - do NOT add a client-side header",
+          "confidence": 1.0
+        },
+        {
+          "text": "Frontend vite dev proxy currently sends /api/* to the gateway (127.0.0.1:8090) which does NOT proxy SigNoz - confirmed via curl returning 404; need new Vite proxy rules for /api/v1..5/* + /signoz/*",
+          "confidence": 1.0
+        },
+        {
+          "text": "SigNoz REST API does NOT use the {ok,data} envelope that the gateway uses - signoz.ts must NOT use admin/lib/api-client.ts (raw fetch + ApiError only)",
+          "confidence": 1.0
+        },
+        {
+          "text": "Existing Logs.svelte hard-codes http://100.126.197.92:3003/ as tailnet URL - keep this string but update target to /logs (not just /)",
+          "confidence": 1.0
+        },
+        {
+          "text": "Frontend admin SPA is hash-based (no SvelteKit) - trace_id links go directly to SigNoz, not a SvelteKit route",
+          "confidence": 1.0
+        },
+        {
+          "text": "Two previous Caddy fixes (commits 7795a73, 287d089) attempted to make the iframe work; the underlying SigNoz v0.130 React bundle bootstrap problem is unfixable at the Caddy layer (session JWT requirement) - this is WHY we are replacing the iframe with a native panel",
+          "confidence": 1.0
+        },
+        {
+          "text": "WS endpoint /signoz/ws/logs/v5/{orgId} routes through the existing /signoz/* handle_path - Caddy v2 reverse_proxy auto-handles the Upgrade header; no new Caddy block expected, but w3-t3 must verify with a real curl test",
+          "confidence": 0.85
+        },
+        {
+          "text": "LoadingSkeleton.svelte is a full-page IRCCloud-equivalent main-spin - NOT suitable for inline table loading; w2-t4 / w4-t2 must roll a small inline skeleton (32px grey bars)",
+          "confidence": 1.0
+        },
+        {
+          "text": "There are no admin component tests yet (glob pattern returns 0 files) - first batch of admin tests will be created in this plan",
+          "confidence": 1.0
+        },
+        {
+          "text": "Local SigNoz is NOT running on this dev machine (curl 127.0.0.1:8080 -> connection refused) - dev proxy needs VITE_SIGNOZ_URL env var to point at the right target",
+          "confidence": 1.0
+        },
+        {
+          "text": "WebSocket auto-reconnect with exponential backoff must cap at 30s and stop after 10 consecutive failures to prevent reconnect storms during SigNoz restart",
+          "confidence": 1.0
+        },
+        {
+          "text": "AGENTS.md currently documents the iframe-based Logs.svelte architecture; w4-t4 rewrites that section to describe the new native-panel design and WHY the iframe was abandoned",
+          "confidence": 1.0
+        }
+      ]
+    },
+    "prior_decisions": [
+      {
+        "decision": "Architecture = Option D: native Svelte logs panel + tailnet fallback link",
+        "rationale": [
+          "Iframe failed because SigNoz v0.130 React bundle bootstraps a session JWT that cannot be header-replayed (Caddy SIGNOZ-API-KEY injection only carries the API key, not a session cookie)",
+          "Two prior Caddy-side fixes (commits 7795a73, 287d089) addressed asset routing but the bundle bootstrap problem is unfixable at the Caddy layer",
+          "Native panel keeps the operator in the admin shell for common tasks (filter, paginate, time range, severity, expand row) while the tailnet fallback link to /logs gives access to advanced features (saved views, pivots, anomalies) without leaving the workflow entirely"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "All log API calls go through relative /api/... URLs (not absolute)",
+        "rationale": [
+          "Caddy reverse-proxies /api/v1..5/* to signoz-signoz:8080 with SIGNOZ-API-KEY header injection - browser never needs to know the host or the key",
+          "Same-origin requests inherit the admin session cookie so 401 surfaces the right toast",
+          "Production and dev use the same code path - only the Vite dev proxy differs"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Live-tail uses WebSocket through /signoz/ws/logs/v5/{orgId} (not direct TCP)",
+        "rationale": [
+          "Browser WebSocket API is the only transport available; raw TCP is not feasible",
+          "Routing through /signoz/ws/logs/* means the same Caddy SIGNOZ-API-KEY header injection applies to WS upgrade requests (Caddy v2 reverse_proxy forwards auth headers on WS upgrade by default)",
+          "v1 fallback /ws/logs/tail documented as a contingency"
+        ],
+        "confidence": 0.9
+      },
+      {
+        "decision": "Saved views are localStorage-only in v1 (no SigNoz SavedView backend wiring)",
+        "rationale": [
+          "User requirement: localStorage is acceptable for v1",
+          "Stable API surface (listViews/saveView/loadView/deleteView) means the future SavedView backend can be a drop-in replacement",
+          "Avoids extra API calls and SigNoz permission complications in v1"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Roll offset-based virtualization in-house (no new svelte-virtual-list dep)",
+        "rationale": [
+          "Log rows are uniform-height (32px) - simple offset math is sufficient",
+          "MessageList.svelte's key-based windowing is overkill for uniform rows",
+          "Avoids adding a dependency that may have a different reactivity model (svelte-virtual-list was built for Svelte 3/4 and may not use Svelte 5 runes natively)",
+          "Anti-overplanning: minimum viable solution satisfies the requirement"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Frontend never sees SIGNOZ-API-KEY; only Caddy injects it server-side",
+        "rationale": [
+          "Caddy header_up SIGNOZ-API-KEY {$SIGNOZ_API_KEY} on /signoz/* and /api/v1..5/* handles all auth at the edge",
+          "Browser-side keys would be extractable via devtools and visible in any cURL export - security regression",
+          "cURL export omits the header intentionally (Caddy injects on the wire)"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "decision": "Vite dev proxy adds SigNoz-specific rules BEFORE the catch-all /api rule",
+        "rationale": [
+          "Vite proxy rules are first-match-wins for path prefixes",
+          "Gateway (BACKEND_URL) does not speak SigNoz protocol so /api/v1/services 404s when proxied there",
+          "New rules target a configurable VITE_SIGNOZ_URL (default http://127.0.0.1:8080) - operators on the tailnet set this to the deployed SigNoz"
+        ],
+        "confidence": 1.0
+      }
+    ],
+    "reuse_notes": [
+      {
+        "path": "frontend/src/admin/stores/dashboard.ts",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/admin/stores/ui.ts",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/admin/lib/api-client.ts",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/admin/lib/router.ts",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/admin/lib/format.ts",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/admin/components/EmptyState.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/admin/components/Card.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/admin/components/PageHeader.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/admin/components/ToastViewport.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/admin/App.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/lib/fuzzyMatch.ts",
+        "trust": "high"
+      },
+      {
+        "path": "deploy/roles/caddy/templates/Caddyfile.j2",
+        "trust": "high"
+      },
+      {
+        "path": "deploy/roles/signoz_mcp/tasks/main.yml",
+        "trust": "high"
+      },
+      {
+        "path": "docs/OBSERVABILITY.md",
+        "trust": "high"
+      },
+      {
+        "path": "AGENTS.md",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/components/MessageList.svelte",
+        "trust": "medium"
+      },
+      {
+        "path": "frontend/src/components/LoadingSkeleton.svelte",
+        "trust": "low"
+      },
+      {
+        "path": "frontend/src/admin/lib/safety.ts",
+        "trust": "low"
+      }
+    ],
+    "learned_from_review": {
+      "summary": "Reviewer + critic findings from the first pass (2026-06-30). Captured here so future plans can apply the same validation discipline without re-discovering the issues.",
+      "version": 1,
+      "findings": [
+        {
+          "id": "REV-001",
+          "severity": "blocker",
+          "category": "verification-before-build",
+          "title": "Never assume an external endpoint is reachable - prove it with a BLOCKER preflight before building on top",
+          "lesson": "The original plan assumed /signoz/ws/logs/v5/{orgId} works against live SigNoz without verification. If the WS contract is wrong or Caddy does not route correctly, every downstream task (logsLiveTail.ts, w3-t2 wire, etc.) wastes weeks. Future plans that depend on any external service MUST include a verification script (curl / openssl / kafkacat / mongosh) that exits non-zero on failure with a SPECIFIC remediation message keyed off the failure mode (connection refused vs 404 vs 502 vs 401).",
+          "applied_in": "w3-t0-ws-preflight (BLOCKER preflight), w1-t5-deploy-assertion (stack smoke test)"
+        },
+        {
+          "id": "REV-002",
+          "severity": "major",
+          "category": "virtualization-invariant",
+          "title": "Offset-based virtualization is fragile when row content varies - use overlay UI for content expansion",
+          "lesson": "A fixed-row-height + overscan virtualization breaks the moment any row's content exceeds the fixed height (offset math becomes wrong for every subsequent row). The fix is to render content expansion as an absolutely-positioned overlay (anchored to the row's viewport position, dismissable on Esc / backdrop click / X button) rather than inline row expansion. The overlay sits in its own stacking context and does not affect the table's virtualization math. Tests should explicitly assert the table's height is invariant under expand-collapse cycles.",
+          "applied_in": "w2-t1 (split into LogRow + LogTable + JsonDrawer.svelte overlay)"
+        },
+        {
+          "id": "REV-003",
+          "severity": "minor",
+          "category": "explicit-enums",
+          "title": "Lock state-machine enums in the plan - implementers should not have to guess",
+          "lesson": "When a component renders state from a store (status pill, connection indicator, retry counter), the plan should specify the EXACT enum the implementer should use. The original plan said 'Live / Reconnecting / Live unavailable' (3 strings, vague semantics); the fix is to enumerate all 5 states explicitly: 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'. TypeScript string literal unions over enums (better tree-shaking and matches the codebase's style).",
+          "applied_in": "w3-t1-live-tail-store status writable contract"
+        },
+        {
+          "id": "REV-004",
+          "severity": "minor",
+          "category": "url-centralisation",
+          "title": "Hard-coded URLs in plans get duplicated - centralise into a tiny module at first use",
+          "lesson": "When a plan introduces a new hard-coded URL constant (IP, port, host), put it in a small typed module (frontend/src/admin/lib/{name}.ts) at the FIRST task that uses it, not later. The plan should explicitly call out the module so downstream tasks import from it instead of re-hard-coding. Saves a future grep-and-replace when the URL changes.",
+          "applied_in": "w1-t3 creates frontend/src/admin/lib/signozUrl.ts (TAILNET_SIGNOZ_URL + TAILNET_SIGNOZ_LOGS_URL)"
+        },
+        {
+          "id": "REV-005",
+          "severity": "minor",
+          "category": "graph-metadata-accuracy",
+          "title": "DAG summary numbers must match reality - fix the count before review #2",
+          "lesson": "The first plan reported wave_1_task_count: 4 and total_dependencies: 8, both wildly wrong (actual: 15 tasks, 23 edges). Fix the summary numbers before sending the plan to review - a wrong DAG metric destroys reviewer trust. The 'Don't fix every math reference' rule means fix the two headline numbers (task_count, dep_count) and let downstream numbers sort themselves out.",
+          "applied_in": "plan_metrics corrected to wave_1_task_count: 6, total_dependencies: 35 (actual)"
+        },
+        {
+          "id": "REV-006",
+          "severity": "minor",
+          "category": "conflicts-with-scope",
+          "title": "conflicts_with entries only make sense within the same wave - drop cross-wave noise",
+          "lesson": "Wave ordering already enforces serial execution across waves. conflicts_with entries that span different waves are noise - they cannot trigger because the downstream wave cannot start until the upstream wave is done. Keep conflicts_with only for true intra-wave resource contention (e.g. two tasks both writing to the same file with no merge strategy).",
+          "applied_in": "Removed w2-t4 <-> w4-t1 cross-wave conflicts"
+        },
+        {
+          "id": "REV-007",
+          "severity": "counter-critique",
+          "category": "yagni-vs-enterprise",
+          "title": "YAGNI vs full enterprise solution - user request wins",
+          "lesson": "A critic suggested cutting Copy-as-cURL and Saved Views for YAGNI. Disagree - the user explicitly asked for a full enterprise solution. Small-LOC features (cURL = 20 LOC, saved views = 60 LOC) that provide disproportionate operator value should be KEPT when explicitly requested. Document the judgement so future plans do not re-litigate the cut.",
+          "applied_in": "Both features kept - Copy-as-cURL in w4-t3, Saved Views in w1-t4"
+        },
+        {
+          "id": "REV-008",
+          "severity": "operational-gap",
+          "category": "fail-open-config",
+          "title": "Caddyfile conditional skip is fail-open - document the operational gap explicitly",
+          "lesson": "The signoz_mcp role is conditional in the Caddyfile template - if /etc/ircfiber/signoz-mcp/.api_key is missing on first run, the /signoz/* route block is skipped (no startup error, just no proxy). This is a fail-open configuration that surfaces as a silent 404 in production. The plan must explicitly call out this gap (in relevant_context + pre_mortem) so operators know to run signoz_mcp first.",
+          "applied_in": "Updated relevant_context.vite_dev_proxy_gap + added pre_mortem failure mode"
+        }
+      ]
+    },
+    "relevant_context": {
+      "what_already_deployed": {
+        "caddy_signoz_proxy": "deploy/roles/caddy/templates/Caddyfile.j2:36-97 - handle_path /signoz and /signoz/* plus named matchers @signoz_api (/api/v[1-5]/*) and @signoz_static (/assets/index-* /css/*); all proxy to signoz-signoz:8080 with header_up SIGNOZ-API-KEY {$SIGNOZ_API_KEY}. Confirmed working by docs/OBSERVABILITY.md curl smoke test (line 243).",
+        "signoz_mcp_api_key_provisioning": "deploy/roles/signoz_mcp/tasks/main.yml - provisions an EDITOR-role service-account SIGNOZ-API-KEY on first run, persists to /etc/ircfiber/signoz-mcp/.api_key (mode 0600), reloads ircfiber-caddy after rotation. Idempotent re-runs reuse the existing key if it validates against /api/v1/user.",
+        "admin_logs_route_registered": "frontend/src/admin/App.svelte:49 - match('/logs', path) already maps to <Logs />. Hash-based router, no SvelteKit.",
+        "iframe_architecture_to_be_replaced": "frontend/src/admin/pages/Logs.svelte (current) - 54 lines; only renders the placeholder text and an 'Open SigNoz' link to http://100.126.197.92:3003/. Comment in the file explicitly notes the iframe failure.",
+        "tailwind_tokens": "frontend design tokens available: bg-surface, bg-surface-2, text-text, text-heading, text-muted, border-border, primary, success, warn, danger, info, accent. Per AGENTS.md conventions - use tokens, no raw colors."
+      },
+      "prior_failed_iframe_attempts": [
+        {
+          "commit": "3fb78d4",
+          "title": "feat(deploy): admin logs routed through SigNoz via Caddy header injection",
+          "intent": "Iframe SigNoz UI at /signoz/logs; Caddy injects SIGNOZ-API-KEY on iframe document and absolute /api/v1/... requests.",
+          "outcome": "Initial deployment; SigNoz UI bootstraps but immediately renders the cloud-icon error page because the React bundle requires a session JWT."
+        },
+        {
+          "commit": "7795a73",
+          "title": "fix(deploy): proxy SigNoz API and asset paths from root",
+          "intent": "Add @signoz_api (/api/v[1-3]/*) and @signoz_static (/assets/* /css/*) matchers so absolute API calls and asset bundles proxy to SigNoz.",
+          "outcome": "Caused regression: /assets/* intercepted admin SPA bundles (admin-*.js, legacy-*.js, main-*.js, admin-*.css). SigNoz returned its SPA HTML for unmatched assets, breaking the admin app."
+        },
+        {
+          "commit": "287d089",
+          "title": "fix(deploy): scope SigNoz static proxy to index-* bundles",
+          "intent": "Fix the regression in 7795a73 by scoping @signoz_static to /assets/index-* (SigNoz's hashed bundle prefix).",
+          "outcome": "Asset collision fixed; the admin SPA loads correctly. But the underlying problem remains: SigNoz React bundle still fails to bootstrap a session JWT from the SIGNOZ-API-KEY header. The iframe still shows the cloud-icon error page."
+        }
+      ],
+      "why_iframe_unfixable": [
+        "SigNoz v0.130 combined image serves a React SPA that bootstraps a session JWT in client-side state.",
+        "The session JWT is issued by /api/v2/sessions/email_password after interactive login; it cannot be replayed by a static SIGNOZ-API-KEY header.",
+        "Caddy can inject the API key but cannot fabricate a session JWT without the login flow.",
+        "Adding a Caddy-side login proxy (POST /api/v2/sessions on each iframe load) was considered but would: (a) leak the admin password into the Caddyfile, (b) hit session-rate-limits, (c) break on every SigNoz version bump when the login API contract changes.",
+        "Conclusion: replace the iframe with a native panel that uses the same /api/v1..5/* API the iframe would have used, but rendered in Svelte 5 without depending on SigNoz's React bundle."
+      ],
+      "architecture_decision_record": {
+        "option_considered": "Option D (user selection)",
+        "components": [
+          "Native Svelte 5 logs panel (this plan)",
+          "Tailnet fallback link to http://100.126.197.92:3003/logs for advanced features",
+          "LocalStorage saved views in v1 (future: SigNoz SavedView backend)"
+        ],
+        "rationale": [
+          "Operator stays in the admin shell for the 95% case (filter, paginate, time range, severity, expand row).",
+          "Tailnet fallback provides the full SigNoz UI for the 5% case (saved views, pivots, anomalies) without re-implementing them in Svelte.",
+          "No third-party React bundle dependency in the admin SPA."
+        ]
+      },
+      "signoz_endpoint_surface": {
+        "rest_v5_logs": "POST /api/v5/query_range with compositeQuery.queryType=builder and builder queries; returns rows in result.results[A].rows or .series",
+        "rest_v1_services": "GET /api/v1/services -> {data: [{serviceName: '...'}, ...]} per docs/OBSERVABILITY.md:238",
+        "rest_v1_user": "GET /api/v1/user -> {data: {orgId: '...', email: '...', role: '...'}} for org ID discovery (WS URL construction)",
+        "rest_v1_logs_fields": "GET /api/v1/logs/fields -> list of field names with types (resource/attribute/body) for query builder dropdowns",
+        "rest_v1_field_values": "GET /api/v1/values/?... with name, searchText, etc. -> list of distinct values for a field",
+        "ws_live_tail_v5": "WS /ws/logs/v5/{orgId}?filter=<expr>&start=<ms>&end=<ms> -> server pushes log rows as JSON messages",
+        "ws_live_tail_v1_fallback": "WS /ws/logs/tail (older endpoint, listed as fallback if v5 contract changes)",
+        "all_paths_use_relative_urls": true,
+        "caddy_injects_signoz_api_key": true,
+        "caddy_injects_on_paths": [
+          "/signoz",
+          "/signoz/*",
+          "/api/v1/*",
+          "/api/v2/*",
+          "/api/v3/*",
+          "/api/v4/*",
+          "/api/v5/*"
+        ]
+      },
+      "vite_dev_proxy_gap": {
+        "current_state": "frontend/vite.config.ts:69-76 proxies /api to BACKEND_URL (default http://127.0.0.1:8090, the gateway). Gateway does not proxy SigNoz API. Confirmed via `curl -sS -m 5 -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8090/api/v1/services` returning 404.",
+        "fix_in_wave_1": "Add more-specific Vite proxy rules for /api/v1/, /api/v2/, /api/v3/, /api/v4/, /api/v5/, /signoz/ targeting VITE_SIGNOZ_URL (default http://127.0.0.1:8080). Rules must precede the catch-all /api rule.",
+        "env_var": "VITE_SIGNOZ_URL - if unset, panel renders 'SigNoz URL not configured - set VITE_SIGNOZ_URL' empty state (no crash).",
+        "ws_in_dev": "/signoz/ rule must have ws:true so WebSocket upgrades work in dev.",
+        "caddyfile_conditional_skip_risk": "The /signoz/* handle_path block in deploy/roles/caddy/templates/Caddyfile.j2 is CONDITIONAL on /etc/ircfiber/signoz-mcp/.api_key existing on the host. If signoz_mcp role has not run yet (or the file was deleted), ircfiber-caddy boots successfully but /signoz/* returns 404 - no startup error, no diagnostic. This is a fail-open operational gap. Mitigation: w1-t5-deploy-assertion probes /signoz/api/v1/services and surfaces a specific remediation message ('signoz_mcp role has not run on this host - run ansible-playbook playbooks/signoz_mcp.yml'). w3-t3-caddy-ws-audit also validates the Caddyfile route block is present."
+      },
+      "open_questions_pending_user_signoff": [
+        {
+          "question": "Tailnet listener URL hard-coded as http://100.126.197.92:3003 - confirm this is still the right address (deploy/roles/caddy/templates/Caddyfile.j2:178 default).",
+          "status": "RESOLVED",
+          "resolution": "Centralised into frontend/src/admin/lib/signozUrl.ts (created in w1-t3) exporting TAILNET_SIGNOZ_URL and TAILNET_SIGNOZ_LOGS_URL. If the IP changes in the future, only one file needs updating - downstream imports stay stable. 'Open SigNoz ↗' link target is now /logs (not just /)."
+        },
+        {
+          "question": "Default severity filter (WARN+ERROR) - confirm; an alternative is DEBUG+INFO+WARN+ERROR+FATAL (show all) for first impression.",
+          "status": "OPEN",
+          "context": "Affects first-impression UX. Currently locked at WARN+ERROR in w1-t2 (logsStore defaults) and w2-t2 (toolbar chip initial state). User has not explicitly confirmed. If 'show all' preferred, change the default in logsStore.resetFilters() and the LogsToolbar initial chip selection."
+        },
+        {
+          "question": "Default time range (5m vs 15m vs 1h) for the Logs panel - 5m matches the 'live' vibe; 1h matches the 'investigate' vibe. User request implies 5m-24h range picker is fine; default unclear.",
+          "status": "OPEN",
+          "context": "Locked at 5m in w1-t2 (logsStore.resetFilters default) and w2-t2 (LogsToolbar preset). User has not explicitly confirmed. If 'investigate' preferred, change the default in logsStore.resetFilters() and the LogsToolbar's active preset."
+        },
+        {
+          "question": "Saved views retention - 50 LRU prune cap; could be higher (200, 1000). User did not specify.",
+          "status": "OPEN",
+          "context": "Locked at 50 in w1-t4 (savedViews.ts) per minimum-viable-plan rule. If user needs more, bump the cap constant in savedViews.ts. Most operators accumulate 5-20 views in practice - 50 is a comfortable ceiling."
+        }
+      ]
+    }
+  }
+}

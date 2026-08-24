@@ -1,0 +1,52 @@
+---
+- name: Healthcheck the public endpoint
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check public /health
+      ansible.builtin.uri:
+        url: "https://{{ ircfiber_domain }}/health"
+        validate_certs: true
+        status_code: 200
+        timeout: 10
+      register: health
+      failed_when: false
+      retries: 3
+      delay: 5
+      until: health.status | default(0) == 200
+
+    - name: Check public /api/health
+      ansible.builtin.uri:
+        url: "https://{{ ircfiber_domain }}/api/health"
+        validate_certs: true
+        status_code: 200
+        timeout: 10
+      register: api_health
+      failed_when: false
+      retries: 3
+      delay: 5
+      until: api_health.status | default(0) == 200
+
+    - name: Check engine registration (requires login)
+      ansible.builtin.uri:
+        url: "https://{{ ircfiber_domain }}/api/servers"
+        validate_certs: true
+        status_code: [200, 401]
+        timeout: 10
+      register: servers
+      failed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: |
+          /health     -> {{ health.status | default('NO RESPONSE') }}
+          /api/health -> {{ api_health.status | default('NO RESPONSE') }}
+          /api/servers-> {{ servers.status | default('NO RESPONSE') }}
+
+    - name: Fail if any check failed
+      ansible.builtin.fail:
+        msg: "One or more health checks failed"
+      when:
+        - (health.status | default(0)) != 200
+        - (api_health.status | default(0)) != 200

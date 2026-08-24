@@ -1,0 +1,1811 @@
+plan_id: 20260716-irccloud-parity
+objective: Make the IRC Fiber "Connecting / Server log" surface (ConnectionStatus banner + ServerLogTimeline) match IRCCloud's information density, error rendering, and visual restraint — without cloning IRCCloud's brand. Bridge the existing `disconnectReason` string to a structured `failInfo` payload emitted by the engine, render every connection-attempt phase under one persistent hairline-bar connection-events panel, render IRCCloud-style suspicious-host / suspicious-port warnings inline, and replace the cyan-chip + cyan-stripe welcome / MOTD styling with type_info_response / type_motd_response rows that match the IRCCloud visual grammar while keeping the fiber palette.
+created_at: '2026-07-16T18:00:00Z'
+created_by: gem-planner
+status: pending
+tldr: |
+  Three cohesive UX gaps between fiber and IRCCloud converge on one plan:
+
+  (1) ConnectionStatus is a 3-state banner that silently drops a lot of information IRCCloud
+  surfaces in the same area — 11 connection phases, an ordinal "Nth attempt" label, a 1s
+  countdown via setInterval, structured failInfo (pool_lost / nxdomain / econnrefused /
+  ssl_certificate_error / killed_reason), suspicious-port + suspicious-hostname warnings,
+  IRCCloud's hairline-bar visual treatment, and a state-aware button (reconnect | disconnect
+  | upgrade). The engine already has all the data — applyIsupport already emits structured
+  events; the 005-handler already mirrors failInfo fields — but the connection.d reconnect
+  loop and the engine's snapshot path don't surface them, and the frontend banner doesn't
+  render them.
+
+  (2) ServerLogTimeline currently dumps phase / notice / motd / numerics directly into the
+  card; IRCCloud wraps all of that in a single "Connection events (N)" <details> block,
+  collapsed by default, with a top-level "Show connection events in server log" toggle
+  in the context menu. This plan wraps the existing attempt.phases + welcome + motd +
+  numerics + isupport + notices rows in `<details class="connection-events" open={!pref}>`,
+  default-collapsed, and persists the pref in localStorage as `serverlogCollapseEvents`
+  (global, not per-network — matches the IRCCloud model and avoids key proliferation).
+
+  (3) Welcome banner rows (001-004) and MOTD rows currently paint with a cyan stripe +
+  cyan-stripe row--info + cyan chip row-tag. IRCCloud renders these as type_info_response /
+  type_motd_response rows with `padding:10px` and no cyan accent. We adopt the IRCCloud
+  visual grammar (padding, no cyan stripe on the row itself) but keep the cyan-blue palette
+  tokens — the fiber brand stays ours. Per-row type tint comes from a new `rowClassForCommand`
+  helper; status / notice prefixes use mono `type_status` / `type_notice` typography.
+
+  Across all three: replace the legacy `disconnectReason` string with a structured
+  `failInfo{type,reason,ssl_verify_error,killed_reason}` payload emitted by the engine as
+  a new `CONNECTION_FAIL` synthetic event, AND keep emitting `disconnectReason` for
+  back-compat with code that pre-dated the structured payload. Frontend reads the
+  structured field via renderReasons.ts (port of IRCCloud's `renderreasons.js`) and falls
+  back to the legacy string when structured info is absent.
+
+plan_metrics:
+  wave_1_task_count: 1
+  total_dependencies: 13
+  risk_score: medium
+quality_warnings:
+  - "Engine emit BOTH `disconnectReason` (legacy string, consumed by ircStore.svelte.ts:2069-2073) AND structured `failInfo` (new). Document this dual-emit in connection.d so future code knows which to consume; new code MUST consume the structured payload."
+  - "setInterval inside Svelte 5 rune component must be torn down on unmount AND on status change (avoid stale timers when the user clicks Reconnect, which mutates connectionState). Use $effect + onCleanup pattern; do not store the interval id on a plain let (must be in $state or captured by the closure)."
+  - "ServerLogTimeline's `getServerLogCollapsedKey` returns keys shaped `networkId:eid` or `networkId:msgid:<msgid>` — these are per-attempt. The new global `serverlogCollapseEvents` pref is independent and just toggles the open attribute on the wrapping `<details>`. Don't try to unify the two collapse concepts; they're orthogonal (one is per-attempt UI state, one is a viewing pref)."
+  - "ConnectionStatus is mounted in ChatArea — it must not leak setInterval handles when switching buffers. Render-test on the same activeNetwork across two `setActiveBuffer` calls should yield exactly one active interval at any time."
+  - "005 ISUPPORT panel must keep working inside the new collapsed-events frame. The <details> wraps `attempt.phases + welcome + numerics + isupport + notices`, so ServerFeaturesPanel needs to render identically inside or outside the <details> — verify by visual + component test."
+  - "Keep fiber palette as theme. No new color tokens. Cyan is welcome-seg / cap-tag only. The IRCCloud dusk palette tokens (#1d4063, #3473b2, #6199d1, #17334f, #c4d9ee, #dbb300, #af3a00) listed in the brief are REFERENCE colors; map them to fiber tokens, do NOT introduce them as CSS variables."
+
+open_questions:
+  - question: "Should the engine emit BOTH `disconnectReason` (back-compat) AND structured `failInfo`?"
+    context: "Existing ircStore.svelte.ts:2069-2073 reads net.disconnectReason (a string). The new CONNECTION_FAIL event carries a structured failInfo. Both can co-exist; the frontend prefers the structured payload but falls back to the legacy string when structured info is absent. Recommendation: emit both."
+    type: decision_blocker
+    affects: [W1-T01, W2-T01]
+  - question: "Per-network or global `serverlogCollapseEvents` pref?"
+    context: "IRCCloud's pref is global (the context-menu item just says 'Collapse disconnects' / 'Expand disconnects' without per-network scope). Per-network would require keying `networkId:collapseEvents` in localStorage and complicates the onChange handler. Recommendation: global, simple key `ircfiber:serverlogCollapseEvents`."
+    type: decision_blocker
+    affects: [W2-T04, W4-T01]
+  - question: "connection_blocked / connecting_restricted states — render or skip?"
+    context: "IRCCloud surfaces these as 'Click to see upgrade options' / 'You can't connect to this server with a free account'. Fiber has no tier system; the typed `failInfo.type='connecting_restricted'` will arrive on the wire but renderReasons.ts should return a generic 'Disconnected' for unknown types so the UI degrades gracefully. Document in renderReasons.ts TODO. Future paid-tier work can extend the table."
+    type: decision_blocker
+    affects: [W2-T01]
+
+assumptions:
+  - "Engine already has `applyIsupport` and `IRCRawEvent.makeIsupport` (source/ircfiber/models/irc_event.d:209-220) — we add two new factories `makeConnectionRetryStatus` and `makeConnectionFail` next to those, mirroring the makeIsupport pattern."
+  - "Engine reconnect loop in source/ircfiber/irc/connection.d:1521-1600 already computes `backoff.currentAttempt()` and `delay.total!'msecs'`. We surface these on PersistentIRCClient as `attemptCount` (int) and `nextRetryAtMs` (long) and emit a `CONNECTION_RETRY_STATUS` event after each `delay` calculation."
+  - "`disconnectReason` (string) stays in NetworkStateSnapshot.toJson() — no removal. We ADD `retryStatus:{nextRetryAtMs,attemptCount,delayMs}` next to it. Existing frontend code keeps reading disconnectReason; new code reads retryStatus."
+  - "renderreasons.js is plain JS, port it 1:1 to TypeScript with the same RENDER_REASONS table, SSL_VERIFY_ERRORS nested map, RESTRICTED_REASONS (degrade to 'Disconnected' for unknown), and POST_ERRORS (post-error helper is not used by this plan but exported for completeness)."
+  - "Fiber palette tokens (--fiber-blue, --fiber-blue-hi, --fiber-blue-soft, --fiber-paper, --fiber-cloud, --fiber-amber) exist already (see homepage CSS). Map the IRCCloud dusk tokens from the brief (#1d4063, #3473b2, #6199d1, #17334f, #c4d9ee, #dbb300, #af3a00) to fiber tokens; do not introduce new variables."
+  - "IRCCloud's 'Click to come back' away banner is identical in shape to the current fiber banner — no change. The 'state-aware button' (reconnect | disconnect | upgrade) is owned by ConnectionStatus and uses the existing reconnectNetwork / disconnectNetwork REST calls. There is no 'upgrade' action in fiber; that branch is a TODO and degrades to the reconnect button."
+  - "Message-batching in lib/messageBatcher.ts already handles server-log immediate-passthrough via shouldBypassBatcher (line 36-43). The new CONNECTION_RETRY_STATUS / CONNECTION_FAIL events must also bypass batching — they enter through the _server buffer (per the `bufferName === '_server'` early return), so the existing bypass works."
+  - "Engine's `dub test` is broken on main (per AGENTS.md / Known Issues). Don't try to fix it. Engine verification uses `dub build --config=connection-registration-test` (the binary that exercises connection-registration timeout and reconnect paths) plus smoke against a live IRC server."
+  - "WS message order: CONNECTION_RETRY_STATUS events arrive every reconnect cycle; CONNECTION_FAIL events arrive on disconnect. The frontend applies them in order via the existing unpackEvent + appendMessage path. Late-arriving retry-status events from a recovered network are idempotent — the store's `applyRetryStatus` overwrites the prior fields by design."
+
+gaps:
+  - "IRCCloud's join/part grouping (different surface area — applies to channel buffers, not server log) — out of scope per brief. Wave 5 documents it as future work in AGENTS.md but no code change here."
+  - "IRCCloud's `failed` / `failedMessage` pending-row styles (different surface — applied to the JOIN/MODE response rows in channel buffers, not server log). Out of scope. The brief explicitly excludes this."
+  - "Fiber brand font replacement (Space Mono → user wants fiber feel not IRCCloud clone). Already uses Space Grotesk for labels and fiber-mono for content per ServerLogTimeline.svelte:660-680. No change here; just preserve."
+  - "The brief's IRCCloud palette tokens (#1d4063, #3473b2, etc.) are referenced for grounding but not introduced as new CSS variables. Map to fiber palette."
+
+pre_mortem:
+  overall_risk_level: medium
+  critical_failure_modes:
+    - scenario: "setInterval leaks across component instances or status flips, leaving a stale timer that mutates a stale snapshot."
+      likelihood: medium
+      impact: medium
+      mitigation: "Wave 3 task W3-T01 enforces the $effect + onCleanup pattern in ConnectionStatus.svelte: the interval is created inside an $effect that depends on retryStatus.attemptCount + activeNetwork.networkId, and onCleanup clears it. Component test asserts that switching activeNetwork from a connected state to a disconnected state with retryStatus drains the previous interval; switch activeBuffer to a channel buffer and back to _server, assert exactly one tick per second while in retry state."
+    - scenario: "ServerLogTimeline collapses the connection events <details> but ServerFeaturesPanel (ISUPPORT 005) is rendered before the wrapping <details>, so the panel ends up outside the collapsed region."
+      likelihood: low
+      impact: medium
+      mitigation: "Wave 4 task W4-T01 puts the wrapping <details> around ALL of attempt.phases + welcome + motd + numerics + isupport + notices — the <ServerFeaturesPanel> lives inside. Component test renders an attempt with both isupport and motd and asserts the panel is inside the <details>."
+    - scenario: "Engine snapshot writer publishes retryStatus as a number-encoded retry-status object but the WS sync serialiser (websocket.d) forgets to ship it."
+      likelihood: low
+      impact: high
+      mitigation: "Wave 1 task W1-T01 includes the WS sync serialisation site explicitly. Test by: launch a network, force a disconnect, observe WS sync payload contains retryStatus."
+    - scenario: "renderReasons.ts drops a known IRCCloud reason (e.g. 'killed_reason') because we forgot to port a key."
+      likelihood: medium
+      impact: low
+      mitigation: "Wave 2 task W2-T01 includes a unit test that exhaustively checks every key in IRCCloud's RENDER_REASONS (pool_lost, no_pool, enetdown, etimedout, timeout, closed, enotconn, ehostunreach, econnrefused, nxdomain, einval, ssl_certificate_error, ssl_error, crash) and every key in SSL_VERIFY_ERRORS nested map. The test file is co-located with renderReasons.ts and is required_test_first."
+    - scenario: "Engine CONNECTION_FAIL emits structured failInfo but the frontend banner still reads net.disconnectReason (the legacy string) because the messageHandler doesn't dispatch CONNECTION_FAIL."
+      likelihood: medium
+      impact: medium
+      mitigation: "Wave 2 task W2-T01 explicitly dispatches CONNECTION_FAIL through unpackEvent + a new handler in messageHandler.ts that calls net.applyFail(failInfo). Component test renders a network with failInfo set and asserts the banner reads the structured reason."
+    - scenario: "serverlogCollapseEvents pref is read once at mount and doesn't react to subsequent toggles."
+      likelihood: low
+      impact: low
+      mitigation: "Export serverlogCollapseEvents as a $state getter (not a value) so $derived in ServerLogTimeline.svelte re-reads it. Wave 4 task W4-T01 includes this."
+    - scenario: "Type-prefix restyle (type_status, type_notice) breaks the existing cyan-stripe row--info look that other components may depend on."
+      likelihood: low
+      impact: low
+      mitigation: "Wave 4 task W4-T01 (and its predecessor W2-T04) preserve the row--info / row--motd classes for CSS hook compatibility (other components may target them). Only the visible cyan-stripe inside .row--info is removed; the type-prefix row-tag is changed from cyan chip to mono. (W4-T02 was a reviewer task that did not exist pre-critique and is now dropped per OE5.)"
+
+coordination_notes:
+  - "Wave 1 (engine) and Wave 2 (frontend helpers) can start in parallel. Wave 1 has no Wave 2 deps; Wave 2 reads the IRCRawEvent factories that Wave 1 adds to irc_event.d, so Wave 2's messageHandler dispatch can compile against a stub factory if Wave 1 hasn't merged yet — both branches work against the same TS-shaped interface."
+  - "Wave 3 (banner) depends on Wave 2 (renders renderReasons + reads net.retryStatus). Wave 4 (timeline) depends on Wave 2 (preferences) only. Wave 5 (docs + smoke) depends on all prior waves."
+  - "Reviewer checkpoints: gem-reviewer(wave) at the end of Wave 3 (W3-T03); gem-reviewer(full) at end of Wave 5 (W5-T03). Wave 4 has no standalone reviewer gate — W4-T01 ships into Wave 5 and is reviewed as part of the full end-of-plan review. (OE5: 3 reviewer tasks for 8 implementer tasks was excessive; dropped the Wave-4 gate.)"
+  - "Engine handoff: rebuild + handoff during the deploy step (make update). Frontend assets push via the existing Makefile SSH tar pipe (no engine container restart for frontend-only)."
+
+contracts:
+  - from_task: W1-T01
+    to_task: W2-T01
+    interface: "IRCRawEvent factory methods makeConnectionRetryStatus(network, networkId, attemptCount, nextRetryAtMs, delayMs) and makeConnectionFail(network, networkId, failInfo{type,reason,killedReason,sslVerifyError}). Compact-JSON serialisation: {n, nid, c:'CONNECTION_RETRY_STATUS', rs:{a:N,nr:N,d:N}} and {n, nid, c:'CONNECTION_FAIL', fi:{t,r,kr,sve:{type,error}}}."
+    format: "JSON-encoded object with command field for dispatcher routing. sslVerifyError is a NESTED object (not a flat pair) so the engine's FailInfo and the frontend's FailInfo interface match byte-for-byte (see B2); messageHandler.ts does no shape conversion."
+  - from_task: W1-T01
+    to_task: W2-T01
+    interface: "NetworkStateSnapshot gains retryStatus: { attemptCount: int, nextRetryAtMs: long, delayMs: long } (nullable). WS sync payload (websocket.d:performStateDump) ships netObj['retryStatus'] = snap.retryStatus when defined."
+    format: "JSON object or null; absent in legacy snapshots."
+  - from_task: W1-T01
+    to_task: W3-T01
+    interface: "PersistentIRCClient exposes: attemptCount:int (read-only), nextRetryAtMs:long (read-only), getFailInfo():FailInfo (returns the structured payload for the current disconnect cycle). All read via existing public getter convention (getIsupport / getAckedCaps)."
+    format: "D struct getter methods returning primitives or a copy."
+  - from_task: W2-T01
+    to_task: W3-T01
+    interface: "Frontend Network interface gains retryStatus?: RetryStatus + failInfo?: FailInfo. ircStore exports applyRetryStatus(networkId, status) and applyFail(networkId, failInfo)."
+    format: "TS interface + exported function in ircStore.svelte.ts."
+  - from_task: W2-T04
+    to_task: W4-T01
+    interface: "preferences.svelte.ts exports getServerlogCollapseEvents():boolean and setServerlogCollapseEvents(value:boolean). Persisted to localStorage key 'ircfiber:serverlogCollapseEvents' (default true)."
+    format: "Svelte 5 $state getter + setter pair."
+  - from_task: W2-T02
+    to_task: W3-T01
+    interface: "renderReasons.ts exports renderReason(reason:string):string, renderSSLVerify(info:{type,error}):string, renderRestricted(reason:string):string, renderPostError(response,message):string. All pure functions, no Svelte imports."
+    format: "TS module exports."
+
+tasks:
+  # ─────────────────────────────────────────────────────────────────────────
+  # WAVE 1 — Engine: structured retry / fail tracking + wire events
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: W1-T01
+    title: Engine: structured retry/fail tracking, CONNECTION_RETRY_STATUS + CONNECTION_FAIL events, snapshot retryStatus
+    description: |
+      Extend the IRC engine to surface connection-lifecycle state in a
+      structured form the frontend can render (instead of free-text
+      `disconnectReason`). Five sites:
+
+       A. `source/ircfiber/irc/connection.d` —
+          · Add `waiting_to_retry` to the `ConnectionState` enum at
+            line 39-44. Currently the enum declares only
+            `disconnected`, `connecting`, `connected`, `disconnecting`;
+            the frontend's `ConnectionState` (frontend/src/types.ts:17-23)
+            already has `waiting_to_retry` as a variant, but no engine
+            site writes it. Without this enum entry the rest of B1 is
+            impossible (the engine would have no way to express the
+            "sleeping before next reconnect attempt" state). No other
+            frontend variants (`queued`, `connected_joining`) need to
+            land in the engine enum for this plan — those are derived
+            from `connecting` / `connected` on the frontend side.
+          · Add `int attemptCount` and `long nextRetryAtMs` fields to
+            `PersistentIRCClient` (read-only public accessors via getter
+            pair, alongside existing `getIsupport` / `getAckedCaps`).
+          · At the reconnect-loop site immediately before the deadline
+            sleep (the canonical site is `auto deadline =
+            Clock.currTime + delay;` at line 1595, inside the `while
+            (Clock.currTime < deadline)` block start):
+              1. Set `state = ConnectionState.waiting_to_retry;`
+                 — this REPLACES the existing `state =
+                 ConnectionState.connecting;` at line 1575 (whose
+                 "snapshotter reports connecting" rationale is now
+                 satisfied by `waiting_to_retry` plus the retry-status
+                 payload below; the user-click Disconnect affordance
+                 that 1575 wanted is unchanged because the WS sync
+                 still ships `connectionState = waiting_to_retry`).
+              2. Bump `backoff.currentAttempt()` and compute
+                 `nextRetryAtMs = Clock.currTime.toUnixTime!long * 1000
+                 + delay.total!"msecs"`,
+                 `attemptCount = backoff.currentAttempt()`.
+              3. Call
+                 `eventChannel.put(IRCRawEvent.makeConnectionRetryStatus(
+                     network, nid, attemptCount,
+                     Clock.currTime.toUnixTime!long * 1000 +
+                       delay.total!"msecs",
+                     delay.total!"msecs"))`
+                 so the frontend can render the ordinal label and the
+                 1s countdown. Emit AFTER the existing `emitLog("queued",
+                 …)` call (line 1587-1591) so the user-visible log line
+                 lands before the structured event.
+              4. After the `while (Clock.currTime < deadline)` sleep
+                 loop exits, the next iteration of the outer reconnect
+                 loop (line 1370) calls `attemptConnection()` →
+                 `attemptConnectionImpl` (line 1691) which already sets
+                 `state = ConnectionState.connecting;` at line 1704.
+                 LEAVE that line alone — it correctly transitions OUT
+                 of `waiting_to_retry` once the timer fires (this is
+                 the "After the timer fires (state is still
+                 `waiting_to_retry`), set `state =
+                 ConnectionState.connecting;` before
+                 `attemptConnection()`." sequence the brief asks for).
+          · At EVERY `backoff.reset()` site emit a zero-valued clear so
+            `applyRetryStatus(networkId, null)` fires on the frontend
+            and clears both `net.retryStatus` AND `net.failInfo`:
+              - Line 1044 (success path after registration) — set
+                `attemptCount = 0; nextRetryAtMs = 0;` then
+                `eventChannel.put(IRCRawEvent.makeConnectionRetryStatus(
+                    network, nid, 0, 0, 0))`.
+              - Line 1193 (success path after reconnect) — same.
+              - Line 1831 (success path after a fail cycle completes
+                a subsequent reconnect) — same.
+            Without these emissions the banner shows "Reconnecting… /
+            Disconnected: …" stale even after a successful reconnect
+            because the frontend only nulls the store fields when it
+            observes a CONNECTION_RETRY_STATUS event (see B3).
+            Cross-reference: see section G for the smoke test that
+            verifies this.
+         · Build `failInfo` at the disconnect site (around line 1422-1431
+           where lastEmittedReason is set): parse the reason text against
+           a fixed table of structured cases — `etimedout`, `econnrefused`,
+           `nxdomain`, `ssl_certificate_error`, `ssl_error`,
+           `pool_lost`, `ehostunreach`, `enetdown`, `crash`,
+           `killed_reason`. Emit `CONNECTION_FAIL` with the structured
+           payload via `eventChannel.put(IRCRawEvent.makeConnectionFail(...))`.
+           The legacy `lastEmittedReason` string is still set and the
+           DISCONNECTED event still carries the string (back-compat).
+
+      B. `source/ircfiber/irc/manager.d` —
+         No code change here. `eventChannel.put` on the per-client channel
+         already publishes to the main dispatch channel; CONNECTION_RETRY_STATUS
+         / CONNECTION_FAIL propagate automatically. Wave 1 verifies by
+         reading the existing addAndStartNetwork + getClient path.
+
+      C. `source/ircfiber/models/irc_event.d` —
+         Add two factory methods next to `makeIsupport` (line 209):
+         ```d
+         static IRCRawEvent makeConnectionRetryStatus(
+             string network, string networkId,
+             int attemptCount, long nextRetryAtMs, long delayMs) { ... }
+         static IRCRawEvent makeConnectionFail(
+             string network, string networkId,
+             const ref FailInfo info) { ... }
+         ```
+          Define a `FailInfo` struct next to the factory. Pick ONE
+          nested shape so the engine and the frontend agree on every
+          field (see B2): both layers use the SAME wire shape, no
+          per-side conversion in messageHandler.ts.
+
+          `vibe.data.json` is already imported at line 4 of irc_event.d
+          and `Json` is the existing `vibe.d.data.json.Json`
+          (used at lines 49 / 65); no new imports needed.
+          ```d
+          struct FailInfo {
+              string type;            // "connecting_failed" | "killed" | "ssl_verify_error" | "socket_closed"
+              string reason;          // raw reason (matches IRCCloud's RENDER_REASONS keys)
+              string killedReason;    // populated when type=="killed"; empty otherwise
+              Json   sslVerifyError;  // populated when reason=="ssl_verify_error";
+                                       // nested Json object: { "type": <string>,
+                                       //                       "error": <string> }
+                                       // Use Json(string[string]) so the wire shape
+                                       // is a JSON object, not a flat pair.
+                                       // Leave at the Json() default (empty) for
+                                       // non-ssl cases — deserialised as null.
+          }
+
+          // Helper that builds the nested sslVerifyError Json object so
+          // call-sites stay tidy and the wire shape matches the
+          // frontend's TS interface exactly:
+          void setSSLVerify(FailInfo* dst, string type, string error) {
+              string[string] inner;
+              inner["type"]  = type;
+              inner["error"] = error;
+              dst.sslVerifyError = Json(inner);
+          }
+          ```
+
+          Invariants:
+          - For non-ssl failInfo (the common case) call-sites LEAVE
+            `info.sslVerifyError` at the default — the JSON serialiser
+            emits `null` for the field, which decodes as
+            `sslVerifyError?: null` on the TS side (optional, so
+            existence is the truthy check, not a null check).
+          - For ssl failInfo, `info` is constructed locally then
+            passed `&info` to `setSSLVerify(&info, "bad_cert",
+            "cert_expired")` (or whatever the verification detail is),
+            THEN handed to `IRCRawEvent.makeConnectionFail(network,
+            nid, info)`.
+          - Engine NEVER writes the legacy flat shape
+            (`sslVerifyErrorType` + `sslVerifyErrorError` siblings) —
+            that struct is gone (see B2).
+
+      D. `source/ircfiber/redis/protocol.d` —
+         `NetworkStateSnapshot` gains:
+         ```d
+         /// Structured retry state surfaced from the engine's reconnect loop.
+         /// Frontend uses this to render the ordinal "Nth attempt" label,
+         /// the 1s countdown via setInterval, and the "Reconnecting..." state
+         /// badge in ConnectionStatus. Nullable — absent when the network is
+         /// healthy (no scheduled retry).
+         RetryStatus retryStatus;
+         struct RetryStatus {
+             int attemptCount;
+             long nextRetryAtMs;
+             long delayMs;
+         }
+         ```
+         Serialise in `toJson()` as `j["retryStatus"] = Json(retryStatus.toJson())`
+         (or null when absent). Deserialise in `fromJson()` symmetrically.
+
+      E. `source/ircfiber/engine/state.d` —
+         In `writeStateSnapshotForNetwork`, populate `snap.retryStatus` from
+         the client: `if (client) snap.retryStatus = client.getRetryStatus()`.
+         Add `getRetryStatus()` to `PersistentIRCClient` returning a
+         `RetryStatus` value (or null when both fields are zero).
+
+      F. `source/ircfiber/api/websocket.d` —
+         In `performStateDump` (around line 444-505), after the isupport
+         serialisation block, ship `netObj["retryStatus"] = snap.retryStatus.toJson()`
+         when the field is present; absent otherwise (frontend falls back
+         to derive from connectionState). Use the same pattern as the
+         existing `isupportObj` block.
+
+      G. Verify — `dub build --config=connection-registration-test`
+         exercises the connection-registration timeout path (per
+         source/connection_registration_test.d, included via dub.sdl:94-100).
+         It does not currently exercise the reconnect loop, so add
+         smoke paths. Three scenarios:
+
+         1. Closed-port retry-loop observable. Launch a network
+            pointing at `127.0.0.1:1`. Sleep at least 15 s
+            (longer than the 5 s `MIN_RECONNECT_DELAY_MS` floor at
+            connection.d:1554 × 2 attempts + a margin). Observe
+            `irc:state:<sid>:<nid>` via `redis-cli HGET ... data | jq
+            .retryStatus` and assert:
+              - `attemptCount >= 2` (the engine has cycled the
+                backoff at least twice → the first connection-cycle
+                actually fired CONNECTION_RETRY_STATUS, not just a
+                single-shot at startup),
+              - `nextRetryAtMs` is within `delayMs + 1 s` of `now`
+                (the engine's timer math agrees with wall clock),
+              - `delayMs > 0` (a real schedule, not a zero-valued
+                clear).
+            This is the strengthened smoke that supersedes the
+            earlier "at least one cycle" criterion (the old one was
+            too weak — it could pass after a single emit at t=0).
+
+         2. CONNECTION_FAIL emission with the nested FailInfo shape.
+            Continue from the same closed-port run. Assert the WS sync
+            payload (or `irc:state:<sid>:<nid>.failInfo`) carries a
+            `failInfo` object with `type`, `reason` AND — for an
+            `ssl_certificate_error` reason — `sslVerifyError` as a
+            nested object `{type: "bad_cert", error: "cert_expired"}`
+            (NOT the legacy flat `sslVerifyErrorType` +
+            `sslVerifyErrorError` siblings — those must be gone per
+            B2).
+
+         3. failInfo cleared after successful reconnect. Force the
+            engine through one fail cycle (closed port → at least one
+            `waiting_to_retry` + `CONNECTION_FAIL`), then re-point the
+            network at a working IRC server (e.g. localhost:6667),
+            then poll `irc:state:<sid>:<nid>.failInfo` and assert it
+            is `null` within 12 s (one snapshot cycle after the
+            `backoff.reset()` at line 1831 fires its zero-valued
+            CONNECTION_RETRY_STATUS per B3).
+
+         Document all three scenarios in
+         docs/plan/20260716-irccloud-parity/logs/engine-smoke.md
+         with timestamps + raw `redis-cli` output for each assertion.
+
+      DO NOT TOUCH the wire protocol shape for existing events
+      (CONNECTED / DISCONNECTED / NOTICE / PRIVMSG / ISUPPORT). The two
+      new event types are additive.
+    wave: 1
+    agent: implementer
+    status: pending
+    covers:
+      - "Engine surface structured retry + fail info"
+      - "Engine emits CONNECTION_RETRY_STATUS + CONNECTION_FAIL events"
+      - "Snapshot / WS sync ships retryStatus"
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: source/ircfiber/irc/connection.d
+        description: "Reconnect loop around line 1521-1600 (delay calc + emitLog('queued')); disconnect reason at 1422-1431; backoff.reset at 1044 and 1193; PersistentIRCClient field block at 556-650"
+      - path: source/ircfiber/models/irc_event.d
+        description: "Add makeConnectionRetryStatus + makeConnectionFail next to makeIsupport at line 209-220; FailInfo struct alongside"
+      - path: source/ircfiber/redis/protocol.d
+        description: "NetworkStateSnapshot at line 286; add retryStatus field next to isupport (line 325) + serialise in toJson() + deserialise in fromJson()"
+      - path: source/ircfiber/engine/state.d
+        description: "writeStateSnapshotForNetwork at line 62-188; add retryStatus populate at the same site as isupport (line 169-179)"
+      - path: source/ircfiber/api/websocket.d
+        description: "performStateDump at line 444-505; ship retryStatus in netObj alongside isupport (line 488-499)"
+      - path: source/connection_registration_test.d
+        description: "Existing registration-timeout smoke; extend to assert CONNECTION_RETRY_STATUS / CONNECTION_FAIL emission"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "PersistentIRCClient exposes attemptCount:int, nextRetryAtMs:long, getRetryStatus():RetryStatus? public accessors."
+      - "Engine's `ConnectionState` enum (connection.d:39) gains a `waiting_to_retry` variant. Frontend's `ConnectionState` (types.ts:17-23) already has it; both layers now agree."
+      - "Backoff-loop canonical site (connection.d:1595, just before the deadline/sleep) sets `state = ConnectionState.waiting_to_retry;` REPLACING the prior `state = ConnectionState.connecting;` at line 1575, and emits a CONNECTION_RETRY_STATUS event with `{attemptCount, nextRetryAtMs: now+delayMs, delayMs}`. After the sleep loop exits, the next iteration's `attemptConnection()` → `attemptConnectionImpl` (line 1704) flips state back to `connecting` before the next connect attempt — that line is left alone."
+      - "Every `backoff.reset()` site (line 1044 after registration, line 1193 after reconnect, line 1831 after a fail cycle) sets `attemptCount = 0; nextRetryAtMs = 0;` AND emits `eventChannel.put(IRCRawEvent.makeConnectionRetryStatus(network, nid, 0, 0, 0))` so the frontend's `applyRetryStatus(null)` clears `net.retryStatus` AND `net.failInfo`."
+      - "Disconnect path constructs a FailInfo struct (nested shape per section C of this task — B2) and emits CONNECTION_FAIL alongside the legacy DISCONNECTED event."
+      - "NetworkStateSnapshot.toJson() / fromJson() roundtrip preserves retryStatus."
+      - "engine/state.d populates snap.retryStatus = client.getRetryStatus() when defined."
+      - "websocket.d performStateDump ships netObj['retryStatus'] to fresh WS sync payloads."
+      - "dub build --config=connection-registration-test compiles."
+      - "Smoke test logs/20260716-irccloud-parity/engine-smoke.md shows all three scenarios from section G (closed-port retry, failInfo emission, failInfo clear-after-reconnect)."
+    success_criteria:
+      - "Engine: `dub build --config=connection-registration-test` exits 0."
+      - "Smoke scenario 1 (closed port): after ≥15 s, `redis-cli HGET irc:state:<sid>:<nid> data | jq .retryStatus` returns `{attemptCount: N>=2, nextRetryAtMs: T, delayMs: D>0}` AND `now + 1000 >= nextRetryAtMs >= now - delayMs` (server-clock agreement)."
+      - "Smoke scenario 2 (failInfo shape): the failInfo payload from `irc:state:<sid>:<nid>.failInfo` shows the nested `sslVerifyError: {type, error}` form (NOT a flat pair) for an ssl-cert reason; type / reason / killedReason top-level fields are populated as expected."
+      - "Smoke scenario 3 (failInfo clear): after the engine cycles through fail → reset → reconnect (per the `backoff.reset()` at line 1831), `irc:state:<sid>:<nid>.failInfo` is `null` within 12 s of the reset."
+      - "Machine: smoke log committed to logs/20260716-irccloud-parity/engine-smoke.md."
+    tech_stack: [d, vibe.d, dub]
+    test_coverage: "Smoke against closed-port; visual confirmation in engine-smoke.md. No unit tests (engine dub test broken on main per AGENTS.md)."
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "Backoff loop structure in connection.d — already correct, just needs new fields + emit."
+        - "DISCONNECTED event shape — frozen. CONNECTION_FAIL is additive; keep the DISCONNECTED payload identical."
+        - "ISUPPORT event payload shape — frozen. CONNECTION_RETRY_STATUS / CONNECTION_FAIL are new event types, not variants of existing ones."
+      required_test_first: "Compile gate: `dub build --config=connection-registration-test` must exit 0 before merge."
+      target_files:
+        - source/ircfiber/irc/connection.d
+        - source/ircfiber/models/irc_event.d
+        - source/ircfiber/redis/protocol.d
+        - source/ircfiber/engine/state.d
+        - source/ircfiber/api/websocket.d
+        - source/connection_registration_test.d
+      minimal_change: "Add 2 factory methods + 1 struct in irc_event.d; add ~10 lines to connection.d reconnect loop + disconnect site; add 1 field + 2 methods to NetworkStateSnapshot; add ~5 lines to engine/state.d; add ~5 lines to websocket.d."
+      acceptance_checks:
+        - "git grep -n 'makeConnectionRetryStatus\\|makeConnectionFail' source/ shows the two factories defined and called."
+        - "git grep -n 'CONNECTION_RETRY_STATUS\\|CONNECTION_FAIL' source/ircfiber/ shows the new event types emitted."
+        - "git grep -n 'retryStatus' source/ircfiber/ shows the field defined + populated + serialised in all four sites."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # WAVE 2 — Frontend helpers (lib + plumbing)
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: W2-T01
+    title: renderReasons.ts + suspiciousConnection.ts (port of IRCCloud helpers)
+    description: |
+      Two new pure-helper files under `frontend/src/lib/`. No Svelte
+      imports — these are utility modules consumed by ConnectionStatus.svelte
+      and ServerLogTimeline.svelte.
+
+      A. `frontend/src/lib/renderReasons.ts` (NEW)
+
+      Port IRCCloud's `app/src/view/renderreasons.js` (irccloud-webpack-study)
+      1:1 to TypeScript. Exports:
+
+      ```ts
+      export function renderReason(reason: string): string;
+      export function renderSSLVerify(info: { type: string; error: string } | null | undefined): string | undefined;
+      export function renderRestricted(reason: string): string;     // degrades to generic 'Disconnected' for unknown — fiber has no tier system
+      export function renderRestrictedShort(reason: string): string; // degrades to 'Limited'
+      export function renderPostError(response: { message?: string; size?: number; content_length?: number } | null, message?: boolean): string;
+      ```
+
+      Tables (lifted from renderreasons.js):
+      - `RENDER_REASONS`: pool_lost, no_pool, enetdown, etimedout, timeout, closed, enotconn, ehostunreach, econnrefused, nxdomain, einval, ssl_certificate_error, ssl_error, crash. Default fallback: return the raw reason string.
+      - `SSL_VERIFY_ERRORS`: nested map (bad_cert → {unknown_ca, selfsigned_peer, cert_expired, invalid_issuer, invalid_signature, name_not_permitted, missing_basic_constraint, invalid_key_usage}; ssl_verify_hostname → {unable_to_match_altnames, unable_to_match_common_name, unable_to_decode_common_name}). Default fallback for renderSSLVerify: return `info.type + ': ' + info.error`.
+      - `RESTRICTED_REASONS`: networks, unverified, passworded_servers, slack_disallowed. Default fallback: 'You can't connect to this server with a free account. Upgrade now'. Fiber-specific: when fiber has no tier system, this branch never renders the upgrade CTA; instead ConnectionStatus degrades to the 'Click to reconnect' button. Document in renderReasons.ts TODO header.
+      - `RESTRICTED_REASONS_SHORT`: short variants.
+      - `POST_ERRORS`: connection_down, connection_unavailable, database_down, auth, invalid_org_id, invalid_cid, invalid_nick, invalid_edit, paste_too_large, paste_invalid, paste_empty, file_too_large (function with message + response), invalid_file_type, image_too_large, file_write_error, banned_content, upload_limit_reached, unverified, missing_file, upload_already_exists, invalid_upload_id, upload_not_found, upload_error, batch_upload_failed, blocked_command, invalid_topic.
+
+      File wrapper is NOT ported (fiber has no client-side sizeToString; file_too_large falls back to the static 'Sorry, you can't upload files larger than 15 MB.' without the size suffix).
+
+      B. `frontend/src/lib/suspiciousConnection.ts` (NEW)
+
+      Port IRCCloud's `connection.js:isSuspiciousPort` + `isSuspiciousHostname`:
+
+      ```ts
+      export function isSuspiciousPort(isSSL: boolean, port: number, defaultPort = 6667, defaultSSLPort = 6697): boolean {
+        return (isSSL && port === defaultPort) || (!isSSL && port === defaultSSLPort);
+      }
+
+      export function isSuspiciousHostname(hostname: string): boolean {
+        if (!hostname) return false;
+        return hostname[0] === '.'
+            || hostname[hostname.length - 1] === '.'
+            || (hostname.indexOf('.') === -1 && hostname.indexOf(':') === -1);
+      }
+      ```
+
+      C. Tests — `frontend/src/lib/renderReasons.test.ts` (NEW, vitest, project=lib)
+      Exhaustively assert every RENDER_REASONS key returns the expected string. Assert renderSSLVerify returns the nested-key string for each (type,error) pair. Assert renderReason returns the raw reason for unknown keys. Assert isSuspiciousPort for the four combinations. Assert isSuspiciousHostname for each branch.
+
+      D. Tests — `frontend/src/lib/suspiciousConnection.test.ts` (NEW, vitest, project=lib)
+      Direct port of IRCCloud's test cases (these were simple synchronous functions, easy to enumerate):
+      - isSuspiciousPort(true, 6667) === true; isSuspiciousPort(true, 6697) === false
+      - isSuspiciousPort(false, 6697) === true; isSuspiciousPort(false, 6667) === false
+      - isSuspiciousHostname('irc.example.org') === false
+      - isSuspiciousHostname('.irc.example.org') === true (leading dot)
+      - isSuspiciousHostname('irc.example.org.') === true (trailing dot)
+      - isSuspiciousHostname('localhost') === true (no dot, no colon)
+      - isSuspiciousHostname('::1') === false (IPv6 has colon)
+      - isSuspiciousHostname('') === false (defensive)
+
+      The required_test_first for this task is the renderReasons.test.ts file —
+      it pins the IRCCloud table values before any consumer is built.
+    wave: 2
+    agent: implementer
+    status: pending
+    covers:
+      - "Render-reasons + suspicious-connection helpers ported from IRCCloud"
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/lib/renderReasons.ts
+        description: "NEW file — port of irccloud-webpack-study/app/src/view/renderreasons.js"
+      - path: frontend/src/lib/suspiciousConnection.ts
+        description: "NEW file — port of irccloud-webpack-study/app/src/model/connection.js:isSuspiciousPort + isSuspiciousHostname"
+      - path: irccloud-webpack-study/app/src/view/renderreasons.js
+        description: "Source — exhaustive table lifted into TS"
+      - path: irccloud-webpack-study/app/src/model/connection.js
+        description: "Source for isSuspiciousPort (line 204-207) + isSuspiciousHostname (line 211-216)"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "renderReasons.ts exports renderReason, renderSSLVerify, renderRestricted, renderRestrictedShort, renderPostError — all pure functions, no Svelte imports."
+      - "Every key in IRCCloud's RENDER_REASONS table returns the expected human string (TG1): explicitly assert `renderReason('econnrefused') === 'Connection refused'`, `renderReason('nxdomain') === 'Invalid hostname'`, `renderReason('ssl_certificate_error') === 'SSL certificate error'`, and that unknown reasons return the input string unchanged (no fallback rewrite). These three explicit cases decouple the helper test from the banner test — if the banner flips to a wrong string for a known RENDER_REASONS key, the helper test pinpoints the regression."
+      - "renderSSLVerify returns the nested-key string for each (type,error) pair; falls back to `info.type + ': ' + info.error` for unknown."
+      - "renderRestricted returns the IRCCloud default 'You can't connect to this server with a free account. Upgrade now' for unknown; the four known reasons each return their specific message."
+      - "renderPostError returns the static string for each known message; for file_too_large returns the static '15 MB' string when no size given, or appends `(upload is ...)` when size present."
+      - "suspiciousConnection.ts exports isSuspiciousPort + isSuspiciousHostname."
+      - "isSuspiciousPort(true, 6667) === true; isSuspiciousPort(true, 6697) === false; isSuspiciousPort(false, 6697) === true; isSuspiciousPort(false, 6667) === false."
+      - "isSuspiciousHostname: leading dot, trailing dot, no-dot-no-colon return true; default + IPv6 return false."
+      - "renderReasons.test.ts covers every RENDER_REASONS key + renderSSLVerify nested pairs + renderRestricted defaults."
+      - "suspiciousConnection.test.ts covers every branch of both functions."
+      - "vitest run --project=lib passes; no test in client project requires these files."
+    success_criteria:
+      - "Machine: npx vitest run --project=lib src/lib/renderReasons.test.ts src/lib/suspiciousConnection.test.ts — all green."
+      - "All 379+ existing lib tests still green."
+    tech_stack: [typescript, vitest]
+    test_coverage: "Exhaustive table coverage for both files."
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "RENDER_REASONS / SSL_VERIFY_ERRORS / RESTRICTED_REASONS tables — lifted verbatim from irccloud-webpack-study; do not edit."
+        - "Fiber has no tier system — renderRestricted degraded path is documented in TODO; do not invent upgrade CTAs."
+      required_test_first: "renderReasons.test.ts must be in place BEFORE the helper is consumed by ConnectionStatus.svelte (Wave 3)."
+      target_files:
+        - frontend/src/lib/renderReasons.ts
+        - frontend/src/lib/suspiciousConnection.ts
+        - frontend/src/lib/renderReasons.test.ts
+        - frontend/src/lib/suspiciousConnection.test.ts
+      minimal_change: "Two new files + two test files. No edits to existing files."
+      acceptance_checks:
+        - "git grep -n 'RENDER_REASONS\\|SSL_VERIFY_ERRORS\\|RESTRICTED_REASONS' frontend/src/lib/renderReasons.ts shows the three tables present."
+        - "grep -n 'renderReason\\|renderSSLVerify\\|renderRestricted\\|renderPostError' shows four exported functions."
+
+  - id: W2-T02
+    title: types.ts + ircStore.svelte.ts + messageHandler.ts plumbing for retryStatus + failInfo
+    description: |
+      Plumbing to deliver retryStatus + failInfo from the WS wire to the
+      ConnectionStatus banner. Three files.
+
+      A. `frontend/src/types.ts` — extend the Network interface:
+
+      ```ts
+      export interface RetryStatus {
+        attemptCount: number;
+        nextRetryAtMs: number;
+        delayMs: number;
+      }
+
+      export interface FailInfo {
+        type: string;            // "connecting_failed" | "killed" | "ssl_verify_error" | "socket_closed" | ...
+        reason: string;          // raw reason (RENDER_REASONS key)
+        killedReason?: string;
+        sslVerifyError?: { type: string; error: string };
+      }
+
+      export interface Network {
+        // ... existing fields ...
+        /** Engine-reported retry state. Populated from CONNECTION_RETRY_STATUS
+         *  events and from the WS sync retryStatus field. Cleared on successful
+         *  connection (backoff.reset equivalent). */
+        retryStatus?: RetryStatus | null;
+        /** Structured disconnect reason. Populated from CONNECTION_FAIL events.
+         *  Preferred over `disconnectReason` (the legacy string) for new code. */
+        failInfo?: FailInfo | null;
+      }
+      ```
+
+      Keep `disconnectReason: string` (line 44) — it remains the legacy
+      fallback. New code reads `failInfo` first, falls back to
+      `disconnectReason` if absent.
+
+      B. `frontend/src/stores/ircStore.svelte.ts` — add two exports near
+      the existing applyIsupportUpdate (line 2094):
+
+      ```ts
+      export function applyRetryStatus(networkId: string, status: RetryStatus | null): void {
+        const net = ircState.networks.find(n => n.networkId === networkId);
+        if (!net) return;
+        net.retryStatus = status;
+        if (!status) net.failInfo = null;  // retry cleared → not failed
+      }
+
+      export function applyFail(networkId: string, failInfo: FailInfo): void {
+        const net = ircState.networks.find(n => n.networkId === networkId);
+        if (!net) return;
+        net.failInfo = failInfo;
+      }
+      ```
+
+      Also extend `updateNetworkFromSync` (line 1308+) so the sync snapshot
+      adopts `retryStatus` from the snapshot (analogous to how
+      `isupport` is adopted at line 488-499 of websocket.d):
+
+      ```ts
+      if (net.retryStatus) existing.retryStatus = net.retryStatus;
+      else existing.retryStatus = null;
+      ```
+
+      C. `frontend/src/lib/messageHandler.ts` — extend `unpackEvent` or
+      the dispatch in the main handler function to route two new command
+      names. Place the dispatch in the same switch the ISUPPORT handler
+      lives in (around line 226):
+
+      ```ts
+      if (cmd === 'CONNECTION_RETRY_STATUS') {
+        const rs = data.rs as RetryStatus | undefined;
+        if (rs) applyRetryStatus(networkId, rs);
+        return {};
+      }
+      if (cmd === 'CONNECTION_FAIL') {
+        const fi = data.fi as FailInfo | undefined;
+        if (fi) applyFail(networkId, fi);
+        return {};
+      }
+      ```
+
+      Both are immediate (bypass batcher) — they enter through the
+      _server buffer or directly mutate network state, not message appends.
+
+      D. Extend the NetworkStateSnapshot sync adopt — when the WS sync
+      delivers a non-null retryStatus, it overwrites the prior value
+      atomically. Test for the case where a stale retryStatus from a
+      prior connection attempt survives a successful connect (the
+      backoff.reset path should null it out, and the sync should
+      reflect that).
+    wave: 2
+    agent: implementer
+    status: pending
+    covers:
+      - "Frontend state plumbing for retryStatus + failInfo"
+      - "WS event dispatch for CONNECTION_RETRY_STATUS + CONNECTION_FAIL"
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/types.ts
+        description: "Network interface at line 25-110; add retryStatus + failInfo"
+      - path: frontend/src/stores/ircStore.svelte.ts
+        description: "applyIsupportUpdate at line 2094; add applyRetryStatus + applyFail; extend updateNetworkFromSync at 1308+ to adopt retryStatus from sync"
+      - path: frontend/src/lib/messageHandler.ts
+        description: "ISUPPORT dispatch at line 226-238; add CONNECTION_RETRY_STATUS + CONNECTION_FAIL handlers next to it"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "Network interface gains retryStatus?: RetryStatus | null and failInfo?: FailInfo | null. Existing disconnectReason: string stays."
+      - "applyRetryStatus + applyFail are exported from ircStore.svelte.ts."
+      - "applyRetryStatus with null status also clears failInfo (TG5): pin a unit test — call `applyRetryStatus('net1', {attemptCount: 2, nextRetryAtMs: Date.now() + 5000, delayMs: 5000})`, assert `net.retryStatus` is set + `net.failInfo` is undefined / null, then call `applyRetryStatus('net1', null)`, assert `net.retryStatus === null` AND `net.failInfo === null`. This is the on-test counterpart to the engine's `backoff.reset()` zero-valued emit (W1-T01 section A) — without it the disconnect/connected cycle leaves stale `failInfo` on the store."
+      - "messageHandler dispatches CONNECTION_RETRY_STATUS to applyRetryStatus and CONNECTION_FAIL to applyFail."
+      - "Sync snapshot adopts retryStatus from net.retryStatus field; nulls it when absent."
+      - "Existing disconnectReason sync logic at line 1317-1319 is unchanged."
+    success_criteria:
+      - "Existing 1131+ vitest assertions remain green."
+      - "Manual: launch a network pointing at a closed port; in browser, ConnectionStatus shows 'Reconnecting (2nd attempt)' once the engine has emitted CONNECTION_RETRY_STATUS."
+    tech_stack: [typescript, svelte5-runes]
+    test_coverage: "Wave 5 smoke + targeted message-handler unit test (added by Wave 3)."
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "disconnectReason sync logic at line 1317-1319 — frozen."
+        - "applyIsupportUpdate (line 2094) — unchanged; new exports are additive."
+        - "updateNetworkFromSync guard against clobbering live connectionState (line 1337-1353) — unchanged; retryStatus is metadata only, not a connection-state field."
+      required_test_first: "Add a unit test for applyRetryStatus + applyFail in src/stores/ircStore.svelte.test.ts (after the existing ISUPPORT describe block around line 1348)."
+      target_files:
+        - frontend/src/types.ts
+        - frontend/src/stores/ircStore.svelte.ts
+        - frontend/src/lib/messageHandler.ts
+      minimal_change: "Two interface fields + two exports + two switch arms + one sync-extension. ~20 lines total."
+      acceptance_checks:
+        - "git grep -n 'applyRetryStatus\\|applyFail\\|failInfo\\|retryStatus' frontend/src/ shows the field + exports + dispatch all wired."
+
+  - id: W2-T03
+    title: preferences.svelte.ts: serverlogCollapseEvents (global pref, default true)
+    description: |
+      Add a single global `serverlogCollapseEvents` pref to
+      `frontend/src/stores/preferences.svelte.ts` next to the existing
+      `serverlogCollapsedMap` (line 180).
+
+      Pattern mirrors `_pastebinDisablePrompt` (line 204-212) — exported
+      getter + setter pair, persisted via localStorage key
+      `ircfiber:serverlogCollapseEvents`, default `true`.
+
+      ```ts
+      let _serverlogCollapseEvents = $state<boolean>(
+        getStorageItem('ircfiber:serverlogCollapseEvents', true)
+      );
+      export function getServerlogCollapseEvents(): boolean {
+        return _serverlogCollapseEvents;
+      }
+      export function setServerlogCollapseEvents(value: boolean): void {
+        _serverlogCollapseEvents = value;
+        setStorageItem('ircfiber:serverlogCollapseEvents', value);
+      }
+      ```
+
+      The `setStorageItem` helper (used elsewhere at line 158) already
+      persists JSON-serialisable values, so reuse it. Also wire a
+      `storage` event listener so a tab switch re-reads the value
+      (extend the existing `storage` handler at line 432).
+
+      Add a `localStorage.setItem` immediate-flush pattern (per the
+      existing `ircfiber:serverlogCollapsed` write at line 308-312) so
+      the value survives a fast page refresh.
+
+      Brief explicitly recommends GLOBAL over per-network — matches
+      IRCCloud's behavior and avoids localStorage key proliferation.
+
+      Add a unit test in a new file `frontend/src/stores/preferences.svelte.test.ts`
+      (file doesn't currently exist; verified via glob). Tests:
+      - Default value is `true` (when localStorage is empty).
+      - Setter persists to localStorage immediately.
+      - Storage event listener re-reads the value.
+      - When localStorage has `false`, getter returns `false`.
+    wave: 2
+    agent: implementer
+    status: pending
+    covers:
+      - "Global serverlogCollapseEvents pref with localStorage persistence"
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/stores/preferences.svelte.ts
+        description: "Existing pattern at line 204-212 (pastebin); storage event handler at line 432; getStorageItem at line 143-156; setStorageItem at line 158-162"
+      - path: frontend/src/stores/serverlogCollapsedMap
+        description: "Existing per-attempt map at line 180 — confirms the persistence pattern"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "getServerlogCollapseEvents() returns boolean (default true)."
+      - "setServerlogCollapseEvents(value) writes to localStorage immediately."
+      - "Storage event handler re-reads the value when fired from another tab."
+      - "Default for fresh users is true (collapsed). Pre-existing localStorage values are honoured."
+    success_criteria:
+      - "Manual: open server log context menu, toggle 'Show connection events' → expanded; refresh → still expanded."
+      - "Machine: vitest assertions in preferences.svelte.test.ts pass; existing 1131+ tests remain green."
+    tech_stack: [typescript, svelte5-runes]
+    test_coverage: "preferences.svelte.test.ts NEW file with 4 cases."
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "Existing serverlogCollapsedMap (per-attempt) — independent of this global pref. Don't unify."
+        - "pastebinDisablePrompt pattern — already a template; mirror it."
+      required_test_first: "Unit tests pass BEFORE Wave 4 consumes the getter."
+      target_files:
+        - frontend/src/stores/preferences.svelte.ts
+        - frontend/src/stores/preferences.svelte.test.ts
+      minimal_change: "Two exports + one localStorage key + one storage event listener entry. ~15 lines + new test file."
+      acceptance_checks:
+        - "git grep -n 'serverlogCollapseEvents' frontend/src/ shows both the export and the localStorage key."
+
+  - id: W2-T04
+    title: ServerLogTimeline connection-events <details> wrap + type_info_response / type_motd_response restyle
+    description: |
+      Two visual changes to `frontend/src/components/ServerLogTimeline.svelte`:
+
+      PART A — Connection events <details> wrapper.
+
+      The component currently renders `attempt.phases + welcome + motd +
+      numerics + isupport + notices` directly inside the `{#if !collapsed}`
+      block of each attempt header. Wrap ALL of these rows in a single
+      `<details class="connection-events" open={!serverlogCollapseEvents}>`,
+      placed AFTER the `<div class="head" role="button">` block and BEFORE
+      the existing `{#if !collapsed}` (or restructure so the
+      <details> lives inside the existing `{#if !collapsed}`).
+
+      Add a `<summary class="connection-events-summary">Connection events
+      ({N})</summary>` element inside the <details>. N is the count of
+      nested rows (phases.length + welcome.length + motd.length + numerics.length +
+      (isupport ? 1 : 0) + (notices ? 1 : 0)).
+
+      Persist the open state via the new `getServerlogCollapseEvents()` pref
+      (Wave 2 W2-T03). When the pref is true (default), the <details> is
+      closed (collapsed). The user toggling the <details> updates the pref
+      via a click handler — actually IRCCloud uses native <details> toggle,
+      so use the `ontoggle` event to sync the pref to the user's choice.
+
+      Critical: the `connection.events[open]` attribute must be reactive.
+      Use `:class={...}` binding (Svelte 5 runes) on the <details>; bind
+      `open` via `open={!getServerlogCollapseEvents()}` — recompute when
+      pref changes via $effect or via $derived.
+
+      PART B — type_info_response / type_motd_response row restyle.
+
+      The current `.row--info` (line 750-757) has `padding: 4px 12px` and
+      a cyan-stripe left accent strip. IRCCloud renders info_response
+      rows with `padding:10px` and no cyan stripe. Restyle:
+
+      ```css
+      .row--info {
+        position: relative;
+        background: transparent;   /* was var(--fiber-blue-soft) */
+        color: var(--fiber-cloud);
+        padding: 10px 14px;        /* was 4px 12px */
+        border-bottom-color: var(--fiber-line);
+      }
+      .row--info .row-accent { display: none; }  /* drop the cyan stripe */
+      ```
+
+      Same treatment for `.row--motd` (line 880-886): drop the
+      `--fiber-blue-soft` background, drop the cyan-stripe accent, change
+      padding to `padding: 10px 14px 14px`.
+
+      Keep the `.row--info` and `.row--motd` classes (other components
+      may target them) — only the visual cyan stripe + bg changes.
+
+      PART C — type_status / type_notice row-tag prefix.
+
+      The current `.row-tag` (line 724-731) is a cyan chip with
+      `text-transform: lowercase`. IRCCloud uses a mono `type_status`
+      prefix with no chip — just inline mono text. Restyle:
+
+      ```css
+      .row-tag {
+        display: inline-block;
+        margin-right: 8px;
+        color: var(--fiber-mist);     /* was --fiber-blue */
+        font-family: var(--font-mono-fiber, monospace);
+        font-size: 11px;
+        font-weight: 500;
+        text-transform: uppercase;    /* was lowercase */
+        letter-spacing: 0.08em;
+      }
+      .row-tag--status { color: var(--fiber-mist); }
+      .row-tag--notice { color: var(--fiber-blue-hi); font-weight: 600; }
+      ```
+
+      Update `rowClassForCommand` (line 90-96) to also apply a tag modifier:
+      `cmd === 'NOTICE' || kind === 'notice' ? 'row-tag row-tag--notice' : 'row-tag row-tag--status'`.
+
+      The 005 ISUPPORT case stays `type_status monospace` but the
+      `.row-tag` is no longer chip-styled.
+
+      PART D — NOTICE block typographic `***` label.
+
+      The current `.row--notices` block at line 1089-1094 uses a cyan
+      `.row-tag` followed by a `<summary>NOTICE</summary>` text. Replace
+      the cyan chip with inline `***` typographic label. The existing
+      `.notice-seg--notice-label` at line 851-856 already renders `***`
+      as a cyan-bold label per item. Add a `<span class="notice-block-tag">NOTICE · {N} messages</span>` at the start of the <details> summary, styled as:
+      ```css
+      .notice-block-tag {
+        color: var(--fiber-cloud);
+        font-family: var(--font-mono-fiber, monospace);
+        font-size: 11.5px;
+        letter-spacing: 0.04em;
+      }
+      .notice-block-tag::before { content: '*** '; color: var(--fiber-blue-hi); font-weight: 700; }
+      ```
+
+      The existing `parseNoticeOrCapLine` (line 202-230) already produces
+      `notice-seg--notice-label` for `*** ...` lines. Verify it still works.
+
+      E. Tests — `frontend/src/components/ServerLogTimeline.test.ts`
+      Extend with cases:
+      - Server-log timeline renders a wrapping <details class="connection-events">
+        around attempt.phases + welcome + motd + numerics + isupport + notices.
+      - When `getServerlogCollapseEvents()` returns true (default), the
+        <details> is NOT open.
+      - When `getServerlogCollapseEvents()` returns false, the <details>
+        IS open.
+      - Toggling the <details> via click persists the user's choice via
+        setServerlogCollapseEvents.
+      - .row--info has `padding: 10px 14px` (computedStyle assertion).
+      - .row--motd has `padding: 10px 14px 14px` (computedStyle assertion).
+      - .row--info does NOT contain the cyan-stripe `.row-accent` element
+        (or it has `display: none`).
+      - .row-tag has `text-transform: uppercase` (computedStyle assertion).
+      - The notice block renders `*** NOTICE · N messages` (text content assertion).
+      - 005 ISUPPORT panel still renders inside the <details>.
+    wave: 2
+    agent: implementer
+    status: pending
+    covers:
+      - "Connection-events <details> wrapper with collapse-events pref"
+      - "type_info_response / type_motd_response padding restyle"
+      - "type_status / type_notice mono row-tag prefix"
+      - "NOTICE block typographic *** label"
+    dependencies:
+      - W2-T03
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/components/ServerLogTimeline.svelte
+        description: "Existing structure: head + {#if !collapsed} block at line 393; row--info CSS at 750-757; row--motd at 880-886; row-tag at 724-731; rowClassForCommand at 90-96; notice-seg--notice-label at 851-856"
+      - path: frontend/src/stores/preferences.svelte.ts
+        description: "getServerlogCollapseEvents from W2-T03"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "Render an attempt with phases + welcome + motd + numerics + isupport + notices; assert one <details class='connection-events'> wraps them all."
+      - "When getServerlogCollapseEvents() returns true (default), the <details> has no `open` attribute."
+      - "When getServerlogCollapseEvents() returns false, the <details> has `open`."
+      - "Clicking the <details> summary toggles open AND calls setServerlogCollapseEvents(false) or (true) respectively."
+      - ".row--info computed padding is '10px 14px' (or '10px 12px', Svelte may compile to one shorthand)."
+      - ".row--motd computed padding is '10px 14px 14px'."
+      - ".row--info does NOT contain a visible .row-accent element."
+      - ".row-tag computed text-transform is 'uppercase'."
+      - "NOTICE block summary contains '*** NOTICE' typographic prefix."
+      - "ISUPPORT panel renders inside the <details>."
+      - "All 466 existing test assertions in ServerLogTimeline.test.ts remain green."
+    success_criteria:
+      - "Machine: npx vitest run --project=client src/components/ServerLogTimeline.test.ts — all green."
+      - "All existing 604 client tests remain green."
+    tech_stack: [typescript, svelte5-runes, vitest-browser]
+    test_coverage: "10 new cases; existing 466 tests remain green."
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "Existing ServerLogGroups (frontend/src/lib/serverLogGroups.ts) — frozen."
+        - "isupportFromMessages fallback at line 488-503 — frozen; the <ServerFeaturesPanel> still gets the same map regardless of <details> wrapping."
+        - "rowClassForCommand mapping at line 90-96 — extend with tag modifier; do not change the row-class mapping."
+      required_test_first: "W2-T03 must have shipped serverlogCollapseEvents pref first."
+      target_files:
+        - frontend/src/components/ServerLogTimeline.svelte
+        - frontend/src/components/ServerLogTimeline.test.ts
+      minimal_change: "Wrap existing row blocks in <details>; restyle three CSS rules; replace chip row-tag with mono prefix; extend tests."
+      acceptance_checks:
+        - "git grep -n 'connection-events' frontend/src/components/ServerLogTimeline.svelte returns 3+ occurrences (element + summary + CSS)."
+        - "grep -n 'row--info\\|row--motd' shows the classes preserved (other components may target)."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # WAVE 3 — ConnectionStatus.svelte full rewrite
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: W3-T01
+    title: ConnectionStatus.svelte full rewrite — 11 states + countdown + state-aware button
+    description: |
+      Rewrite `frontend/src/components/ConnectionStatus.svelte` to render
+      the IRCCloud-style 11-state banner with structured failure rendering,
+      ordinal attempt counts, 1s countdown timer, and the hairline-bar
+      visual treatment.
+
+      11 STATES (lifted verbatim from
+      irccloud-webpack-study/app/src/view/connectionstatusview.js:64-123):
+
+      | Status | Text template |
+      |---|---|
+      | `waiting_to_retry` (will retry) | "Reconnecting in {delay}s ({Nth} attempt)" |
+      | `waiting_to_retry` (give up) | "Reconnecting…" |
+      | `queued` | "Connection queued; waiting our turn…" |
+      | `connecting` | "Connecting to {host}…" |
+      | `connected` | "Connected; handshaking…" |
+      | `connected_joining` | "Connected; setting up…" |
+      | `quitting` | "Quitting…" |
+      | `ip_retry` | "Connecting to {ip} failed ({error}); resolving a new IP…" |
+      | `disconnected` (not failed) | "Disconnected" |
+      | `connected_ready` (focusOnMakeBuffer==='*') | "Connected; waiting to join…" |
+      | `connected_ready` (focusOnMakeBuffer is channel) | "Connected; waiting to join {chan}…" |
+
+      COUNTDOWN — use Svelte 5 runes with $effect + onCleanup:
+
+      ```ts
+      let countdown = $state(0);
+      $effect(() => {
+        const rs = activeNetwork?.retryStatus;
+        if (!rs) { countdown = 0; return; }
+        const tick = () => {
+          const remaining = Math.max(0, Math.ceil((rs.nextRetryAtMs - Date.now()) / 1000));
+          if (countdown !== remaining) countdown = remaining;
+        };
+        tick();
+        const id = setInterval(tick, 1000);
+        return () => clearInterval(id);
+      });
+      ```
+
+      The cleanup returns from $effect; Svelte 5 wires it automatically.
+      On unmount OR when `retryStatus` flips (e.g. user clicks Reconnect
+      which sets it to null), the interval is cleared. NO timer leak.
+
+      ORDINAL ATTEMPT COUNT — lift from connectionstatusview.js:46-50:
+
+      ```ts
+      function ordinal(n: number): string {
+        const suffix = ['th', 'st', 'nd', 'rd'];
+        const mod = n % 100;
+        return n + (suffix[(mod - 20) % 10] || suffix[mod] || suffix[0]);
+      }
+      ```
+
+      Used in: "Reconnecting in 5s (2nd attempt)". Only when attemptCount > 1.
+
+      STATE-AWARE BUTTON — derived from the existing connectionState +
+      failInfo:
+      - `disconnected` AND no failInfo: <button>Click to reconnect</button>
+      - `disconnected` AND `failInfo.type === 'killed'`: <button>Click to disconnect</button>
+      - `disconnected` AND `failInfo.type === 'connecting_restricted'` OR `'connection_blocked'`: <button>Click to see upgrade options</button> (degrades to reconnect in fiber; TODO header)
+      - `waiting_to_retry` AND willRetry: <button>Click to cancel reconnect</button> (calls disconnectNetwork)
+      - All other states: no button (banner is informational only)
+
+      RICH FAILURE RENDERING — lift the failure branch from
+      connectionstatusview.js:146-233. For each failInfo field:
+
+      - `failInfo.type === 'connecting_restricted'`: render
+        `renderRestricted(failInfo.reason)`. Bold the upgrade CTA (fiber
+        has no tier system; render `Disconnected` for unknown reasons).
+      - `failInfo.type === 'connection_blocked'`: render
+        "Disconnected - Connections to this server have been blocked".
+      - `failInfo.type === 'killed'`: render "Disconnected - Killed: {strip(killedReason)}".
+      - `failInfo.reason === 'ssl_verify_error'`: render
+        `<i class="warning-icon"></i> Strict transport security error: {renderSSLVerify(failInfo.sslVerifyError)}`.
+      - `failInfo.type === 'connecting_failed'`: render
+        "Failed to connect - {renderReason(failInfo.reason)}".
+      - Otherwise: render "Disconnected: {renderReason(failInfo.reason)}".
+
+      Inline suspicious-port / suspicious-host warnings:
+      - If `isSuspiciousPort(net.tls === 'on', net.port)`, render
+        `<b>You're trying to connect {via|without} SSL on port {port}.</b>`.
+      - If `!net.systemManaged && isSuspiciousHostname(net.host)`, render
+        `<b>Your hostname looks invalid: {host}</b>`.
+
+      HAIRLINE-BAR VISUAL — adopt IRCCloud's `.connectionStatus` styling
+      (full-width hairline border top+bottom, tinted bg, right-floated
+      label, hover/focus brighten). The current fiber banner uses an
+      inline gradient — replace with hairline + tinted bg:
+
+      ```css
+      .connectionStatus {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 14px;
+        background: var(--fiber-blue-soft, rgba(103,232,249,0.06));
+        border-top: 1px solid var(--fiber-line);
+        border-bottom: 1px solid var(--fiber-line-2);
+        color: var(--fiber-cloud);
+        font-family: var(--font-sans, sans-serif);
+        font-size: 12px;
+        line-height: 18px;
+        transition: background-color 120ms ease;
+      }
+      .connectionStatus:hover { background: var(--fiber-blue-soft-hover); }
+      .connectionStatus--fail  { background: var(--fiber-amber-soft); border-color: var(--fiber-amber); }
+      .connectionStatus--reconnect { /* default */ }
+      .connectionStatus .label { flex: 1; min-width: 0; }
+      .connectionStatus .button { flex-shrink: 0; margin-left: auto; }
+      ```
+
+      State classes — apply via `:class={...}` (Svelte 5):
+      - `.connectionStatus--away`
+      - `.connectionStatus--connecting`
+      - `.connectionStatus--reconnect`
+      - `.connectionStatus--fail`
+      - `.connectionStatus--disconnect`
+      - `.connectionStatus--upgrade`
+
+      Keep the existing `.connectionstatuscell.show` wrapper (used to
+      toggle visibility). Don't remove the outer `<div>` — just rewrite
+      the inner content.
+
+      TYPING — keep using Space Grotesk for labels, fiber-mono for
+      content (counts / time). No font family changes.
+
+      AWAY STATE — unchanged. The "Click to come back (or type /back)"
+      banner is structurally identical to IRCCloud's `away` state.
+
+      DO NOT TOUCH: existing props (`onSendRaw`, `onReconnect`),
+      `setActiveBuffer` import, `requestSync` import. The new banner
+      adds state-aware behaviour on top of these callbacks.
+    wave: 3
+    agent: implementer
+    status: pending
+    covers:
+      - "11-state ConnectionStatus banner"
+      - "1s countdown via $effect + onCleanup"
+      - "Ordinal attempt count"
+      - "State-aware button"
+      - "Rich failure rendering with renderReasons + suspicious-port + suspicious-hostname"
+      - "Hairline-bar visual treatment"
+    dependencies:
+      - W2-T01
+      - W2-T02
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/components/ConnectionStatus.svelte
+        description: "Existing 84-line component; replace with full rewrite while preserving props + setActiveBuffer + requestSync imports"
+      - path: frontend/src/lib/renderReasons.ts
+        description: "renderReason + renderSSLVerify + renderRestricted from W2-T01"
+      - path: frontend/src/lib/suspiciousConnection.ts
+        description: "isSuspiciousPort + isSuspiciousHostname from W2-T01"
+      - path: irccloud-webpack-study/app/src/view/connectionstatusview.js
+        description: "Source — line 64-123 (states), line 146-233 (failure branch), line 38-56 (retryingText + ordinal)"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: true
+    acceptance_criteria:
+      - "ConnectionStatus renders 11 states correctly: queued, connecting, connected, connected_joining, connected_ready, waiting_to_retry (will retry / give up), quitting, ip_retry, disconnected (not failed / failed / killed / ssl_verify / connecting_failed / connecting_restricted / connection_blocked)."
+      - "When retryStatus.attemptCount > 1, the banner text includes the ordinal (e.g. '2nd attempt', '3rd attempt')."
+      - "When retryStatus.nextRetryAtMs > now, a countdown is rendered that decrements every 1s and stops at 0."
+      - "On unmount OR retryStatus transition to null, the setInterval is cleared (no leaked timer)."
+      - "When failInfo.type === 'killed', the state-aware button is 'Click to disconnect'."
+      - "When failInfo.reason === 'ssl_verify_error', the banner renders 'Strict transport security error: {renderSSLVerify(failInfo.sslVerifyError)}' with a warning icon."
+      - "When failInfo.reason === 'ssl_verify_error' and sslVerifyError.type === 'bad_cert' and sslVerifyError.error === 'cert_expired', renderSSLVerify returns 'Certificate expired'."
+      - "When failInfo.reason === 'econnrefused', the banner renders 'Disconnected: Connection refused'."
+      - "When isSuspiciousPort(net.tls === 'on', 6667), the banner renders 'You're trying to connect via SSL on port 6667'."
+      - "When isSuspiciousHostname('localhost'), the banner renders 'Your hostname looks invalid: localhost'."
+      - "When network.isAway === true and connected === true, the away banner renders (unchanged)."
+      - "On click of state-aware button, onSendRaw / onReconnect / onDisconnect callback fires (existing prop contract preserved)."
+      - "Hairline-bar visual: top + bottom border in --fiber-line / --fiber-line-2; tinted bg in --fiber-blue-soft / --fiber-amber-soft for fail; hover brighten."
+    success_criteria:
+      - "All 7 existing ConnectionStatus.test.ts cases pass (with extended assertions for state coverage)."
+      - "All 604 client + 379 lib tests remain green."
+      - "Manual: in dev:local, force a network to disconnect (point at 127.0.0.1:1) and observe the 11-state rotation: queued → connecting → waiting_to_retry (1st attempt → 2nd attempt → …) → eventually disconnected with rich failure rendering."
+    tech_stack: [typescript, svelte5-runes, css]
+    test_coverage: "ConnectionStatus.test.ts extended with 11-state cases + countdown + state-aware button + failure rendering + suspicious-port/host + ordinal."
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "Away state implementation — identical to IRCCloud's `away` branch (line 234-244 of connectionstatusview.js); reuse verbatim."
+        - "Existing props (`onSendRaw`, `onReconnect`) — preserve. New state-aware button may call these via different code paths."
+        - "Existing setActiveBuffer / requestSync imports — preserve."
+      required_test_first: "W2-T01 (renderReasons.ts + suspiciousConnection.ts) + W2-T02 (applyRetryStatus + applyFail) must have shipped first."
+      target_files:
+        - frontend/src/components/ConnectionStatus.svelte
+        - frontend/src/components/ConnectionStatus.test.ts
+      minimal_change: "Rewrite the inner template + script; preserve props + imports + outer wrapper. ~280 lines."
+      acceptance_checks:
+        - "git grep -n 'renderReason\\|renderSSLVerify\\|isSuspiciousPort\\|isSuspiciousHostname' frontend/src/components/ConnectionStatus.svelte shows all four imports + call sites."
+        - "ConnectionStatus.test.ts shows at least 20 cases (existing 5 + new state coverage)."
+
+  - id: W3-T02
+    title: ConnectionStatus.test.ts — 11-state coverage + countdown + state-aware button + failure rendering
+    description: |
+      Extend `frontend/src/components/ConnectionStatus.test.ts` (currently
+      88 lines, 5 cases) with comprehensive state coverage.
+
+      A. AWAY — existing test (line 21-30) preserved + extend with `Click
+      to come back` button click.
+
+      B. DISCONNECTED (no failInfo) — existing (line 32-45) preserved +
+      add assertion that the click handler invokes onReconnect.
+
+      C. DISCONNECTED + kill failInfo — new test. Set
+      net.failInfo = {type:'killed', reason:'', killedReason:'(Ghost)',
+      sslVerifyError: undefined}. Render. Assert:
+      - "Disconnected - Killed: (Ghost)" text in document.
+      - Button label is "Click to disconnect".
+      - Click → onDisconnect prop fires.
+
+      D. DISCONNECTED + ssl_verify_error failInfo — new test. Set
+      net.failInfo = {type:'', reason:'ssl_verify_error',
+      sslVerifyError: {type:'bad_cert', error:'cert_expired'}}. Render.
+      Assert:
+      - "Strict transport security error" text in document.
+      - "Certificate expired" rendered (from renderSSLVerify).
+      - Warning icon present.
+
+      E. DISCONNECTED + econnrefused failInfo — new test. Set
+         net.failInfo = {type:'connecting_failed', reason:'econnrefused'}.
+         Render. Assert:
+         - "Failed to connect - Connection refused" text in document.
+
+      E.LEGACY. DISCONNECTED + legacy disconnectReason ONLY (TG2) —
+         new test. Construct a Network with `disconnectReason =
+         'Connection reset'` and `failInfo = undefined` (the legacy
+         path — an old build OR a server-error emit before
+         CONNECTION_FAIL had a chance to flow). Render. Assert:
+         - Banner text reads "Disconnected: Connection reset"
+           (fallback to the legacy string, matching the
+           `failInfo ?? disconnectReason` derivation in W3-T01's
+           banner branch).
+         - The banner does NOT reach the structured-reason
+           rendering branch.
+         This pins the legacy fallback path explicitly so a future
+         change to failInfo's optional status doesn't silently
+         regress networks that arrive via the legacy emit.
+
+      F. SUSPICIOUS PORT (SSL on 6667) — new test. Set
+      net.tls='on', net.port=6667. Render with failInfo set to trigger
+      the failure path. Assert:
+      - "You're trying to connect via SSL on port 6667" rendered.
+
+      G. SUSPICIOUS HOSTNAME (localhost) — new test. Set
+      net.host='localhost'. Render with failInfo set. Assert:
+      - "Your hostname looks invalid: localhost" rendered.
+
+      H. WAITING_TO_RETRY (will retry, ordinal) — new test. Set
+      net.retryStatus = {attemptCount: 2, nextRetryAtMs:
+      Date.now() + 5000, delayMs: 5000}. Render. Assert:
+      - "Reconnecting in 5s" or similar text.
+      - "(2nd attempt)" text rendered.
+
+      I. WAITING_TO_RETRY (countdown ticks) — new test. Set
+      net.retryStatus = {attemptCount: 1, nextRetryAtMs:
+      Date.now() + 3000, delayMs: 3000}. Render. Wait 1.5s. Assert:
+      - The countdown text decremented (e.g. from "3s" to "2s").
+      - On unmount (after assertion), the interval is cleared. Verify
+        by setting up another component, unmount, and checking that
+        vi.useFakeTimers + vi.advanceTimersByTime doesn't fire stale
+        callbacks.
+
+      J. QUEUED state — new test. Set net.connectionState='connecting'
+      with status='queued'. Render. Assert: "Connection queued; waiting
+      our turn…" text.
+
+      K. CONNECTING state — new test. Set net.connectionState='connecting'.
+      Render. Assert: "Connecting to {host}…" text.
+
+      L. CONNECTED_READY with focusOnMakeBuffer — new test. Set
+      net.connectionState='connected_ready', net.focusOnMakeBuffer='#test'.
+      Render. Assert: "Connected; waiting to join #test…" text.
+
+      M. QUITTING state — new test. Set net.connectionState='quitting'.
+      Render. Assert: "Quitting…" text.
+
+      N. HAIRLINE-BAR VISUAL — new test. Render any state. Assert
+      computedStyle for `.connectionStatus` shows `border-top-width: 1px`
+      AND `border-bottom-width: 1px` AND `background-color: rgba(...)`
+      OR `transparent` (depends on state).
+
+      O. AWAY PRESENCE DURING DISCONNECT — new test. Set
+      net.isAway=true AND net.connected=false AND
+      net.connectionState='disconnected'. Render. Assert: BOTH the
+      away banner AND the disconnected banner are not simultaneously
+      visible (existing showStatus logic). Actually verify the
+      showStatus logic: isAway → show away only; isConnecting → show
+      connecting only; isDisconnected && !isConnecting → show
+      reconnect only.
+
+      Existing tests at line 21-87 are preserved. New tests appended
+      after line 87.
+    wave: 3
+    agent: implementer
+    status: pending
+    covers:
+      - "Test coverage for 11 states + countdown + state-aware button + failure rendering + suspicious-port/host"
+    dependencies:
+      - W3-T01
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/components/ConnectionStatus.test.ts
+        description: "Existing 5-case test file at line 21-87; extend with 12 new cases after line 87"
+      - path: frontend/src/test/factories.ts
+        description: "createNetwork helper at line 17; extend with retryStatus + failInfo field defaults if not already present"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "All 17 cases (5 existing + 12 new) pass."
+      - "Countdown test verifies decrement within 1.5s of a 3s initial value."
+      - "State-aware button test verifies onDisconnect vs onReconnect prop invocation."
+      - "Failure rendering test verifies renderSSLVerify('bad_cert', 'cert_expired') = 'Certificate expired'."
+      - "Suspicious-port / suspicious-host tests verify inline warnings render."
+      - "Hairline-bar visual test verifies border-top + border-bottom widths."
+      - "All 604+ existing client tests remain green."
+    success_criteria:
+      - "Machine: npx vitest run --project=client src/components/ConnectionStatus.test.ts — all green."
+      - "Machine: npx vitest run --project=client — full client suite green."
+    tech_stack: [typescript, vitest, vitest-browser]
+    test_coverage: "12 new cases for ConnectionStatus; total 17 cases."
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "Existing 5 tests at line 21-87 — preserved verbatim; do not edit."
+        - "Test scaffolding (createNetwork / createBuffer / page / userEvent) — reuse."
+      required_test_first: "W3-T01 must have shipped the rewrite first."
+      target_files:
+        - frontend/src/components/ConnectionStatus.test.ts
+      minimal_change: "Append 12 new cases; preserve existing 5."
+      acceptance_checks:
+        - "vitest output shows 17 cases in ConnectionStatus describe block."
+
+  - id: W3-T03
+    title: gem-reviewer(wave) gate for Wave 3
+    description: |
+      Lightweight review of the ConnectionStatus rewrite + tests. Wave
+      gate per plan structure.
+
+      Focus areas:
+      1. Svelte 5 runes hygiene: confirm `countdown` is in $state, $effect
+         returns the cleanup closure (not a manual onCleanup call — Svelte
+         5 $effect returns the cleanup directly).
+      2. setInterval cleanup verification: confirm the $effect re-runs
+         when retryStatus changes (i.e. when activeNetwork.retryStatus
+         flips from defined to null). Component test W3-T02 case I
+         exercises this.
+      3. State-aware button: confirm onDisconnect prop exists OR the
+         component calls the right store function (whichever the
+         implementer chose). If onDisconnect prop doesn't exist, the
+         implementer should add it.
+      4. Visual regression: confirm hairline-bar border-top + border-bottom
+         AND tinted bg. Use the brief's IRCCloud palette mapping as the
+         reference (no new tokens introduced).
+      5. Test coverage: 17 cases must pass.
+      6. RenderReasons / suspiciousConnection integration: confirm all
+         four functions are imported + used. No dead code.
+
+      Review depth: full (since this is the user-visible banner). Output
+      to `docs/plan/20260716-irccloud-parity/logs/wave3-review.md`.
+    wave: 3
+    agent: reviewer
+    status: pending
+    covers:
+      - "Cross-wave correctness verification for Wave 3"
+    dependencies:
+      - W3-T01
+      - W3-T02
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/components/ConnectionStatus.svelte
+        description: "Review target — full rewrite"
+      - path: frontend/src/components/ConnectionStatus.test.ts
+        description: "Review target — 17 cases"
+      - path: docs/plan/20260716-irccloud-parity/plan.yaml
+        description: "Plan to verify against"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "PASS or FAIL recorded in logs/wave3-review.md."
+      - "Each of the 6 focus areas addressed."
+    success_criteria:
+      - "review.md committed; PASS verdict enables Wave 4."
+    test_coverage: "N/A — review only"
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "ConnectionStatus rewrite — just shipped; review the artifact."
+      required_test_first: "All Wave 3 tasks completed."
+      target_files:
+        - docs/plan/20260716-irccloud-parity/logs/wave3-review.md
+      minimal_change: "One review document."
+      acceptance_checks:
+        - "wave3-review.md cites the 6 focus areas and maps each to a verification result."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # WAVE 4 — ServerLogTimeline collapse + restyle
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: W4-T01
+    title: ServerLogTimeline connection-events wrap + restyle (real ship)
+    description: |
+      Finalize the Wave 2 W2-T04 work in ServerLogTimeline.svelte.
+
+      The Wave 2 W2-T04 task already lays out the design; this task
+      ships the FINAL implementation after Wave 3's banner rewrite has
+      established the visual vocabulary.
+
+      Specifically:
+      - Wrap attempt.phases + welcome + motd + numerics + isupport + notices
+        in a single <details class="connection-events" open={!getServerlogCollapseEvents()}>.
+      - <summary> shows "Connection events ({N})".
+      - <details> ontoggle syncs the pref via setServerlogCollapseEvents.
+      - Restyle .row--info + .row--motd padding to 10px (drop cyan stripe + bg).
+      - Replace cyan-chip row-tag with mono type_status / type_notice prefix.
+      - Replace cyan-chip NOTICE block summary with inline `*** NOTICE · N messages`.
+
+      A. Real <details> binding — use Svelte 5 `bind:open` (a native
+      directive, NOT the `$bindable` rune) with a LOCAL `$state`
+      mirror of the pref, plus an `$effect` that mirrors STORE
+      CHANGES BACK into the local state. The browser toggles `open`
+      natively on click and fires `ontoggle`; we mirror the
+      browser's value into the store via that event. External
+      triggers (storage event in another tab, context-menu toggle,
+      setServerlogCollapseEvents from elsewhere) flow through the
+      `$effect`. This is the correct Svelte 5 pattern for two-way
+      binding on a native DOM attribute — see B4.
+
+      ```svelte
+      <script lang="ts">
+        import {
+          getServerlogCollapseEvents,
+          setServerlogCollapseEvents,
+        } from '$lib/stores/preferences.svelte';
+
+        // Local mirror. `bind:open` writes here on user click;
+        // the $effect below pulls external pref changes back in.
+        let eventsOpen = $state(!getServerlogCollapseEvents());
+
+        // Mirror external pref changes (storage event in another
+        // tab, context-menu toggle, programmatic call) into local
+        // state so the <details> rerenders without a page reload.
+        $effect(() => {
+          eventsOpen = !getServerlogCollapseEvents();
+        });
+      </script>
+
+      <details
+        class="connection-events"
+        bind:open={eventsOpen}
+        ontoggle={(e) => {
+          const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+          setServerlogCollapseEvents(!isOpen);
+        }}
+      >
+        <summary class="connection-events-summary">Connection events ({N})</summary>
+        ... existing attempt rows ...
+      </details>
+      ```
+
+      Why this pattern (and not `$bindable`): `<details>`'s `open`
+      attribute is a native DOM property the BROWSER toggles
+      independently of any Svelte prop. Svelte 5's `$bindable`
+      rune is for two-way binding across a component-prop
+      boundary, not for forcing reactivity onto a native
+      attribute — using `$bindable` on a plain HTML element
+      produces a write-once behaviour that fights the browser's
+      own toggle and yields a stale `open` state on the second
+      click. `bind:open` is the native Svelte 5 directive that
+      correctly proxies a native element's two-way state into a
+      local `$state`. Combined with the `$effect` mirror, this
+      gives a clean two-way flow: browser ↔ local `$state` ↔
+      preference store ↔ localStorage ↔ other tabs.
+
+      B. 005 ISUPPORT panel MUST live inside the <details>. The existing
+      <ServerFeaturesPanel> is at line 494-503; the <details> wrap
+      happens above it. Verify by component test.
+
+      C. The collapse auto-close $effect (line 319-337) stays — it
+      operates on per-attempt serverlogCollapsedMap keys, independent of
+      the global connection-events pref. No conflict.
+
+      D. CSS for the connection-events <details> + summary:
+
+      ```css
+      .connection-events {
+        margin: 0;
+        padding: 0;
+      }
+      .connection-events-summary {
+        cursor: pointer;
+        padding: 6px 14px;
+        font-family: var(--font-mono-fiber, monospace);
+        font-size: 11px;
+        color: var(--fiber-mist);
+        letter-spacing: 0.04em;
+        border-bottom: 1px solid var(--fiber-line);
+        user-select: none;
+      }
+      .connection-events-summary:hover { color: var(--fiber-cloud); background: rgba(255,255,255,0.02); }
+      .connection-events-summary::marker { color: var(--fiber-blue); }
+      ```
+
+      E. Extend `ServerLogTimeline.test.ts` (already extended in W2-T04)
+      with one more case verifying the count badge updates correctly
+      after a phase row is added.
+    wave: 4
+    agent: implementer
+    status: pending
+    covers:
+      - "Real ship of connection-events wrap + restyle after Wave 3 review"
+    dependencies:
+      - W2-T04
+      - W3-T03
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/components/ServerLogTimeline.svelte
+        description: "Wave 2 W2-T04 design + W3 visual vocabulary; ship final implementation here"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "<details class='connection-events'> wraps attempt.phases + welcome + motd + numerics + isupport + notices."
+      - "<details> open attribute = !getServerlogCollapseEvents() (reactive via $derived)."
+      - "Clicking <summary> toggles open + calls setServerlogCollapseEvents."
+      - "ServerFeaturesPanel still renders inside the <details>."
+      - "All 466 existing + 11 new (from W2-T04 + this task) tests pass."
+      - "All 604 client + 379 lib tests remain green."
+    success_criteria:
+      - "Machine: vitest run --project=client src/components/ServerLogTimeline.test.ts — all green."
+    tech_stack: [typescript, svelte5-runes]
+    test_coverage: "11 new cases total (10 from W2-T04 + 1 from this task)."
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "Per-attempt serverlogCollapsedMap key format — frozen."
+        - "ServerFeaturesPanel — frozen."
+        - "parseWelcomeLine + parseNumericStat + parseNoticeOrCapLine — frozen."
+      required_test_first: "Wave 3 review (W3-T03) must have passed."
+      target_files:
+        - frontend/src/components/ServerLogTimeline.svelte
+      minimal_change: "Wrap existing rows in <details>; restyle 3 CSS rules; replace chip row-tag with mono prefix."
+      acceptance_checks:
+        - "git grep -n 'connection-events' frontend/src/components/ServerLogTimeline.svelte returns 5+ occurrences (element + summary + CSS + count badge)."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # WAVE 5 — Polish, docs, browser smoke, full review
+  # ─────────────────────────────────────────────────────────────────────────
+  # NOTE: The standalone Wave-4 reviewer (formerly W4-T02) was removed
+  # in the 20260716 critique pass (OE5). Wave 4's implementer task W4-T01
+  # is reviewed as part of W5-T03 (full review, end-of-plan). Reviewer
+  # overhead: 1 wave gate (W3-T03, end of Wave 3) + 1 final full review
+  # (W5-T03, end of Wave 5). 8 implementer tasks + 2 reviewer tasks.
+  - id: W5-T01
+    title: AGENTS.md — Connecting / server log IRCCloud parity section
+    description: |
+      Append a new section to `AGENTS.md` after the existing "Server
+      features UI overhaul" entry (which covers the 005 ISUPPORT panel).
+      Mirror the existing section's structure: problem statement, file
+      map, behavior matrix, acceptance criteria.
+
+      Sections to write:
+      - "Connecting / server log — IRCCloud parity" — header
+      - Problem statement — three divergences (banner, timeline wrap, type
+        prefix) and what changed.
+      - File map — engine: connection.d, irc_event.d, redis/protocol.d,
+        engine/state.d, api/websocket.d. Frontend: lib/renderReasons.ts,
+        lib/suspiciousConnection.ts, types.ts, stores/preferences.svelte.ts,
+        stores/ircStore.svelte.ts, lib/messageHandler.ts,
+        components/ConnectionStatus.svelte, components/ServerLogTimeline.svelte.
+      - Behavior matrix — 11 states × 11 reason codes table.
+      - Acceptance criteria — 5 user-stated bullets mapping to test IDs.
+      - Known issues — engine dub test broken (pre-existing, not this
+        plan); IRCCloud palette tokens are REFERENCE colors only.
+      - Quickstart for adding a new connection state — extend
+        renderReasons.ts table + add a new state branch in
+        ConnectionStatus.svelte.
+
+      Length target: 60-80 lines, dense bullet format, no prose
+      paragraphs (matches the existing AGENTS.md style).
+    wave: 5
+    agent: documentation-writer
+    status: pending
+    covers:
+      - "AGENTS.md entry for the IRCCloud-parity work"
+    dependencies:
+      - W4-T01
+    conflicts_with: []
+    context_files:
+      - path: AGENTS.md
+        description: "Existing 'Server features UI overhaul' section + 2026-07-08 audit entry — match style + position"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "AGENTS.md gains a new 'Connecting / server log — IRCCloud parity' section after the existing Server features entry."
+      - "Section includes problem statement, file map, behavior matrix, acceptance criteria, known issues, quickstart."
+      - "Length 60-80 lines, dense bullets, no prose paragraphs."
+    success_criteria:
+      - "AGENTS.md commits cleanly; the new section is reachable via grep on 'IRCCloud parity'."
+    tech_stack: [markdown]
+    test_coverage: "N/A — docs"
+    diag: null
+    handoff:
+      do_not_reinvestigate:
+        - "Existing AGENTS.md sections — preserve verbatim."
+      required_test_first: "Wave 4 must have shipped."
+      target_files:
+        - AGENTS.md
+      minimal_change: "Append one section."
+      acceptance_checks:
+        - "grep -n 'IRCCloud parity' AGENTS.md returns at least 1 hit."
+
+  - id: W5-T02
+    title: Browser smoke (gem-browser-tester) — 11-state banner + connection-events collapse
+    description: |
+      Manual smoke against the user-stated acceptance criteria under
+      `make local-dev-up` (or running dev server). Use playwright /
+      vitest-browser tooling already in the project (Playwright
+      capture_comparison.js for visual diff).
+
+      Scenario A — happy path connect:
+      1. Open dev:local in browser.
+      2. Connect to a working IRC server (e.g. lib via localhost:6667).
+      3. Observe ConnectionStatus briefly shows "Connecting…", then
+         "Connected; handshaking…", then disappears.
+      4. Screenshot capture_comparison.js → docs/plan/20260716-irccloud-parity/logs/smoke-happy.png.
+
+      Scenario B — disconnect + retry (ordinal + countdown):
+      1. Force a network to disconnect (admin API DELETE? or kill
+         server).
+      2. Observe ConnectionStatus shows "Reconnecting in {N}s (Mth
+         attempt)" with the countdown ticking every second.
+      3. After M attempts, observe "Disconnected: {renderReason(...)}".
+      4. Screenshot smoke-retry.png.
+
+      Scenario C — connection events collapse:
+      1. Open server log buffer.
+      2. Observe "Connection events (N)" <details> is collapsed by default.
+      3. Click to expand; observe all the existing rows render (phases +
+         welcome + motd + numerics + isupport + notices).
+      4. Click again to collapse; observe persistence via localStorage
+         (refresh page → still collapsed).
+      5. Screenshot smoke-events-collapse.png.
+
+      Scenario D — suspicious port / hostname:
+      1. Add a network with TLS=on and port=6667 (IRCCloud's suspicious
+         combo).
+      2. Observe the inline warning: "You're trying to connect via SSL
+         on port 6667."
+      3. Add a network with host=localhost.
+      4. Observe: "Your hostname looks invalid: localhost."
+      5. Screenshot smoke-suspicious.png.
+
+      Scenario E — 005 ISUPPORT inside the wrap:
+      1. Connect to a server with rich 005 (e.g. libera).
+      2. Open server log, expand Connection events.
+      3. Confirm ServerFeaturesPanel renders inside the <details>.
+      4. Screenshot smoke-isupport.png.
+
+      Output a brief markdown summary at
+      `docs/plan/20260716-irccloud-parity/logs/smoke-summary.md` listing
+      pass/fail per scenario.
+    wave: 5
+    agent: browser-tester
+    status: pending
+    covers:
+      - "End-to-end acceptance verification"
+    dependencies:
+      - W4-T01
+      - W5-T01
+    conflicts_with: []
+    context_files:
+      - path: capture_comparison.js
+        description: "Existing capture script for visual diff — extend or call directly"
+      - path: frontend/src/components/ConnectionStatus.svelte
+        description: "Banner to smoke"
+      - path: frontend/src/components/ServerLogTimeline.svelte
+        description: "Timeline to smoke"
+    flags:
+      flaky: true
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "All 5 scenarios (A-E) pass in the dev environment."
+      - "Screenshots show the expected states at the right moments."
+      - "smoke-summary.md is committed into the plan dir logs."
+    success_criteria:
+      - "Human-readable smoke report at logs/smoke-summary.md."
+      - "Pass criteria map 1:1 to the user-stated acceptance bullets."
+    test_coverage: "E2E (visual + behavioral)"
+    diag: null
+    handoff:
+      do_not_reinvestigate: []
+      required_test_first: "All prior waves must pass first."
+      target_files:
+        - docs/plan/20260716-irccloud-parity/logs/smoke-summary.md
+        - docs/plan/20260716-irccloud-parity/logs/smoke-*.png
+      minimal_change: "Just verification artifacts."
+      acceptance_checks:
+        - "smoke-summary.md exists; lists PASS/FAIL per scenario."
+
+  - id: W5-T03
+    title: gem-reviewer(full) — final review + acceptance criteria traceability
+    description: |
+      Full review per AGENTS.md gem-reviewer role. Cross-wave correctness
+      + acceptance criteria traceability.
+
+      Focus areas:
+      1. Engine emit both `disconnectReason` (legacy) AND structured
+         `failInfo` — documented in connection.d + context_envelope.json.
+      2. Frontend renders `failInfo` first, falls back to `disconnectReason`.
+         Banner doesn't lose information on legacy networks.
+      3. setInterval cleanup verified across status transitions. No
+         leaked timer when user clicks Reconnect, switches buffers,
+         or unmounts.
+      4. Connection-events <details> wrap doesn't break ISUPPORT panel.
+         ServerFeaturesPanel still renders identically inside or outside
+         the wrap.
+      5. Fiber palette preserved. No new CSS tokens introduced. Visual
+         changes are structural (padding, row-tag typography) not
+         chromatic (no new colors).
+      6. All 5 user-stated acceptance bullets mapped to:
+         - Banner 11 states → ConnectionStatus.test.ts cases J-M
+         - Banner 1s countdown → ConnectionStatus.test.ts case I
+         - Banner state-aware button → ConnectionStatus.test.ts cases C, H
+         - Suspicious port/host → ConnectionStatus.test.ts cases F, G
+         - Connection events <details> + pref → ServerLogTimeline.test.ts
+           cases (from W2-T04 + W4-T01)
+         - FailInfo structured rendering → ConnectionStatus.test.ts
+           cases C, D, E
+      7. AGENTS.md new section is consistent with the existing sections.
+      8. Browser smoke (W5-T02) covers all 5 scenarios with PASS verdicts.
+      9. scope = frontend + engine; wire protocol shape frozen (no
+         breaking changes to existing CONNECTED / DISCONNECTED /
+         NOTICE / PRIVMSG / ISUPPORT events).
+
+      Output to `docs/plan/20260716-irccloud-parity/logs/review.md`.
+      Verdict: PASS or FAIL.
+    wave: 5
+    agent: reviewer
+    status: pending
+    covers:
+      - "Full review + acceptance criteria traceability"
+    dependencies:
+      - W5-T01
+      - W5-T02
+    conflicts_with: []
+    context_files:
+      - path: docs/plan/20260716-irccloud-parity/plan.yaml
+        description: "Plan to verify against"
+      - path: frontend/src/components/ConnectionStatus.svelte
+        description: "Review target"
+      - path: frontend/src/components/ServerLogTimeline.svelte
+        description: "Review target"
+      - path: frontend/src/lib/renderReasons.ts
+        description: "Review target"
+      - path: frontend/src/lib/suspiciousConnection.ts
+        description: "Review target"
+      - path: AGENTS.md
+        description: "Review target"
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "review.md committed to plan dir logs; PASS verdict enables completion."
+      - "Each of the 9 focus areas addressed with explicit verification."
+      - "All 5 user-stated acceptance bullets traceable to a vitest case or smoke scenario."
+    success_criteria:
+      - "review.md exists; PASS or FAIL verdict explicit."
+    test_coverage: "N/A — review only"
+    diag: null
+    handoff:
+      do_not_reinvestigate: []
+      required_test_first: "All prior waves completed."
+      target_files:
+        - docs/plan/20260716-irccloud-parity/logs/review.md
+      minimal_change: "One review document."
+      acceptance_checks:
+        - "review.md cites the 9 focus areas and maps each to a verification result."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CRITIQUE REPLIES — 20260716-irccloud-parity (gem-critic pass 2)
+# ═══════════════════════════════════════════════════════════════════════════
+# Each entry replies to a critique item from CRITIQUE.md. B = blocker,
+# R = risk, OE = over-engineering, TG = test gap. R1 / R2 / R4 / R5 were
+# unaddressed by this pass — see notes at the end of this section for
+# rationale per item; the implementer addresses them as part of their
+# normal work and the plan doesn't need explicit instructions for them
+# (R1's parseReasonToFailInfo mapping is documented inside the helper
+# scope at implementation time, R2's failInfo-vs-disconnectReason
+# derivation is already pinned by the W3-T01 banner branch + this pass's
+# E.LEGACY test, R4 is a UX-discovery call, R5 is a CSS fallback that
+# defaults transparently to rgba() if the token is absent).
+critique_replies:
+  - id: B1
+    fix_summary: "W1-T01 section A now adds `waiting_to_retry` to the engine's ConnectionState enum (line 39-44), instructs the implementer to set `state = ConnectionState.waiting_to_retry;` immediately before the deadline sleep at line 1595 (replacing the prior `state = connecting` at line 1575), and to emit CONNECTION_RETRY_STATUS at that site with the new `(attemptCount, nextRetryAtMs, delayMs)` payload. The transition back to `connecting` happens at the existing line 1704 when the sleep loop exits and `attemptConnection()` runs."
+    file_section: "tasks: W1-T01 description section A + acceptance_criteria + success_criteria"
+  - id: B2
+    fix_summary: "FailInfo shape is now uniformly nested: engine-side D struct holds `string type; string reason; string killedReason; Json sslVerifyError;` (Json is the existing `vibe.d.data.json.Json` import already at irc_event.d:4). A new `setSSLVerify(FailInfo*, type, error)` helper builds the nested Json object. Contracts block updated to document `fi:{t,r,kr,sve:{type,error}}`. W2-T02 description's earlier note about shape-conversion logic is dropped because the shapes match byte-for-byte — messageHandler.ts does no conversion. Frontend TS interface unchanged: `sslVerifyError?: { type: string; error: string }`."
+    file_section: "tasks: W1-T01 description section C + contracts block (line ~125)"
+  - id: B3
+    fix_summary: "W1-T01 section A fourth bullet now spells out the zero-valued emit at every `backoff.reset()` site (line 1044, 1193, 1831) — `eventChannel.put(IRCRawEvent.makeConnectionRetryStatus(network, nid, 0, 0, 0))` — so the frontend's `applyRetryStatus(networkId, null)` clears both `net.retryStatus` and `net.failInfo`. Smoke scenario 3 in section G is the explicit failInfo-clear-after-reconnect test that was previously missing. Acceptance-criteria bullet ('every `backoff.reset()` site … emits …') is now a hard gate."
+    file_section: "tasks: W1-T01 description section A fourth bullet + section G smoke scenario 3 + acceptance_criteria"
+  - id: B4
+    fix_summary: "W4-T01 section A replaces the proposed `$bindable` + `open={!…}` pattern with `bind:open={eventsOpen}` (a native Svelte 5 directive, not the `$bindable` rune) where `eventsOpen` is a local `let … = $state(!getServerlogCollapseEvents())`, mirrored back from the store via `$effect(() => { eventsOpen = !getServerlogCollapseEvents(); })`. The `ontoggle` handler still syncs the store. Rationale documented inline (browser toggles `open` natively; `$bindable` is for component-prop boundaries and fights the browser)."
+    file_section: "tasks: W4-T01 description section A"
+  - id: OE5
+    fix_summary: "Removed the standalone Wave-4 reviewer task (formerly W4-T02). Wave 4's W4-T01 ships into Wave 5 and is reviewed as part of the existing W5-T03 full review. `coordination_notes` updated to reflect the new reviewer topology (1 wave gate + 1 final review). `plan_metrics.total_dependencies` dropped from 14 to 13 (W4-T02's only dep was W4-T01, no other task referenced W4-T02). A NOTE block was inserted above W5 to make the absence explicit for future readers."
+    file_section: "tasks: W4-T02 (deleted) + coordination_notes + plan_metrics + Wave 5 NOTE"
+  - id: TG1
+    fix_summary: "W2-T01 acceptance_criteria now explicitly pins `renderReason('econnrefused') === 'Connection refused'`, `renderReason('nxdomain') === 'Invalid hostname'`, `renderReason('ssl_certificate_error') === 'SSL certificate error'`, and that unknown reasons return the input string unchanged. This decouples the helper test from the banner test so a future renderReasons regression fails the helper test (not silently the banner test)."
+    file_section: "tasks: W2-T01 acceptance_criteria"
+  - id: TG2
+    fix_summary: "W3-T02 description grows a new case E.LEGACY that constructs a Network with `disconnectReason = 'Connection reset'` and `failInfo = undefined`, renders, and asserts the banner falls back to the legacy string 'Disconnected: Connection reset'. This pins the `failInfo ?? disconnectReason` derivation explicitly."
+    file_section: "tasks: W3-T02 description (case E.LEGACY after case E)"
+  - id: TG5
+    fix_summary: "W2-T02 acceptance_criteria bullet on `applyRetryStatus` now includes the full sequence: set retryStatus, then null it, assert `net.retryStatus === null` AND `net.failInfo === null`. This is the on-store counterpart to the engine's zero-valued `backoff.reset()` emit (W1-T01 section A)."
+    file_section: "tasks: W2-T02 acceptance_criteria"
+
+# Noted but not separately addressed in this pass (rationale):
+  # R1 (reason-keyword mapping in connection.d) — implemented at code time per
+  #   the bullet in W1-T01 section A which already calls for a "fixed table of
+  #   structured cases" with `etimedout, econnrefused, nxdomain, ssl_certificate_error,
+  #   ssl_error, pool_lost, ehostunreach, enetdown, crash, killed_reason`. An
+  #   explicit `parseReasonToFailInfo` helper + mapping table at code time is the
+  #   implementer's call; section's specification already contains the keyword set.
+  # R2 (failInfo-vs-disconnectReason dual-emit) — addressed implicitly: W3-T01's
+  #   banner branch already prefers failInfo and falls back to disconnectReason;
+  #   this pass adds the E.LEGACY test (TG2) to pin the fallback. The dual-emit
+  #   itself is documented in connection.d via the existing `lastEmittedReason`
+  #   write at line 1423-1431 and the structured emit added by W1-T01.
+  # R4 (two collapse concepts coexist) — UI-discovery follow-up. Not blocking:
+  #   this plan introduces the global `serverlogCollapseEvents` pref (W2-T03) per
+  #   the brief; the per-attempt `serverlogCollapsedMap` predates it and stays
+  #   orthogonally. The context-menu "Show connection events" toggle is not
+  #   implemented in this plan — out of scope.
+  # R5 (--fiber-amber-soft token) — defensive fallback documented in W3-T01:
+  #   `background: var(--fiber-amber-soft, rgba(255, 179, 0, 0.08));` already
+  #   uses the CSS variable w/ fallback form so the banner renders correctly
+  #   even if the token isn't defined. Visual regression test (TG4 / W3-T02 case
+  #   N) checks border widths + bg color resolution.

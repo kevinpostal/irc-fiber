@@ -1,0 +1,287 @@
+---
+# ============================================================================
+# Sync local Docker Mongo + Redis → tailnet
+# ----------------------------------------------------------------------------
+# One-way sync of local dev state into the tailnet stack on ircfiber-prod-1.
+# Idempotent in the sense that re-running produces the same end state, but
+# each run does destructive work (Mongo --drop, Redis RDB + AOF wipe + restart).
+#
+# Defaults to interactive confirmation. Pass `-e sync_yes=true` to skip.
+#
+# Configuration (override per call as needed):
+#   sync_tailnet_host=root@ircfiber-prod-1.tail544547.ts.net
+#   sync_mongo_local_container=irc_mongo_test
+#   sync_redis_local_container=irc_redis_test
+#   sync_mongo_tailnet_container=ircfiber-mongo
+#   sync_redis_tailnet_container=ircfiber-redis
+#   sync_mongo_db=ircfiber
+#
+# Prerequisites:
+#   - Local docker-compose stack running (irc_mongo_test, irc_redis_test)
+#   - Tailscale SSH to the tailnet host works non-interactively
+#     (use ~/.ssh/id_ed25519_ircfiber + ~/.ssh/config block)
+#   - Ansible vault password available via --ask-vault-pass or
+#     ANSIBLE_VAULT_PASSWORD_FILE
+#
+# Usage:
+#   ansible-playbook deploy/playbooks/sync-db-to-tailnet.yml
+#   ansible-playbook deploy/playbooks/sync-db-to-tailnet.yml -e sync_yes=true
+#   ansible-playbook deploy/playbooks/sync-db-to-tailnet.yml --tags mongo
+#   ansible-playbook deploy/playbooks/sync-db-to-tailnet.yml --tags redis
+# ============================================================================
+
+- name: Preflight
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    tailnet_host: "root@ircfiber-prod-1.tail544547.ts.net"
+    mongo_local_container: "irc_mongo_test"
+    redis_local_container: "irc_redis_test"
+    mongo_tailnet_container: "ircfiber-mongo"
+    redis_tailnet_container: "ircfiber-redis"
+    mongo_db: "ircfiber"
+    sync_yes: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+
+    - name: Preflight — local Mongo container is running
+      ansible.builtin.command: >-
+        docker inspect --format '{{ "{{.State.Status}}" }}'
+        {{ mongo_local_container }}
+      register: local_mongo
+      failed_when: local_mongo.stdout | trim != 'running'
+
+    - name: Preflight — local Redis container is running
+      ansible.builtin.command: >-
+        docker inspect --format '{{ "{{.State.Status}}" }}'
+        {{ redis_local_container }}
+      register: local_redis
+      failed_when: local_redis.stdout | trim != 'running'
+
+    - name: Preflight — tailnet host reachable via SSH (non-interactive)
+      ansible.builtin.command: "ssh -o BatchMode=yes {{ tailnet_host }} echo OK"
+      register: ssh_check
+      changed_when: false
+      failed_when: ssh_check.rc != 0
+
+    - name: Preflight — check tailnet container states
+      ansible.builtin.shell: |
+        set -e
+        for name in "{{ mongo_tailnet_container }}" "{{ redis_tailnet_container }}"; do
+          state=$(ssh -o BatchMode=yes {{ tailnet_host }} \
+            "docker container inspect '$name' 2>/dev/null" \
+            | grep -o '"Status":"[^"]*"' | cut -d'"' -f4 || echo "NOT_FOUND")
+          echo "$name:$state"
+        done
+      register: remote_containers
+      changed_when: false
+
+    - name: Preflight — assert tailnet containers exist
+      ansible.builtin.assert:
+        that:
+          - "'NOT_FOUND' not in remote_containers.stdout"
+          - "'mongo:' in remote_containers.stdout"
+          - "'redis:' in remote_containers.stdout"
+        fail_msg: |
+          One or more tailnet containers don't exist on {{ tailnet_host }}.
+          Deploy them first: ansible-playbook deploy/playbooks/site.yml
+
+    - name: Preflight — start stopped tailnet containers
+      ansible.builtin.shell: |
+        set -e
+        for name in "{{ mongo_tailnet_container }}" "{{ redis_tailnet_container }}"; do
+          line=$(echo "{{ remote_containers.stdout }}" | grep "^$name:" || true)
+          state=$(echo "$line" | cut -d: -f2)
+          if [ "$state" != "running" ]; then
+            echo "Starting $name ($state)..."
+            ssh -o BatchMode=yes {{ tailnet_host }} docker start "$name" >/dev/null
+          fi
+        done
+      register: start_result
+      changed_when: start_result.stdout | length > 0
+
+    - name: Confirmation prompt (skip with `-e sync_yes=true`)
+      ansible.builtin.pause:
+        prompt: |
+
+          This will REPLACE existing data in the tailnet stack:
+            • Mongo: --drop on '{{ mongo_db }}' collections (admin/config untouched)
+            • Redis: full RDB replacement + AOF wipe + container restart
+
+          Proceed? Type 'yes' to continue (Ctrl+C + A to abort)
+      when: not sync_yes
+
+# ----------------------------------------------------------------------------
+# Mongo sync
+# ----------------------------------------------------------------------------
+- name: Sync Mongo
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    tailnet_host: "root@ircfiber-prod-1.tail544547.ts.net"
+    mongo_local_container: "irc_mongo_test"
+    mongo_tailnet_container: "ircfiber-mongo"
+    mongo_db: "ircfiber"
+    dump_local_path: "/tmp/ircfiber-mongo-sync.dump"
+    dump_remote_path: "/tmp/ircfiber-mongo-sync.dump"
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tags: [mongo]
+
+  tasks:
+    - name: Dump local Mongo to local file
+      ansible.builtin.shell: >-
+        docker exec {{ mongo_local_container }}
+        mongodump --db={{ mongo_db }} --archive
+        > {{ dump_local_path }}
+      register: dump
+      changed_when: dump.rc == 0
+      failed_when: dump.rc != 0
+
+    - name: Show dump size
+      ansible.builtin.command: "du -h {{ dump_local_path }}"
+      register: dump_size
+      changed_when: false
+
+    - name: Debug — dump size
+      ansible.builtin.debug:
+        msg: "Local dump: {{ dump_size.stdout | trim }}"
+
+    - name: Copy dump to tailnet host
+      ansible.builtin.command: >-
+        scp -o BatchMode=yes {{ dump_local_path }} {{ tailnet_host }}:{{ dump_remote_path }}
+      register: scp
+      changed_when: scp.rc == 0
+
+    - name: Copy dump into tailnet container
+      ansible.builtin.command: >-
+        ssh -o BatchMode=yes {{ tailnet_host }}
+        docker cp {{ dump_remote_path }} {{ mongo_tailnet_container }}:{{ dump_remote_path }}
+      changed_when: true
+
+    - name: Restore Mongo with --drop (scoped to ircfiber.*)
+      # Mongo binds ONLY to the Tailscale IP (100.126.197.92) with
+      # network_mode: host. So we must connect via --host=<tailscale_ip>
+      # instead of defaulting to localhost (which mongo doesn't listen on).
+      ansible.builtin.shell: >-
+        ssh -o BatchMode=yes {{ tailnet_host }}
+        docker exec {{ mongo_tailnet_container }}
+        mongorestore --archive={{ dump_remote_path }}
+        --drop --nsInclude='{{ mongo_db }}.*'
+        --host=100.126.197.92 --port=27017
+        --username={{ vault_mongo_root_username }}
+        --password='{{ vault_mongo_root_password }}'
+        --authenticationDatabase=admin
+      no_log: true  # don't echo the password
+      changed_when: true
+
+    - name: Cleanup — dump inside tailnet container
+      ansible.builtin.command: >-
+        ssh -o BatchMode=yes {{ tailnet_host }}
+        docker exec {{ mongo_tailnet_container }} rm -f {{ dump_remote_path }}
+      changed_when: true
+
+    - name: Cleanup — dump on tailnet host
+      ansible.builtin.command: "ssh -o BatchMode=yes {{ tailnet_host }} rm -f {{ dump_remote_path }}"
+      changed_when: true
+
+    - name: Cleanup — local dump
+      ansible.builtin.file:
+        path: "{{ dump_local_path }}"
+        state: absent
+
+# ----------------------------------------------------------------------------
+# Redis sync
+# ----------------------------------------------------------------------------
+- name: Sync Redis
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    tailnet_host: "root@ircfiber-prod-1.tail544547.ts.net"
+    redis_local_container: "irc_redis_test"
+    redis_tailnet_container: "ircfiber-redis"
+    rdb_local_path: "/tmp/ircfiber-redis-sync.rdb"
+    rdb_remote_path: "/tmp/ircfiber-redis-sync.rdb"
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tags: [redis]
+
+  tasks:
+    - name: Save local Redis RDB
+      ansible.builtin.command: "docker exec {{ redis_local_container }} redis-cli BGSAVE"
+      changed_when: true
+
+    - name: Wait for BGSAVE to finish
+      ansible.builtin.pause:
+        seconds: 2
+
+    - name: Copy local RDB from container to local file
+      ansible.builtin.command: >-
+        docker cp {{ redis_local_container }}:/data/dump.rdb {{ rdb_local_path }}
+      changed_when: true
+
+    - name: Show RDB size
+      ansible.builtin.command: "du -h {{ rdb_local_path }}"
+      register: rdb_size
+      changed_when: false
+
+    - name: Debug — RDB size
+      ansible.builtin.debug:
+        msg: "Local RDB: {{ rdb_size.stdout | trim }}"
+
+    - name: Copy RDB to tailnet host
+      ansible.builtin.command: >-
+        scp -o BatchMode=yes {{ rdb_local_path }} {{ tailnet_host }}:{{ rdb_remote_path }}
+      changed_when: true
+
+    - name: Swap RDB + wipe AOF + restart Redis on tailnet
+      ansible.builtin.shell: |
+        ssh -o BatchMode=yes {{ tailnet_host }} '
+        set -e
+        docker stop {{ redis_tailnet_container }} >/dev/null 2>&1 || true
+        docker cp {{ rdb_remote_path }} {{ redis_tailnet_container }}:/data/dump.rdb
+        # Wipe AOF so the new RDB is authoritative (Redis 7 prefers AOF)
+        docker exec {{ redis_tailnet_container }} \
+          sh -c "rm -rf /data/appendonlydir/*" 2>/dev/null || true
+        docker start {{ redis_tailnet_container }} >/dev/null
+        # Wait for healthy
+        for i in $(seq 1 20); do
+          S=$(docker inspect --format="{{"{{.State.Health.Status}}"}}" {{ redis_tailnet_container }} 2>/dev/null || echo none)
+          if [ "$S" = "healthy" ]; then
+            echo ready
+            exit 0
+          fi
+          P=$(docker exec {{ redis_tailnet_container }} \
+              redis-cli -a "{{ vault_redis_password }}" --no-auth-warning ping 2>/dev/null || echo FAIL)
+          if [ "$P" = "PONG" ]; then
+            echo ready
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "--- container state ---"
+        docker inspect --format="Status={{"{{.State.Status}}"}}" {{ redis_tailnet_container }}
+        echo "--- last 20 log lines ---"
+        docker logs --tail 20 {{ redis_tailnet_container }}
+        exit 1
+        '
+      register: redis_swap
+      changed_when: true
+      no_log: true
+
+    - name: Debug — Redis swap output
+      ansible.builtin.debug:
+        msg: "{{ redis_swap.stdout_lines }}"
+
+    - name: Cleanup — RDB on tailnet host
+      ansible.builtin.command: "ssh -o BatchMode=yes {{ tailnet_host }} rm -f {{ rdb_remote_path }}"
+      changed_when: true
+
+    - name: Cleanup — local RDB
+      ansible.builtin.file:
+        path: "{{ rdb_local_path }}"
+        state: absent

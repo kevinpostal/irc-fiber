@@ -1,0 +1,289 @@
+# {{ ansible_managed }}
+# OpenTelemetry Collector — bridge between ircfiber services and SigNoz.
+# Runs on BOTH ircfiber_net and ircfiber_logging so it can accept OTLP
+# from D processes (tracing.d) and forward to signoz-ingester.
+#
+# Receivers:
+#   - otlp: 4317 (gRPC) + 4318 (HTTP) — intake from ircfiber D services
+#           (engine via ircfiber-signoz-otel alias, holder, gateway)
+#   - hostmetrics: CPU, memory, disk, network, load, processes
+#   - docker_stats: per-container CPU, memory, network, block I/O
+#   - filelog/caddy: tail Caddy access logs (container logs via Fluent Bit)
+#
+# Processors:
+#   - memory_limiter: hard cap to keep the collector under 256m
+#   - batch: bundle records, 1024 / 5s
+#   - resourcedetection: tag with host.name, os.type, etc.
+#   - transform/newrelic: New Relic-style entity model (entity.type,
+#     service.display_name, friendly service names)
+#   - redaction: scrub secrets, tokens, passwords
+#
+# Exporters:
+#   - otlp/signoz: forward to signoz-ingester:4317 (no TLS — internal network)
+#
+# Extensions:
+#   - health_check: /health on :13133
+#   - pprof: /debug/pprof on :1777
+#   - zpages: live debug UI on :55679
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 16
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "*"
+
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk:
+      filesystem:
+        metrics:
+          system.filesystem.utilization:
+            enabled: true
+      network:
+      load:
+      processes:
+      paging:
+
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    timeout: 10s
+    initial_delay: 5s
+    api_version: "1.45"   # collector v0.119 defaults to 1.25; host Docker (v29+) requires >=1.40
+
+  filelog/caddy:
+    # Tail the Caddy JSON access log. We only parse the body (json_parser
+    # below) — no regex_parser or time_parser because Caddy's ts field is
+    # Unix seconds with sub-second fraction which filelog can't ingest.
+    # service.name is set via the resource block so the dashboard query
+    # works without depending on the body content.
+    include:
+      - /var/lib/docker/volumes/ircfiber_caddy_data/_data/access.log
+    start_at: end
+    poll_interval: 1s
+    resource:
+      service.name: "caddy"
+      service.namespace: "ircfiber"
+      deployment.environment: "production"
+      service.display_name: "Caddy Reverse Proxy"
+      entity.type: "application"
+    operators:
+      - type: json_parser
+        parse_to: body
+      # All moves are guarded with `if` to skip lines that don't have the
+      # field (Caddy's log format varies — Wget requests lack some fields,
+      # and ping requests lack others). A failing move would discard the
+      # entire log entry.
+      - type: move
+        if: 'body["request"] != nil && body["request"]["method"] != nil'
+        from: body["request"]["method"]
+        to: attributes["http.request.method"]
+      - type: move
+        if: 'body["request"] != nil && body["request"]["uri"] != nil'
+        from: body["request"]["uri"]
+        to: attributes["url.path"]
+      - type: move
+        if: 'body["status"] != nil'
+        from: body["status"]
+        to: attributes["http.response.status_code"]
+      - type: move
+        if: 'body["request"] != nil && body["request"]["remote_ip"] != nil'
+        from: body["request"]["remote_ip"]
+        to: attributes["net.peer.ip"]
+      - type: move
+        if: 'body["duration"] != nil'
+        from: body["duration"]
+        to: attributes["http.server.request.duration"]
+      - type: move
+        if: 'body["request"] != nil && body["request"]["host"] != nil'
+        from: body["request"]["host"]
+        to: attributes["http.request.host"]
+      - type: move
+        if: 'body["user_id"] != nil'
+        from: body["user_id"]
+        to: attributes["enduser.id"]
+      - type: move
+        if: 'body["size"] != nil'
+        from: body["size"]
+        to: attributes["http.response.body.size"]
+      - type: severity_parser
+        parse_from: body["level"]
+        preserve: false
+        mapping:
+          debug: DEBUG
+          info: INFO
+          warn: WARN
+          error: ERROR
+      - type: add
+        field: attributes["log.source"]
+        value: "caddy-access"
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+  resourcedetection:
+    detectors: [env, system, docker]
+    timeout: 2s
+    system:
+      resource_attributes:
+        host.name:
+          enabled: true
+        os.type:
+          enabled: true
+
+  transform/newrelic:
+    # New Relic-style entity model applied to ALL signals.
+    # Friendly service.display_name, deployment.environment, service.namespace,
+    # entity.type, and consistent service name normalization.
+    trace_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["deployment.environment"], "production") where resource.attributes["deployment.environment"] == nil
+          - set(resource.attributes["service.namespace"], "ircfiber") where resource.attributes["service.namespace"] == nil
+          - set(resource.attributes["service.display_name"], "IRC Fiber Gateway") where resource.attributes["service.name"] == "ircfiber-gateway"
+          - set(resource.attributes["service.display_name"], "IRC Fiber Engine") where resource.attributes["service.name"] == "ircfiber-engine"
+          - set(resource.attributes["service.display_name"], "IRC Fiber Holder") where resource.attributes["service.name"] == "ircfiber-holder"
+          - set(resource.attributes["service.display_name"], "Caddy Reverse Proxy") where resource.attributes["service.name"] == "caddy"
+          - set(resource.attributes["service.display_name"], "IRC Fiber Docker") where resource.attributes["service.name"] == "docker"
+          - set(resource.attributes["service.display_name"], "SigNoz Backend") where resource.attributes["service.name"] == "signoz-signoz"
+          - set(resource.attributes["service.display_name"], "ClickHouse Storage") where resource.attributes["service.name"] == "signoz-clickhouse"
+          - set(resource.attributes["service.display_name"], "OTel Bridge Collector") where resource.attributes["service.name"] == "ircfiber-otel-collector"
+          - set(resource.attributes["service.display_name"], resource.attributes["service.name"]) where resource.attributes["service.display_name"] == nil
+          - set(resource.attributes["entity.type"], "application") where resource.attributes["service.name"] != nil and resource.attributes["entity.type"] == nil
+          - set(resource.attributes["entity.type"], "host") where resource.attributes["host.name"] != nil and resource.attributes["entity.type"] == nil
+    metric_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["deployment.environment"], "production") where resource.attributes["deployment.environment"] == nil
+          - set(resource.attributes["service.namespace"], "ircfiber") where resource.attributes["service.namespace"] == nil
+          - set(resource.attributes["service.display_name"], "IRC Fiber Gateway") where resource.attributes["service.name"] == "ircfiber-gateway"
+          - set(resource.attributes["service.display_name"], "IRC Fiber Engine") where resource.attributes["service.name"] == "ircfiber-engine"
+          - set(resource.attributes["service.display_name"], "IRC Fiber Holder") where resource.attributes["service.name"] == "ircfiber-holder"
+          - set(resource.attributes["service.display_name"], "Caddy Reverse Proxy") where resource.attributes["service.name"] == "caddy"
+          - set(resource.attributes["service.display_name"], "IRC Fiber Docker") where resource.attributes["service.name"] == "docker"
+          - set(resource.attributes["service.display_name"], "OTel Bridge Collector") where resource.attributes["service.name"] == "ircfiber-otel-collector"
+          - set(resource.attributes["service.display_name"], resource.attributes["service.name"]) where resource.attributes["service.display_name"] == nil
+          - set(resource.attributes["entity.type"], "container") where resource.attributes["container.name"] != nil
+    log_statements:
+      # Filelog logs arrive with NO resource attributes (the receiver's
+      # `resource:` block silently no-ops on filelog in this patch version,
+      # and the `resource` processor fails silently on insert action).
+      # We use the transform processor with `context: resource` to set
+      # the resource attributes, which DOES work reliably.
+      - context: resource
+        statements:
+          # Set defaults that are always the same for ircfiber
+          - set(resource.attributes["service.namespace"], "ircfiber")
+          - set(resource.attributes["deployment.environment"], "production")
+          - set(resource.attributes["entity.type"], "container")
+          # Set service.name to "docker" if not already set. The OTLP
+          # path from D processes sets service.name explicitly; filelog
+          # logs come in with service.name empty.
+          - set(resource.attributes["service.name"], "docker") where resource.attributes["service.name"] == nil
+          # Friendly display names
+          - set(resource.attributes["service.display_name"], "IRC Fiber Docker") where resource.attributes["service.name"] == "docker"
+          - set(resource.attributes["service.display_name"], "Caddy Reverse Proxy") where resource.attributes["service.name"] == "caddy"
+          - set(resource.attributes["service.display_name"], "IRC Fiber Engine") where resource.attributes["service.name"] == "ircfiber-engine"
+          - set(resource.attributes["service.display_name"], "IRC Fiber Gateway") where resource.attributes["service.name"] == "ircfiber-gateway"
+          - set(resource.attributes["service.display_name"], "IRC Fiber Holder") where resource.attributes["service.name"] == "ircfiber-holder"
+          - set(resource.attributes["service.display_name"], "SigNoz Backend") where resource.attributes["service.name"] == "signoz-signoz"
+          - set(resource.attributes["service.display_name"], "ClickHouse Storage") where resource.attributes["service.name"] == "signoz-clickhouse"
+          - set(resource.attributes["service.display_name"], "OTel Bridge Collector") where resource.attributes["service.name"] == "ircfiber-otel-collector"
+      # Then also set log-level attributes for filter convenience
+      - context: log
+        statements:
+          - set(attributes["service.namespace"], "ircfiber") where attributes["service.namespace"] == nil
+          - set(attributes["deployment.environment"], "production") where attributes["deployment.environment"] == nil
+
+  redaction:
+    allow_all_keys: false
+    blocked_values:
+      - "password="
+      - "passwd="
+      - "secret="
+      - "token="
+      - "api_key="
+      - "apikey="
+      - "Authorization: Bearer"
+      - "@gmail.com"
+      - "@yahoo.com"
+      - "@hotmail.com"
+      - "@outlook.com"
+      - "@icloud.com"
+      - "@protonmail.com"
+    summary: "scrub"
+
+exporters:
+  otlp/signoz:
+    endpoint: signoz-ingester:4317
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 2000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  debug:
+    verbosity: detailed
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, transform/newrelic, batch]
+      exporters: [otlp/signoz]
+
+    metrics:
+      receivers: [otlp, hostmetrics]
+      processors: [memory_limiter, resourcedetection, transform/newrelic, batch]
+      exporters: [otlp/signoz]
+
+    # Docker stats metrics produce a high volume of metric names that the
+    # signoz-ingester rejects with 400. Collect but don't forward to SigNoz.
+    metrics/docker:
+      receivers: [docker_stats]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+
+    logs:
+      receivers: [otlp, filelog/caddy]
+      processors: [memory_limiter, resourcedetection, transform/newrelic, redaction, batch]
+      exporters: [otlp/signoz]

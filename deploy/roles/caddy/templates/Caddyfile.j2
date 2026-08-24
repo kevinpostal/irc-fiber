@@ -1,0 +1,288 @@
+# {{ ansible_managed }}
+# IRC Fiber — Caddyfile
+# Public TLS termination in front of the irc-fiber gateway.
+# Caddy v2 automatically negotiates WebSocket upgrades for paths that
+# request them (e.g. /ws). Long timeouts are configured for the WS connection.
+{# Caddy route audit 2026-07-01: No Loki/Promtail/Tempo/Prometheus routes found — OK #}
+#
+# We use ONE site block per host (looping over ircfiber_domain + any
+# caddy_extra_serve_hosts entries) instead of a single merged block.
+# Caddy's auto-TLS only manages certificates for the FIRST host in a
+# merged site block, so an additional Tailscale MagicDNS hostname would
+# otherwise be served a cert with the wrong SAN and the TLS handshake
+# would fail.
+#
+# Per-host cert handling:
+#   - *.ts.net hosts: Caddy's built-in caddytls.Tailscale manager fetches
+#     a real Tailscale-issued cert via tailscaled.sock (mounted into the
+#     container by the caddy role). No browser cert warning.
+#   - Other hosts:    follow the global default — Let's Encrypt when
+#     ircfiber_use_lets_encrypt=true, Caddy's local CA (self-signed)
+#     otherwise.
+{%- set serve_hosts = ([ircfiber_domain] + (caddy_extra_serve_hosts | default([]))) | unique %}
+{%- set use_internal_ca = not (ircfiber_use_lets_encrypt | default(true) | bool) %}
+
+# Snippet containing the shared per-site config (proxy + headers + log).
+# Imported into every site block below so we don't duplicate 60 lines
+# of config across blocks.
+(common_site_config) {
+    encode zstd gzip
+
+    # Health endpoints — serve directly with 200, never go to the upstream.
+    @health path /health /api/health
+    handle @health {
+        respond "OK\n" 200
+    }
+
+{% if caddy_signoz_api_key | default('') | length > 0 %}
+    {# WS audit 2026-07-01: /signoz/ws/logs/v5/default returned HTTP/2 200 (SigNoz SPA shell, via: 1.1 Caddy) instead of 101 Switching Protocols against prod (FAIL — added dedicated /signoz/ws/logs/* handle_path block below with flush_interval -1). Also tested /ws/logs/v1/default: same 200 HTML. #}
+    # ── SigNoz reverse-proxy ──────────────────────────────────────────
+    # The admin SPA at /admin#/logs iframes SigNoz at /signoz/logs.
+    # SigNoz's SPA renders <base href="/"> so absolute API calls
+    # (fetch('/api/v1/...')) go to the document root, but the React
+    # bundle's bundled asset paths (./assets/index-*.js and ./*.css)
+    # also resolve against /, and the iframe document itself loads
+    # at /signoz/logs. We proxy both root-level API/asset paths and
+    # the /signoz document tree to the SigNoz upstream.
+    #
+    # handle_path (not handle) is required so the /signoz prefix is
+    # stripped before forwarding; otherwise the upstream sees
+    # /signoz/logs, which doesn't exist in the SigNoz router, and
+    # SigNoz returns its stripped SPA shell (no <script src=...>
+    # tags, no <link rel=stylesheet> tags) — the page never mounts.
+    #
+    # The /assets/index-* matchers scope to SigNoz's hashed bundle
+    # names (e.g. index-De9PDe8G.js). Without that prefix, /assets/*
+    # would also catch the admin SPA's bundles (admin-*.js,
+    # legacy-*.js, main-*.js) and the landing page's assets, which
+    # the gateway serves — serving them from SigNoz would return
+    # its own SPA HTML and break the admin app.
+    @signoz_api path /api/v1/* /api/v2/* /api/v3/* /api/v4/* /api/v5/*
+    @signoz_static path /assets/index-* /css/*
+    # ── SigNoz WebSocket route ──────────────────────────────────────────
+    # WS upgrade requires flush_interval -1; Caddy v2 reverse_proxy auto-
+    # handles Upgrade headers in standard config but the WS path was missing
+    # from the proxy setup. Dedicated block to avoid affecting the document/
+    # asset paths proxied by /signoz/* below.
+    handle_path /signoz/ws/logs/* {
+        reverse_proxy signoz:8080 {
+            header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
+            header_down -X-Frame-Options
+            # WS upgrade: flush bytes immediately on each chunk (the
+            # default), no periodic flush buffer that could hold back
+            # real-time log tail frames. flush_interval is a subdirective
+            # of reverse_proxy itself (NOT of transport http).
+            flush_interval -1
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 60s
+            }
+        }
+    }
+    handle_path /signoz {
+        reverse_proxy signoz:8080 {
+            header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
+            header_down -X-Frame-Options
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 60s
+            }
+        }
+    }
+    handle_path /signoz/* {
+        reverse_proxy signoz:8080 {
+            header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
+            header_down -X-Frame-Options
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 60s
+            }
+        }
+    }
+    handle @signoz_api {
+        reverse_proxy signoz:8080 {
+            header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 60s
+            }
+        }
+    }
+    handle @signoz_static {
+        reverse_proxy signoz:8080 {
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 60s
+            }
+        }
+    }
+{% endif %}
+
+    # ── Grafana reverse-proxy ────────────────────────────────────────────
+    # Serves the Grafana dashboard UI at /grafana/ on the public domain.
+    # Strips the /grafana prefix before forwarding to the Grafana container.
+    handle_path /grafana/* {
+        reverse_proxy ircfiber-grafana:3000 {
+            transport http {
+                dial_timeout 10s
+            }
+        }
+    }
+
+    # Gateway upstream — single replica or load-balanced multi-replica.
+    # When replica_count > 1, active health checks detect dead replicas
+    # and ip_hash pins WebSocket clients to the same replica.
+    # Step 3 swappable backend: when gateway_use_python is true, proxy to
+    # irc-fiber-api-py:8000 instead of ircfiber-gateway:8090 (no frontend rebuild needed).
+    {% if (gateway_use_python | default(false) | bool) %}
+    reverse_proxy {{ gateway_python_host | default('irc-fiber-api-py') }}:{{ gateway_python_port | default(8000) }} {
+        transport http {
+            dial_timeout 30s
+            response_header_timeout 60s
+            read_timeout 24h
+            write_timeout 24h
+        }
+    }
+    {% elif (gateway_bluegreen_enabled | default(false) | bool) %}
+    # Blue/green: ircfiber-gateway (blue) + ircfiber-gateway-green with
+    # active health checks. Either can be absent — health check marks it
+    # down and Caddy routes to the healthy one, so `docker rm` is zero-downtime.
+    # Tuned for fast failover: 5s interval + 2 fails = max 10s to mark dead,
+    # lb_try_duration 10s ensures retries to healthy upstream during flap
+    # (rename window). Without this, `no upstreams available` 503 flaps for
+    # ~20s after `docker rename gateway-green gateway`.
+    reverse_proxy {{ gateway_backend_host | default('ircfiber-gateway') }}:{{ gateway_backend_port | default(gateway_http_port) }} {{ gateway_backend_host | default('ircfiber-gateway') }}-green:{{ gateway_backend_port | default(gateway_http_port) }} {
+        health_uri /health
+        health_interval 5s
+        health_timeout 3s
+        health_fails 2
+        health_passes 1
+        lb_try_duration 10s
+        lb_try_interval 100ms
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 60s
+            read_timeout 24h
+            write_timeout 24h
+        }
+    }
+    {% elif (gateway_replica_count | default(1) | int) == 1 %}
+    reverse_proxy {{ gateway_backend_host | default('ircfiber-gateway') }}:{{ gateway_backend_port | default(gateway_http_port) }} {
+        # Long-lived transport for WebSockets and slow message-history fetches
+        transport http {
+            dial_timeout 30s
+            response_header_timeout 60s
+            read_timeout 24h
+            write_timeout 24h
+        }
+    }
+    {% else %}
+    reverse_proxy{% for i in range(gateway_replica_count | int) %} {{ gateway_backend_host | default('ircfiber-gateway') }}-{{ i }}:{{ gateway_backend_port | default(gateway_http_port) }}{% endfor %} {
+        health_uri /health
+        health_interval 30s
+        health_timeout 5s
+        health_fails 3
+        health_passes 2
+{% if gateway_replica_sticky | default(true) | bool %}
+        # Sticky sessions — hash on the real client IP (trusted_proxies
+        # configured in the global options block below). Ensures WebSocket
+        # connections stay with the same replica.
+        lb_policy ip_hash
+{% endif %}
+        # Long-lived transport for WebSockets and slow message-history fetches
+        transport http {
+            dial_timeout 30s
+            response_header_timeout 60s
+            read_timeout 24h
+            write_timeout 24h
+        }
+    }
+    {% endif %}
+
+    # Security headers — only applied to non-SigNoz responses. The
+    # /signoz/* path needs no X-Frame-Options or frame-ancestors so
+    # the admin SPA can iframe it.
+    @notsignoz not path /signoz /signoz/* /api/v1/* /api/v2/* /api/v3/* /api/v4/* /api/v5/* /assets/index-* /css/* /uploads/*
+    header @notsignoz {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        # CSP allows:
+        #  - 'self' for app assets
+        #  - 'unsafe-inline' + 'unsafe-eval' for the Svelte app's inline
+        #    JS and inline styles (the app uses both)
+        #  - Google Fonts (fonts.googleapis.com + fonts.gstatic.com) for
+        #    Space Grotesk / Inter / JetBrains Mono typography
+        #  - jsdelivr and cloudflare CDNs (used by the Svelte app)
+        #  - wss:// for the gateway WebSocket connection
+        #  - data: URIs for inline images and font fallbacks
+        #  - frame-ancestors 'none' so other sites cannot embed /admin
+        #  - frame-src for YouTube inline previews (IRCCloud parity)
+        Content-Security-Policy "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://fonts.googleapis.com; font-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://fonts.gstatic.com data:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' wss: https:; frame-src 'self' https://www.youtube.com https://youtube.com https://youtu.be https://www.youtube-nocookie.com https://m.youtube.com https://music.youtube.com; frame-ancestors 'none'"
+    }
+
+    log {
+        output file /data/access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        level INFO
+    }
+}
+
+{
+    # Admin API on localhost only (operational access via `docker exec`)
+    admin localhost:2019
+{% if use_internal_ca %}
+    local_certs
+{% endif %}
+{% if (gateway_replica_count | default(1) | int) > 1 %}
+    # Trusted proxies — required for correct ip_hash stickiness when
+    # behind Cloudflare Tunnel (cloudflared). Without this, Caddy hashes
+    # the cloudflared container IP instead of the real client IP.
+    servers {
+        trusted_proxies static private_ranges
+    }
+{% endif %}
+}
+
+{% for host in serve_hosts %}
+# Site block for {{ host }}
+{{ host }} {
+{% if use_internal_ca or host is match("\.ts\.net$") %}
+    # Tailscale hostname → real cert via Tailscale cert manager.
+    # No explicit tls needed — Caddy's Tailscale integration handles this
+    # when the tailscaled.sock is mounted.
+{% else %}
+    # Public domain — use internal CA for the tunnel origin connection.
+    # The tunnel connects via HTTPS with "No TLS Verify" enabled.
+    # Cloudflare handles real TLS termination at the edge.
+    tls internal
+{% endif %}
+    import common_site_config
+}
+
+{% endfor %}
+
+# Internal listener for Cloudflare Tunnel on port {{ caddy_tunnel_port }}.
+# Plain HTTP — the tunnel connects here instead of port 80 to avoid
+# Caddy's auto-HTTPS redirect loop.
+:{{ caddy_tunnel_port }} {
+    import common_site_config
+}
+
+{% if caddy_tailscale_signoz_enabled | default(false) | bool %}
+# ── Tailscale-only SigNoz listener ──────────────────────────────────
+# SigNoz combined image serves the full application (SPA + API) on
+# port 8080. Proxy ALL paths at the root — the image internally routes
+# /api/v1/* to its query-service and /* to the React frontend.
+http://{{ caddy_tailscale_logging_address | default('198.51.100.1') }}:{{ caddy_tailscale_signoz_port | default(3003) }} {
+    reverse_proxy signoz:8080 {
+        header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
+        transport http {
+            dial_timeout 10s
+        }
+    }
+}
+{% endif %}

@@ -1,0 +1,14 @@
+# Summary of changes for run 1779b5a5-705e-4735-a43e-dc4b64d27f3a
+All ten `sorry`s in `IrcFiber/HoleDetector.lean` and `IrcFiber/Splitter.lean` are gone; the project builds cleanly with `lake build` on core Lean 4.28 + Std (no mathlib, no new axioms, no `@[implemented_by]`). Eight obligations were proved as stated; two turned out to be **false as stated**, so each original is preserved (commented out, with an explanation) alongside a machine-checked counterexample and a corrected theorem. A full write-up is in `PROOF_JOURNAL.md`, and `README.md` status rows were updated.
+
+HoleDetector:
+- `findHole_none_iff` — proved (no hole reported iff every adjacent gap is within the threshold).
+- `findHole_first` — FALSE as stated: it orders adjacent pairs by `y < b` rather than by position, which differs on a non-ascending window. `findHole_first_counterexample` refutes it with window `[0,100,0,50]`, threshold `10` (reports `(0,100)`, yet the later pair `(0,50)` has gap 49 and `50 < 100`). Two corrected versions are proved: `findHole_first_prefix` (positional "first": the pair list splits as `pre ++ (a,b) :: post` with all of `pre` within the threshold, no extra hypotheses) and `findHole_first_ascending` (the original `y < b` form under the ascending-window invariant).
+- `window_ascending_preserved` — proved, via reusable lemmas about adjacent pairs of suffixes, the 20-entry trim, and appending a larger eid.
+- `cooldown_prevents_storm` — proved; `cooldown_gap_between_fetches` was added to state the spacing consequence (`t1 + cooldownMs ≤ t2`) explicitly.
+
+Splitter:
+- `chunks_tile`, `chunks_length_le`, `chunks_interior_exact` — proved (the last one's `1 < length` hypothesis was kept as requested but is not needed; the unconditional form is proved too).
+- `pack_maximal_adjacent` — FALSE as stated: it quantifies over any two packed messages, but a blank input line flushes the accumulator; `pack ["ab","","cd","","ab cd"] 5 = ["ab","cd","ab cd"]` contains two messages and their join (`pack_maximal_adjacent_counterexample`). Corrected: `pack_maximal_adjacent_consecutive` — for blank-free input, consecutive packed messages satisfy `m < A.length + 1 + B.length`.
+- `pack_optimal` — FALSE as stated: `ValidPack lines m msgs` never mentions `lines`, so `[]` is a "valid pack" of `["a"]` (`pack_optimal_counterexample`). Corrected with `IsPackOf` (messages are the single-space joins of a partition of the lines into consecutive non-empty groups, each within budget): `pack_optimal_correct` proves greedy uses no more messages than any legal packing (blank-free input), and `pack_isPackOf` proves the greedy pack is itself legal, so greedy attains the minimum. The proof is the standard exchange argument, decomposed into greedy-step, buffer-monotonicity, suffix-monotonicity and absorption lemmas.
+- `enqueue_append_dropLast` — proved.

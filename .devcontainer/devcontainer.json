@@ -1,0 +1,18 @@
+{
+  "name": "IRC Fiber",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": { "version": "latest", "dockerDashComposeVersion": "v2" },
+    "ghcr.io/devcontainers/features/node:1": { "version": "20" },
+    "ghcr.io/1password/codespaces-features/1password:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-vscode.cpptools", "svelte.svelte-vscode", "bradlc.vscode-tailwindcss", "ms-vscode.vscode-github-actions"]
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "remoteEnv": { "ANSIBLE_VAULT_PASSWORD": "${localEnv:ANSIBLE_VAULT_PASSWORD}" },
+  "forwardPorts": [8090, 3000, 5173, 6379, 27017],
+  "portsAttributes": { "8090": { "label": "gateway", "onAutoForward": "notify" }, "5173": { "label": "vite", "onAutoForward": "silent" } }
+}

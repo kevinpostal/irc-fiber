@@ -1,0 +1,420 @@
+---
+# Enterprise-grade hot-path deploy — BuildKit with persistent dub cache.
+#
+# Uses `docker build --target builder` with BuildKit cache mounts.
+# The Containerfile's `RUN --mount=type=cache,target=/build/.dub` persists
+# dub packages + .o files across builds inside the Docker engine's BuildKit
+# cache. Only changed .d files recompile (dub rebuilds incremental).
+#
+# Architecture:
+#   1. rsync source → /opt/ircfiber-src/ (only changed files, ~1s for no-op)
+#   2. DOCKER_BUILDKIT=1 docker build --target builder
+#      - LDC layer cached (no re-download)
+#      - dub fetch + packages cached via BuildKit mount
+#      - Only changed .d files recompile
+#   3. Extract binaries from builder image (docker create → docker cp → docker rm)
+#   4. docker cp into running gateway + engine, then restart
+#
+# First run: ~80-90s (full dub build). Subsequent runs: ~5-15s.
+#
+# Usage:
+#   make update
+#   ansible-playbook playbooks/deploy-update.yml -l ircfiber-prod-1
+
+- name: Hot-path deploy
+  hosts: "{{ target | default('ircfiber_gw:ircfiber_engines') }}"
+  become: true
+  gather_facts: false
+  # ansible-core 2.20 has a known issue where the inventory directory is
+  # not auto-added to ansible_search_path when the inventory path contains
+  # spaces (or in some other cases). Load group_vars and the vault
+  # explicitly so the public defaults (mongo_port, redis_port, etc.)
+  # and the secrets (vault_mongo_*, vault_redis_password) are both
+  # resolvable on the deploy path under
+  # Library/Mobile Documents/com~apple~CloudDocs/Work/IRC/IRC_FIBER.
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/all.yml"
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+
+  vars:
+    src_root: /opt/ircfiber-src
+    builder_image: ircfiber-builder
+    host_bin_dir: /opt/ircfiber/bin
+    engine_container: "{{ ('ircfiber-engine-' ~ ircfiber_engine_id) if ircfiber_engine_id is defined else '' }}"
+    ldc_version: "1.41.0"
+    gateway_binary: "{{ host_bin_dir }}/irc-fiber"
+    engine_binary: "{{ host_bin_dir }}/irc-fiber-engine"
+
+  tasks:
+    # ── Prerequisites ──────────────────────────────────────────────────
+    - name: Ensure output directory
+      ansible.builtin.file:
+        path: "{{ host_bin_dir }}"
+        state: directory
+        mode: "0777"
+
+    # ── rsync source ────────────────────────────────────────────────────
+    - name: rsync source → {{ src_root }}
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../../"
+        dest: "{{ src_root }}"
+        delete: true
+        owner: false
+        group: false
+        times: true
+        checksum: true
+        rsync_opts:
+          - "--omit-dir-times"
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.dub"
+          - "--exclude=*.o"
+          - "--exclude=irc-fiber"
+          - "--exclude=irc-fiber-engine"
+          - "--exclude=frontend/node_modules"
+          - "--exclude=.reasonix"
+          - "--exclude=.playwright-mcp"
+          - "--exclude=test-results"
+          - "--exclude=e2e/test-results"
+          - "--exclude=e2e/e2e"
+          - "--exclude=*.log"
+          - "--exclude=.worktrees"
+          - "--exclude=.nosync"
+          - "--exclude=.DS_Store"
+          - "--exclude=*\\ 2.html"
+          - "--exclude=*\\ 2.*"
+      failed_when: false
+    - name: Get local git hash for version (host)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: git -C {{ playbook_dir }}/../../ rev-parse HEAD
+      register: _local_git_hash
+      changed_when: false
+      failed_when: false
+
+    - name: Get local git short for version
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: git -C {{ playbook_dir }}/../../ rev-parse --short HEAD
+      register: _local_git_short
+      changed_when: false
+      failed_when: false
+
+    - name: Get local git describe for version
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: git -C {{ playbook_dir }}/../../ describe --always --long
+      register: _local_git_describe
+      changed_when: false
+      failed_when: false
+
+    # the BuildKit daemon is alive. Dub's .dub/ directory lives in this
+    # cache mount, so packages + .o files survive container rm.
+    #
+    # We target only the builder stage (no runtime image). That way we
+    # skip COPY-ing into the slim runtime and all Dockerfile steps after
+    # the dub build.
+    - name: Build builder stage (BuildKit — cached dub + LDC)
+      ansible.builtin.shell: |
+        DOCKER_BUILDKIT=1 docker build \
+          --target builder \
+          --build-arg LDC_VERSION={{ ldc_version }} \
+          --build-arg CACHE_BUST=$(date +%s) \
+          --build-arg GIT_HASH={{ _local_git_hash.stdout | default('unknown') }} \
+          --build-arg GIT_SHORT={{ _local_git_short.stdout | default('unknown') }} \
+          --build-arg GIT_DESCRIBE={{ _local_git_describe.stdout | default('unknown') }} \
+          -t {{ builder_image }}:latest \
+          -f {{ src_root }}/Containerfile \
+          {{ src_root }} 2>&1
+      args:
+        executable: /bin/bash
+      # 30-minute budget for the full LDC compilation (first build after a
+      # CACHE_BUST wipe). Incremental builds finish in 5-15s; the 1800s
+      # cap handles the worst case: a cold OVH BuildKit runner doing a
+      # full dub fetch + LDC compile of the ~280k-lines D codebase.
+      timeout: 1800
+      changed_when: true
+
+    # ── Extract both binaries in one shot ──────────────────────────
+    - name: Extract binaries from builder image
+      ansible.builtin.shell: |
+        CID=$(docker create {{ builder_image }}:latest)
+        docker cp "$CID":/build/irc-fiber {{ gateway_binary }}
+        docker cp "$CID":/build/irc-fiber-engine {{ engine_binary }}
+        docker cp "$CID":/build/janitor-migrate {{ host_bin_dir }}/janitor-migrate
+        docker cp "$CID":/build/ircfiber-default-migrate {{ host_bin_dir }}/ircfiber-default-migrate
+        docker rm "$CID" >/dev/null
+        chmod 0755 {{ gateway_binary }} {{ engine_binary }} {{ host_bin_dir }}/janitor-migrate {{ host_bin_dir }}/ircfiber-default-migrate
+        strip {{ gateway_binary }} {{ engine_binary }} {{ host_bin_dir }}/janitor-migrate {{ host_bin_dir }}/ircfiber-default-migrate 2>/dev/null || true
+        echo "Gateway:                    $(ls -lh {{ gateway_binary }} | awk '{print $5}')"
+        echo "Engine:                     $(ls -lh {{ engine_binary }} | awk '{print $5}')"
+        echo "Janitor migrate:            $(ls -lh {{ host_bin_dir }}/janitor-migrate | awk '{print $5}')"
+        echo "Default-network migrate:    $(ls -lh {{ host_bin_dir }}/ircfiber-default-migrate | awk '{print $5}')"
+      args:
+        executable: /bin/bash
+
+    # ── Inject + restart gateway replicas ──────────────────────────────
+    # The gateway is deployed as 1 or more replicas. When only 1 replica
+    # exists the container is named 'ircfiber-gateway' (backward compat);
+    # when N > 1 they are 'ircfiber-gateway-0' through 'ircfiber-gateway-{N-1}'.
+    # Each replica gets the new binary injected and is restarted in-place.
+    - name: Build gateway replica list
+      ansible.builtin.set_fact:
+        _gw_replicas: "{{ ['ircfiber-gateway'] if (gateway_replica_count | default(1) | int) == 1 else (range(gateway_replica_count | default(1) | int) | map('regex_replace', '^', 'ircfiber-gateway-') | list) }}"
+
+    - name: Inject binary into gateway replicas and restart
+      ansible.builtin.shell: |
+        set -o pipefail
+        ctr="{{ item }}"
+        if docker container inspect "$ctr" >/dev/null 2>&1; then
+          docker cp {{ gateway_binary }} "$ctr":/app/irc-fiber
+          docker restart "$ctr" >/dev/null
+          echo "OK: $ctr restarted"
+        else
+          echo "SKIP: $ctr does not exist on this host"
+        fi
+      loop: "{{ _gw_replicas }}"
+      register: _gw_inject
+      # Per-iteration result isn't available via .results[] until after the
+      # whole loop completes, so detect changed via the echo line we wrote.
+      changed_when: "'OK:' in _gw_inject.stdout"
+      failed_when: false
+
+    # ── Engine deploy: hard restart only (handoff removed 2026-08-08) ─────
+    # See AGENTS.md Engine Lifecycle. Handoff (SCM_RIGHTS +
+    # IRCFIBER_RELOAD_FROM_PID + irc:control:ovh LPUSH) was removed as
+    # legacy fragile code (Tailscale-bind redis failure). All deploys
+    # now do hard restart (brief disconnect, auto-reconnect via backoff).
+    # No FD transfer, no handoff socket, no gracefulReload control message.
+    - name: Check engine container exists
+      community.docker.docker_container_info:
+        name: "{{ engine_container }}"
+      register: engine_info
+      when: ircfiber_engine_id is defined
+
+    - name: Inject new engine binary
+      ansible.builtin.command:
+        cmd: docker cp {{ engine_binary }} {{ engine_container }}:/app/irc-fiber-engine
+      when: ircfiber_engine_id is defined and engine_info.exists
+
+    - name: Restart engine container (hard)
+      community.docker.docker_container:
+        name: "{{ engine_container }}"
+        state: started
+        restart: true
+      when: ircfiber_engine_id is defined and engine_info.exists
+
+    # ── Connection strings for host-local migration tools ─────────────
+    # The migration tools (janitor-migrate, ircfiber-default-migrate) run
+    # on the host (not inside a container) and default to 127.0.0.1 for
+    # Mongo and Redis. But both daemons are bound ONLY to this host's
+    # Tailscale IP (see deploy/roles/mongo/templates/mongod.conf.j2 and
+    # deploy/roles/redis/templates/redis.conf.j2) for network isolation —
+    # the host-local defaults never resolve. The gateway reaches Mongo +
+    # Redis via the backend host's Tailscale IP (env.j2:19-20); mirror that
+    # wiring so the migration tools talk to the same daemons. MUST be
+    # computed BEFORE the migration tasks that reference them.
+    - name: Discover this host's Tailscale IPv4 address (for migration tools)
+      ansible.builtin.command: tailscale ip -4
+      register: _migrate_tailscale_ip_raw
+      changed_when: false
+      failed_when: _migrate_tailscale_ip_raw.rc != 0
+      check_mode: false
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Resolve host Tailscale IP (migration block)
+      ansible.builtin.set_fact:
+        migrate_host_tailscale_ip: "{{ _migrate_tailscale_ip_raw.stdout | trim | split('\n') | first | trim }}"
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Resolve backend Tailscale IP (migration block)
+      ansible.builtin.set_fact:
+        migrate_backend_tailscale_ip: >-
+          {{ hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
+             | default(migrate_host_tailscale_ip) }}
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Compute migrate_mongo_url + migrate_redis_url (with creds)
+      ansible.builtin.set_fact:
+        migrate_mongo_url: >-
+          mongodb://{{ vault_mongo_app_username | urlencode }}:{{ vault_mongo_app_password | urlencode }}@{{ migrate_backend_tailscale_ip }}:{{ mongo_port }}/{{ mongo_initdb_database }}
+        migrate_redis_url: >-
+          redis://{{ migrate_backend_tailscale_ip }}:{{ redis_port }}/0
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    # ── Backfill TTLs on existing Redis state ────────────────────────
+    # Runs once after deploy to write TTLs onto keys that pre-date the
+    # janitor. Idempotent — second run finds zero keys to migrate.
+    # Skipped if `skip_migrate` is set (e.g. for debugging or when Redis
+    # is unreachable). The 60s settle gives the engine time to register
+    # and start heartbeating so we don't race its writes.
+    - name: Wait 60s for engine to settle (registration + heartbeat)
+      ansible.builtin.pause:
+        seconds: 60
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Janitor-migrate dry-run (show what would be backfilled)
+      ansible.builtin.shell: |
+        echo "=== Janitor-migrate dry-run (JSMIGRATE_DRY_RUN=1) ==="
+        JSMIGRATE_DRY_RUN=1 {{ host_bin_dir }}/janitor-migrate
+      environment:
+        IRCFIBER_REDIS_URL: "{{ migrate_redis_url }}"
+      register: migrate_dry
+      changed_when: false
+      ignore_errors: true
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Print dry-run summary
+      ansible.builtin.debug:
+        var: migrate_dry.stdout
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+        - migrate_dry is defined
+
+    - name: Janitor-migrate apply (write TTLs onto legacy state keys)
+      ansible.builtin.shell: |
+        echo "=== Janitor-migrate apply (JSMIGRATE_DRY_RUN=0) ==="
+        JSMIGRATE_DRY_RUN=0 {{ host_bin_dir }}/janitor-migrate
+      environment:
+        IRCFIBER_REDIS_URL: "{{ migrate_redis_url }}"
+      register: migrate_apply
+      changed_when: true
+      ignore_errors: true
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Print apply summary
+      ansible.builtin.debug:
+        var: migrate_apply.stdout
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+        - migrate_apply is defined
+
+    - name: Verify janitor status after deploy + migration
+      ansible.builtin.shell: |
+        sleep 30  # give janitor one cycle
+        echo "=== Janitor status (post-deploy) ==="
+        curl -fsS http://127.0.0.1:8090/api/admin/janitor/status 2>&1 | head -30 || echo "(admin endpoint unreachable — fine if you're not authed)"
+      register: janitor_status
+      changed_when: false
+      ignore_errors: true
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Print janitor status
+      ansible.builtin.debug:
+        var: janitor_status.stdout
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+        - janitor_status is defined
+
+    # ── Default-network migration: backfill IRC Fiber network for every user ──
+    # Runs once after deploy to ensure every existing user has the platform-
+    # provided IRC Fiber connection (irc.ircfiber.com:6697). Idempotent — second
+    # run finds zero users needing migration. Skipped if `skip_migrate` is set.
+    # The tool reads MONGO_URL/REDIS_URL from the env vars the same way the
+    # gateway does (see the migrate_*_url facts computed above).
+    - name: Default-network migration dry-run (count users needing backfill)
+      ansible.builtin.shell: |
+        echo "=== Default-network migration dry-run ==="
+        {{ host_bin_dir }}/ircfiber-default-migrate --dry-run
+      environment:
+        IRCFIBER_MONGO_URL: "{{ migrate_mongo_url }}"
+        IRCFIBER_REDIS_URL: "{{ migrate_redis_url }}"
+      register: default_migrate_dry
+      changed_when: false
+      ignore_errors: true
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Print default-migration dry-run summary
+      ansible.builtin.debug:
+        var: default_migrate_dry.stdout
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+        - default_migrate_dry is defined
+
+    - name: Default-network migration apply (create networks for every user)
+      ansible.builtin.shell: |
+        echo "=== Default-network migration apply ==="
+        {{ host_bin_dir }}/ircfiber-default-migrate
+      environment:
+        IRCFIBER_MONGO_URL: "{{ migrate_mongo_url }}"
+        IRCFIBER_REDIS_URL: "{{ migrate_redis_url }}"
+      register: default_migrate_apply
+      changed_when: true
+      ignore_errors: true
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Print default-migration apply summary
+      ansible.builtin.debug:
+        var: default_migrate_apply.stdout
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+        - default_migrate_apply is defined
+
+    # ── Verification: re-run dry-run, expect 0 to create ────────────
+    # A second dry-run after apply should report zero users that need
+    # the IRC Fiber network (all skipped). If anything still needs to
+    # be created, the migration didn't reach every user and we surface
+    # the count loudly.
+    - name: Default-network migration re-verify (dry-run, expect 0 to create)
+      ansible.builtin.shell: |
+        echo "=== Default-network migration re-verify (post-apply dry-run) ==="
+        {{ host_bin_dir }}/ircfiber-default-migrate --dry-run
+      environment:
+        IRCFIBER_MONGO_URL: "{{ migrate_mongo_url }}"
+        IRCFIBER_REDIS_URL: "{{ migrate_redis_url }}"
+      register: default_migrate_verify
+      changed_when: false
+      ignore_errors: true
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Print default-migration re-verify summary
+      ansible.builtin.debug:
+        var: default_migrate_verify.stdout
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+        - default_migrate_verify is defined
+
+    # ── Disk cleanup ────────────────────────────────────────────────────
+    # Each build creates new builder image layers + build cache.
+    # Prune unused images (not referenced by running containers) and
+    # build cache to prevent /var/lib/docker from filling up 72G root.
+    - name: Prune unused Docker images and build cache
+      ansible.builtin.shell: |
+        echo "=== Pruning unused Docker images ==="
+        docker image prune -af 2>&1 | tail -5
+        echo "=== Pruning build cache ==="
+        docker builder prune -af 2>&1 | tail -5
+        echo "=== Disk after cleanup ==="
+        df -h / | tail -1
+      args:
+        executable: /bin/bash
+      changed_when: true

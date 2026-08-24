@@ -1,0 +1,276 @@
+{
+  "context_envelope": {
+    "meta": {
+      "plan_id": "2026-06-27-irccloud-design-parity",
+      "created_at": "2026-06-27",
+      "last_updated": "2026-06-27",
+      "version": 2,
+      "changelog": [
+        "v2 (2026-06-27): Integrated gem-critic APPROVED_WITH_CHANGES (1 BLOCKING + 4 MAJOR + 6 MINOR + 5 pre-mortems); added Wave 0 prep + Wave 4a/4b split; resolved 5 user decisions Q1-Q5.",
+        "v1 (2026-06-27): Initial 56-task 5-wave plan."
+      ]
+    },
+    "tech_stack": [
+      {"name": "Svelte 5", "version": "5.x", "usage_context": "frontend SPA components and reactive stores", "config_files": ["frontend/package.json", "frontend/vite.config.ts"]},
+      {"name": "Vite 5", "version": "5.x", "usage_context": "frontend bundler; output to public/dist/", "config_files": ["frontend/vite.config.ts"]},
+      {"name": "D / vibe.d", "version": "LDC stable", "usage_context": "engine + gateway + REST server", "config_files": ["dub.sdl", "dub.selections.json"]},
+      {"name": "MongoDB", "version": "6.x", "usage_context": "permanent event store; warm cache in Redis", "config_files": ["source/ircfiber/db/message.d"]},
+      {"name": "Redis", "version": "7.x", "usage_context": "hot state, event stream, control queue, pref pub/sub, member-activity hash (W5-T05)", "config_files": ["source/ircfiber/storage/redis.d", "source/ircfiber/redis/protocol.d"]},
+      {"name": "vitest", "version": "1.x", "usage_context": "unit + integration tests; lib + client projects", "config_files": ["frontend/vitest.config.ts"]},
+      {"name": "Playwright", "version": "1.x", "usage_context": "Wave 4 visual regression + e2e", "config_files": ["capture_comparison.js"]},
+      {"name": "BuildKit", "version": "Docker BuildKit", "usage_context": "remote x86_64 D binary compilation (per AGENTS.md)", "config_files": ["Containerfile"]},
+      {"name": "Ansible", "version": "core 2.x", "usage_context": "deploy playbooks (deploy-update.yml, deploy-handoff.yml)", "config_files": ["deploy/playbooks/"]}
+    ],
+    "conventions": [
+      "AGENTS.md testing: vitest projects (lib + client) under frontend/; lib tests in src/lib/**/*.test.ts, client tests in src/**/*.test.ts and *.svelte.test.ts (FLAT convention; NO __tests__/ directory)",
+      "AGENTS.md deploy: NEVER compile D locally + scp (architecture mismatch ARM64 vs x86_64); always `make update` via BuildKit on remote",
+      "AGENTS.md graceful engine hot-reload: `make handoff` for engine-only updates without IRC disconnect (preserves connections via SCM_RIGHTS)",
+      "AGENTS.md connection-holder: `ircfiber-conn-holder` daemon owns IRC TCP/TLS sockets; engine talks via Unix-domain IPC; activated by `IRCFIBER_HOLDER_SOCK` env var",
+      "AGENTS.md engine priority/assignment: `assignNetwork()` in source/ircfiber/irc/registry.d is priority-aware (higher priority wins; fallbackOnly excluded unless no healthy servers)",
+      "All Wave 1 protocol changes ship behind feature flags in GlobalPrefs.featureFlags (created in W0-T01); default OFF for first wave deploy, ON subsequent",
+      "R#6 Ignore migration heuristic: upgrade ONLY pure bare-nick patterns (no !, @, *, ?); patterns with separators or wildcards preserved as-is in 3-level map (C1 critic fix)",
+      "R#5 buffersToDelete: always-on per WS reconnect; client-side guard `(bid NOT in activeJoinList)` before deletion; intersect with archived/pinned/hidden maps",
+      "R#10 temp_unavailable: rendered in BufferHeader (per-buffer); engine emits idle:since per NETWORK (one timer per connection); client countdown anchored on serverTs + remaining_ms",
+      "W5-T03 Linux body escape: REUSE existing escapeHtml from frontend/src/lib/utils.ts:4 (NOT DOMParser; matches IRCCloud escapeHtmlMinimal)",
+      "W4b-T03 keeps `#app.midnight-theme` as backward-compat selector mapping to same `--chat-bg` overrides; new themes use body.theme-* (matches IRCCloud convention)",
+      "Test-first where possible (per writing-plans skill): failing test → minimal impl → commit",
+      "Frequent commits: one task per commit; commit message format `feat(W1-T01): ...`"
+    ],
+    "constraints": {
+      "hard": [
+        "Local Mac ARM64 D binary forbidden (exec format error on remote x86_64); BuildKit only",
+        "No breaking wire-format changes without feature-flag gating (Wave 1) — flags live in GlobalPrefs.featureFlags (created in W0-T01)",
+        "R#6 Ignore migration is one-way safe: ONLY pure bare-nick → *!*@*; patterns with separators OR wildcards preserved (C1 fix)",
+        "R#5 buffersToDelete must intersect with activeJoinList AND archived/pinned/hidden maps before deletion",
+        "W1-T01 conversationsCollapsed MUST be added to BOTH handlePrefUpdate AND mergePreferences (M2 fix)",
+        "W1-T02 prefVersion increment MUST be inside Redis MULTI/EXEC (atomic increment+save)",
+        "Existing CSP at deploy/roles/caddy/templates/Caddyfile.j2:61 permits style-src 'unsafe-inline' AND script-src 'unsafe-inline' 'unsafe-eval'; CSS variables used as BEST PRACTICE",
+        "Existing graceful handoff path must continue to work after Wave 5 deploy",
+        "Wave 1 deploy is TWO-PHASE: frontend first (make update-assets), wait ≥10 minutes, then engine (make handoff) — PM7 mitigation",
+        "Wave 5 XHR fallback MUST close XHR on WS reconnection success (PM8 mitigation)"
+      ],
+      "soft": [
+        "Default theme stays `dark` (existing behavior); new themes opt-in via Settings",
+        "Visual regression <5% pixel diff vs IRCCloud reference baselines",
+        "WCAG AA contrast on new themed surfaces; AAA target size 44×44 on mobile",
+        "presetsReducedMotion respected on all new animations (typing bounce, away indicator pulse, etc.)"
+      ],
+      "compatibility": [
+        "Old SPA clients must continue to work with new engine when Wave 1 feature flags are off",
+        "New SPA clients must gracefully degrade when engine is old (skip heartbeat_echo / buffersToDelete handling)"
+      ],
+      "security_requirements": [
+        "Body escape for Linux desktop notifications: REUSE existing escapeHtml from frontend/src/lib/utils.ts:4 (matches IRCCloud escapeHtmlMinimal at ircformatter.js:131-141)",
+        "Notification notStore retains refs to prevent GC loss of onclick handlers",
+        "BufferPrefs admin endpoint at rest.d:846-899 must validate per-buffer input",
+        "OnlineChecker HEAD /ping with 3s timeout (no CSRF exposure)",
+        "TRACKED SECURITY ITEM: existing script-src 'unsafe-inline' at deploy/roles/caddy/templates/Caddyfile.j2:61 should be tightened in a future PR (out of scope for this plan)"
+      ]
+    },
+    "decisions": [
+      {
+        "id": "Q1",
+        "task": "W1-T03",
+        "question": "heartbeat_echo: new top-level WS type or overload irc_event?",
+        "decision": "New top-level WS type `{type:'heartbeat_echo', cid, bid[], ts}`. Batched per network (one frame per 30s with bid[] array, NOT one frame per buffer).",
+        "rationale": "Cleaner than overloading irc_event with discriminator; matches IRCCloud oob-include pattern; old clients silently ignore unknown types",
+        "resolved_at": "2026-06-27"
+      },
+      {
+        "id": "Q2",
+        "task": "W1-T02",
+        "question": "prefVersion storage: Redis hash counter or inlined JSON field?",
+        "decision": "Inlined JSON field (`UserPreferences.prefVersion: long`). Atomic increment+save via Redis MULTI/EXEC. prefVersion resolves engine-vs-client but NOT tab-vs-tab (already handled by localStorage events).",
+        "rationale": "Inlined approach uses existing atomic redis.setJson() — one write, one read. INCR adds second key without win since mergePreferences loads whole blob anyway",
+        "resolved_at": "2026-06-27"
+      },
+      {
+        "id": "Q3",
+        "task": "W1-T06",
+        "question": "buffersToDelete: always-on per reconnect or diff-mode?",
+        "decision": "Always-on per WS reconnect (NOT per IRC reconnect). Client-side guard: `(bid NOT in activeJoinList)` before deletion. Intersect with archived/pinned/hidden maps.",
+        "rationale": "Always-on is simpler and matches IRCCloud; client-side guard prevents deleting fresh user re-joins between engine snapshot and client receipt",
+        "resolved_at": "2026-06-27"
+      },
+      {
+        "id": "Q4",
+        "task": "W1-T08",
+        "question": "temp_unavailable: countdown in MessageList or BufferHeader?",
+        "decision": "Render in BufferHeader (per-buffer). Engine emits `idle:since` per NETWORK (one timer per connection). Client countdown anchored on `serverTs + remaining_ms` not `Date.now() + countdown_ms` to avoid clock drift.",
+        "rationale": "Per-buffer state belongs in BufferHeader; MessageList is scrolling chat area. Per-NETWORK timer (not per-channel); per-NICK idle is separate (Member list dim)",
+        "resolved_at": "2026-06-27"
+      },
+      {
+        "id": "Q5",
+        "task": "W3-T01",
+        "question": "Cmd+K: cross-network search or active-network only?",
+        "decision": "Cross-network with disambiguation badge showing `serverName` (matches IRCCloud). Single bulk `/api/buffers/archive-names` endpoint (W3-T01a engine task — NOT per-network). Component takes `scope: 'all' | 'active'` prop for future refactor.",
+        "rationale": "Matches IRCCloud channel-switch-dialog.es6:175-238 pattern; power-user friendly for 3+ network users; bulk endpoint avoids N parallel requests",
+        "resolved_at": "2026-06-27"
+      }
+    ],
+    "architecture_snapshot": {
+      "key_dirs": [
+        "frontend/src/ (Svelte 5 SPA)",
+        "frontend/src/components/ (chat UI)",
+        "frontend/src/stores/ (reactive state)",
+        "frontend/src/lib/ (pure utilities + tests)",
+        "frontend/src/styles/ (SCSS partials)",
+        "source/ircfiber/ (engine + gateway in D)",
+        "source/ircfiber/web/ (REST API)",
+        "source/ircfiber/engine/ (event processor, state, handoff)",
+        "source/ircfiber/irc/ (IRC client + parser + manager)",
+        "source/ircfiber/db/ (Mongo + Redis repositories)",
+        "source/ircfiber/redis/ (key namespace)",
+        "source/conn_holder/ (separate connection-holder daemon)",
+        "deploy/roles/caddy/templates/ (Caddyfile.j2:61 — actual CSP location, NOT source/ircfiber/web/package.d)"
+      ],
+      "patterns": [
+        "backlog_ready two-phase boot: WS open → net:works skeleton → sync message → loadBufferHistory",
+        "pref_update additive-only merge: never delete local keys on boot (avoids flicker); cross-tab sync via storage event",
+        "messageBatcher 200ms flush: coalesces high-frequency irc_events into single WS frame",
+        "LoadingSkeleton: shown between WS connect and first sync (cachedNetworkNames for SSR-like UX)",
+        "Per-buffer inputHistory: keyed by `networkId:bufferName`; Up/Down navigation gated on multiline",
+        "IRCCloud-style routing: /irc/{network}/{channel|messages}/{target}",
+        "maxEidTracker for stream resume: WS reconnect sends `since=<maxEid>` so server only streams new events",
+        "Holders transmit IRC I/O via Unix socket when IRCFIBER_HOLDER_SOCK env var set",
+        "Member activity (lastSpoke, lastHighlighted) drives tab completion ranking (R#15); now persisted to Redis hash with debounce (W5-T05)",
+        "Feature flags live in GlobalPrefs.featureFlags namespace (W0-T01); all Wave 1 protocol changes gate behind these",
+        "Midnight theme selector `#app.midnight-theme` is backward-compat alias for `body.theme-midnight` family (W4b-T03)",
+        "WS primary, XHR shadow lifecycle (W5-T01); close XHR on WS reconnection success"
+      ],
+      "key_components": [
+        {"name": "App.svelte", "location": "frontend/src/App.svelte:1-1100", "responsibility": ["WS dispatch (irc_event/pref_update/sync/heartbeat_echo/buffersToDelete)", "handleStatUser/handlePrefUpdate/handleNetworks", "mergePreferences (additive-only)", "Settings overlay mount", "DropTarget + Upload integration", "conversationsCollapsed in BOTH handlePrefUpdate AND mergePreferences (W1-T01 M2 fix)"]},
+        {"name": "ircStore.svelte.ts", "location": "frontend/src/stores/ircStore.svelte.ts:1-1340", "responsibility": ["Network + Buffer reactive state", "Message append/prepend/batch", "optimisticMessages Map (failed state)", "deleteBuffer + hideChannel", "Member activity tracking (lastSpoke/lastHighlighted)"]},
+        {"name": "wsConnection.svelte.ts", "location": "frontend/src/stores/wsConnection.svelte.ts:1-209", "responsibility": ["WS lifecycle (connect/disconnect/reconnect)", "maxEidTracker for resume", "sendRequest/sendRaw/sendMessage queue", "stream state callbacks", "heartbeat_echo dispatch"]},
+        {"name": "preferences.svelte.ts", "location": "frontend/src/stores/preferences.svelte.ts:1-402", "responsibility": ["GlobalPrefs (theme, font, layout, featureFlags)", "Map state (pinned, archived, collapsed, etc.)", "localStorage persistence + cross-tab sync", "ignoreList + highlightWords", "inputHistory per-buffer", "featureFlags namespace (W0-T01)"]},
+        {"name": "ConnectionManager", "location": "source/ircfiber/irc/manager.d:1-491", "responsibility": ["Per-network IRC client lifecycle", "Holder mode dispatch (env var)", "addNetwork/addAndStartNetwork/removeNetwork", "pauseAllForHandoff/snapshotAllForHandoff (graceful)"]},
+        {"name": "PreferencesRepository", "location": "source/ircfiber/db/preferences.d:1-157", "responsibility": ["UserPreferences struct (pinned, archived, membersCollapsed, prefVersion)", "Redis JSON load/save with MULTI/EXEC atomic increment+save (W1-T02)", "broadcastPrefUpdate fan-out"]},
+        {"name": "MemberActivityStore", "location": "source/ircfiber/db/redis.d (new)", "responsibility": ["Redis hash member-activity:<networkId>:<nick>", "30s debounce per key + 60s delta skip", "Fetch on member rejoin (W5-T05)"]},
+        {"name": "REST API", "location": "source/ircfiber/api/rest.d:1-1445", "responsibility": ["WebSocket gateway", "POST /api/me/pinned + /api/me/archives + /api/me/buffers/:prefs", "GET /api/buffers/archive-names (bulk, W3-T01a)", "broadcastPrefUpdate helper", "HEAD /ping probe endpoint"]},
+        {"name": "EventProcessor", "location": "source/ircfiber/engine/processor.d:1-137", "responsibility": ["Batched event drain (50/fiber slice)", "Redis publish + lpush", "MongoDB persistence (detached task)", "State snapshot on lifecycle events", "heartbeat_echo batched per network emit"]}
+      ]
+    },
+    "research_digest": {
+      "relevant_files": [
+        {"path": "docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md", "purpose": ["632-line designer audit", "15 visual findings with CSS values", "10-priority list", "Reading order for designer-engineer pairing"], "confidence": 0.95},
+        {"path": "AGENTS.md", "purpose": ["Testing guide (vitest lib/client, FLAT convention)", "Deploy architecture (BuildKit only, make update)", "Graceful engine hot-reload (make handoff)", "Connection-holder architecture", "Engine priority/assignment"], "confidence": 1.0},
+        {"path": "Makefile:1299-1364", "purpose": ["update target (full deploy)", "handoff target (engine-only graceful)", "update-assets target (frontend-only)"], "confidence": 1.0},
+        {"path": "deploy/roles/caddy/templates/Caddyfile.j2:61", "purpose": ["ACTUAL CSP location (NOT source/ircfiber/web/package.d)", "Current CSP permits style-src 'unsafe-inline' AND script-src 'unsafe-inline' 'unsafe-eval'", "Wave 4 theming uses CSS variables as BEST PRACTICE, not because CSP forbids inline styles"], "confidence": 1.0},
+        {"path": "/Users/zodiac/Downloads/webpack:/app/src/ignore.js", "purpose": ["IRCCloud 3-level ignore map (nick → user@* → *!user@host → *!*@host)", "Parse + check + checkWildcard functions"], "confidence": 0.95},
+        {"path": "/Users/zodiac/Downloads/webpack:/app/src/onlinechecker.js", "purpose": ["OnlineChecker pattern (R#8)", "30s poll + online event"], "confidence": 0.9},
+        {"path": "/Users/zodiac/Downloads/webpack:/app/src/irccloudnotifier.js", "purpose": ["notStore + Linux body escape (R#7)", "Tag-based dedup pattern"], "confidence": 0.9},
+        {"path": "/Users/zodiac/Downloads/webpack:/app/src/ircformatter.js:131-141", "purpose": ["escapeHtmlMinimal — escapes only &, <, >, \" (NOT ')", "Pattern for W5-T03 reuse (NOT DOMParser)"], "confidence": 0.95},
+        {"path": "/Users/zodiac/Downloads/webpack:/app/src/lib/keyboard.es6", "purpose": ["macOS modifierName() / isModifier() (R#2b cross-platform binding)"], "confidence": 0.85},
+        {"path": "/Users/zodiac/Downloads/webpack:/app/src/xhrstreamhandler.js", "purpose": ["XHR long-poll fallback pattern (R#9)"], "confidence": 0.85},
+        {"path": "irccloud-webpack-study/app/src/ignore.js", "purpose": ["Local mirror of IRCCloud webpack reference"], "confidence": 0.95},
+        {"path": "frontend/src/lib/utils.ts:4", "purpose": ["EXISTING escapeHtml — already tested at utils.test.ts:19-46", "Reused by W5-T03 (M4 fix)"], "confidence": 1.0},
+        {"path": "frontend/src/stores/preferences.svelte.ts:7-33", "purpose": ["GlobalPrefs interface (needs W0-T01 extension with featureFlags)", "DEFAULT_PREFS at :35-..."], "confidence": 1.0},
+        {"path": "frontend/src/App.svelte:630-735", "purpose": ["mergePreferences (BOTH paths covered by W1-T01 M2 fix)", "inactiveCollapsed pattern at :690-699"], "confidence": 1.0},
+        {"path": "frontend/src/App.svelte:737-837", "purpose": ["handlePrefUpdate (BOTH paths covered by W1-T01)", "inactiveCollapsed/membersCollapsed envelope at :801-808"], "confidence": 1.0},
+        {"path": "frontend/src/components/BufferHeader.svelte", "purpose": ["Per-buffer status pill (W1-T08 renders temp_unavailable here, NOT MessageList)"], "confidence": 1.0}
+      ],
+      "patterns_found": [
+        {"name": "3-level ignore map with strict heuristic", "category": "protocol_parity", "confidence": 0.95, "example_location": ["/Users/zodiac/Downloads/webpack:/app/src/ignore.js:1-160"], "notes": "Migration heuristic C1-fix: only pure bare-nick (no !, @, *, ?) gets auto-upgraded"},
+        {"name": "OnlineChecker 30s poll", "category": "resilience", "confidence": 0.9, "example_location": ["/Users/zodiac/Downloads/webpack:/app/src/onlinechecker.js:31-65"]},
+        {"name": "notStore + escapeHtmlMinimal", "category": "notification_parity", "confidence": 0.95, "example_location": ["/Users/zodiac/Downloads/webpack:/app/src/irccloudnotifier.js:6-7,93-99"]},
+        {"name": "additive-only pref merge (no flicker)", "category": "wire_parity", "confidence": 1.0, "example_location": ["frontend/src/App.svelte:650-735"]},
+        {"name": "maxEidTracker stream resume", "category": "wire_parity", "confidence": 1.0, "example_location": ["frontend/src/stores/wsConnection.svelte.ts:13-17"]},
+        {"name": "Batched heartbeat_echo per network", "category": "wire_parity", "confidence": 0.9, "example_location": ["W1-T03", "W2-T01"]},
+        {"name": "Redis MULTI/EXEC atomic increment+save", "category": "wire_parity", "confidence": 0.95, "example_location": ["W1-T02 (prefVersion)"]},
+        {"name": "scopedClass for custom CSS preview", "category": "ui_pattern", "confidence": 0.8, "example_location": ["frontend/src/App.svelte:228-242"]},
+        {"name": "WS primary, XHR shadow lifecycle", "category": "resilience", "confidence": 0.85, "example_location": ["W5-T01"]},
+        {"name": "Feature flag namespace in GlobalPrefs", "category": "wire_parity", "confidence": 0.9, "example_location": ["W0-T01"]}
+      ],
+      "gotchas": [
+        {"text": "CSP is at deploy/roles/caddy/templates/Caddyfile.j2:61 (NOT source/ircfiber/web/package.d which has zero matches). Current CSP permits style-src 'unsafe-inline' AND script-src 'unsafe-inline' 'unsafe-eval'. Wave 4 theming uses CSS variables as BEST PRACTICE.", "confidence": 1.0},
+        {"text": "R#6 nick-only patterns with `*` or `?` (e.g. `evil*`) are AMBIGUOUS: existing isIgnored treats as regex wildcard, new 3-level map treats as literal. Heuristic C1-fix preserves them as-is (host='*', user='*', nick=literal).", "confidence": 1.0},
+        {"text": "R#5 buffersToDelete is per WS reconnect (NOT per IRC reconnect); must guard with `(bid NOT in activeJoinList)` to protect user re-joins between engine snapshot and client receipt.", "confidence": 0.95},
+        {"text": "R#10 temp_unavailable: per-NETWORK idle timer (one per connection); client countdown anchored on serverTs + remaining_ms to avoid clock drift.", "confidence": 0.95},
+        {"text": "conversationsCollapsed must be in BOTH handlePrefUpdate AND mergePreferences (M2 fix). Single-path fix silently resets on stat_user boot.", "confidence": 1.0},
+        {"text": "Wave 1 wire-format changes are breaking for old clients if not feature-flagged; default OFF for first wave deploy per spec. Feature flags in GlobalPrefs.featureFlags (created in W0-T01).", "confidence": 1.0},
+        {"text": "WS reconnect URL `?since=<eid>` at wsConnection.svelte.ts:107 is server-side resume; XHR fallback must use the same `since` param for dedup. Close XHR on WS reconnection success (PM8).", "confidence": 0.95},
+        {"text": "Midnight theme uses `#app.midnight-theme` (app-scoped) in _midnight.scss:5. Wave 4b-T03 keeps this as backward-compat alias while introducing new `body.theme-*` family. PM9 verification in W4a-T13.", "confidence": 1.0},
+        {"text": "Local Mac ARM64 D binary is exec format error on remote x86_64 — NEVER scp locally compiled binaries per AGENTS.md. Wave 1 deploy is TWO-PHASE (PM7).", "confidence": 1.0},
+        {"text": "W5-T05 lastSpoke persistence: Redis hash member-activity:<networkId>:<nick> with 30s debounce + 60s delta skip (avoids Mongo hot-write path; PM11).", "confidence": 0.95},
+        {"text": "W5-T03 Linux body escape: REUSE existing escapeHtml from frontend/src/lib/utils.ts:4 (NOT DOMParser; matches IRCCloud escapeHtmlMinimal at ircformatter.js:131-141).", "confidence": 1.0}
+      ]
+    },
+    "prior_decisions": [
+      {"decision": "Two-phase boot (net:works skeleton → sync)", "rationale": ["Avoids loading skeleton on first paint", "Mirrors IRCCloud's net:works handler at App.svelte:579"], "confidence": 1.0},
+      {"decision": "Additive-only pref_update merge", "rationale": ["Prevents flicker on stat_user boot when localStorage has older prefs", "Comment at App.svelte:650-735 explains"], "confidence": 1.0},
+      {"decision": "messageBatcher 200ms flush", "rationale": ["Coalesces high-frequency irc_events (art bursts)", "Front-end performance; reduce WS frame count"], "confidence": 1.0},
+      {"decision": "LoadingSkeleton with cached network names", "rationale": ["SSR-like first paint", "Cached in localStorage at NETWORK_CACHE_KEY"], "confidence": 1.0},
+      {"decision": "Per-buffer inputHistory (networkId:bufferName)", "rationale": ["IRCCloud parity", "Multiline gating via InputHistory.isMultiline"], "confidence": 1.0},
+      {"decision": "IRCCloud-style routing /irc/{network}/{type}/{target}", "rationale": ["Direct deep-linking", "Mirrors IRCCloud URL structure"], "confidence": 1.0},
+      {"decision": "Holder daemon as separate process for IRC socket ownership", "rationale": ["Enterprise-grade zero-disconnect hot-reload", "Connection survives engine exec/reload"], "confidence": 1.0},
+      {"decision": "Engine priority-aware assignment with fallbackOnly servers", "rationale": ["Backup engines don't steal OVH's networks during reboot", "Defer reclaim at bootstrap.d:216-224"], "confidence": 1.0},
+      {"decision": "Wave 0 prep with feature-flag scaffolding (W0-T01) before Wave 1 protocol changes", "rationale": ["Critic m1 fix: ZERO existing flag infrastructure; explicit prep task needed", "Waves before Wave 1 would re-create flag plumbing inline"], "confidence": 1.0},
+      {"decision": "Wave 1 reorder: T07 (safeChanSuffix) before T05 (buffersToDelete)", "rationale": ["W3-T01 ChannelSwitcher needs getDisplayName helper available without re-import dance", "Cleaner cross-wave dep"], "confidence": 1.0},
+      {"decision": "Wave 4 split into 4a (8 visual states + dividers) and 4b (5 themes + remaining visual)", "rationale": ["Critic m3: 18 tasks in one wave is too large", "Each wave becomes ~13 tasks; visual regression baselines captured separately"], "confidence": 1.0},
+      {"decision": "Wave 1 deploy is TWO-PHASE (frontend first, wait 10 min, then engine)", "rationale": ["PM7 mitigation: engine-before-frontend races cause silent message loss", "Old client receives heartbeat_echo events it doesn't know how to handle"], "confidence": 1.0},
+      {"decision": "W5-T03 REUSES existing escapeHtml (NOT DOMParser)", "rationale": ["M4 critic fix: matches IRCCloud escapeHtmlMinimal at ircformatter.js:131-141", "utils.ts:4 already tested at utils.test.ts:19-46"], "confidence": 1.0},
+      {"decision": "W4b-T03 keeps `#app.midnight-theme` selector as backward-compat alias", "rationale": ["PM9: users with cached `theme: 'midnight'` localStorage value need themed UI after deploy", "Test in W4a-T13 visual regression"], "confidence": 1.0}
+    ],
+    "high_risk_signals": [
+      {"task": "W1-T01", "signal": "schema_change", "description": "conversationsCollapsed in BOTH handlePrefUpdate AND mergePreferences (M2 fix)"},
+      {"task": "W1-T02", "signal": "schema_change", "description": "prefVersion field added to UserPreferences; atomic MULTI/EXEC; feature flag default OFF"},
+      {"task": "W1-T03", "signal": "wire_format_change", "description": "heartbeat_echo new WS type, batched per network with bid[] array"},
+      {"task": "W1-T04", "signal": "capability_negotiation", "description": "draft/edit-message IRCv3; check CAP before sending"},
+      {"task": "W1-T05", "signal": "low_risk", "description": "safeChanSuffix parser; pure parser addition"},
+      {"task": "W1-T06", "signal": "wire_format_change", "description": "buffersToDelete always-on per WS reconnect; client-side activeJoinList guard"},
+      {"task": "W1-T07", "signal": "migration", "description": "Ignore nick-only → `*!*@*`; C1 heuristic fix checks BOTH separators AND wildcards; console-log original"},
+      {"task": "W1-T08", "signal": "wire_format_change", "description": "temp_unavailable BufferHeader countdown anchored on serverTs; per-NETWORK idle timer"},
+      {"task": "W3-T01a", "signal": "wire_format_change", "description": "Archive-names bulk endpoint with Redis TTL; PART invalidation"},
+      {"task": "W3-T01", "signal": "cross_domain_impact", "description": "ChannelSwitcher cross-network with serverName disambiguation; scope prop"},
+      {"task": "W4a-T01..T08", "signal": "cross_domain_impact", "description": "SCSS partials touched; default theme = dark (no regression); #app.midnight-theme backward-compat"},
+      {"task": "W4b-T03", "signal": "theme_class_scope_change", "description": "body.theme-* + #app.midnight-theme backward-compat (PM9 verification in W4a-T13)"},
+      {"task": "W5-T01", "signal": "wire_format_change", "description": "XHR ?since= long-poll; explicit WS primary/XHR shadow lifecycle (PM8)"},
+      {"task": "W5-T03", "signal": "security_sensitive", "description": "Linux body escape reusing existing escapeHtml; matches IRCCloud escapeHtmlMinimal"},
+      {"task": "W5-T05", "signal": "schema_change + hot_write_path", "description": "lastSpoke persistence to Redis hash with 30s debounce + 60s delta skip (PM11)"}
+    ],
+    "pre_mortems": [
+      {"id": "PM1", "scenario": "Wave 1 wire-format changes break existing pre-update clients", "likelihood": "medium", "impact": "critical", "mitigation": "Gate all Wave 1 wire changes behind feature flags; default OFF for first wave deploy. See PM7 for two-phase deploy ordering."},
+      {"id": "PM2-C1", "scenario": "R#6 Ignore migration silently breaks existing ignore list (e.g. nick 'evil*' was regex wildcard, becomes literal)", "likelihood": "high", "impact": "high", "mitigation": "Heuristic: upgrade ONLY pure bare-nick (no !, @, *, ?). Patterns with any separator OR wildcard preserved as-is in 3-level map (host='*', user='*', nick=literal). Console-log original before transformation."},
+      {"id": "PM3", "scenario": "R#5 buffersToDelete deletes user-rejoined channels on reconnection", "likelihood": "medium", "impact": "high", "mitigation": "Client-side guard `(bid NOT in activeJoinList)`; intersect with archived/pinned/hidden maps."},
+      {"id": "PM4-M2", "scenario": "W1-T01 only fixes half the gap (handlePrefUpdate but not mergePreferences)", "likelihood": "high", "impact": "high", "mitigation": "W1-T01 MUST add conversationsCollapsed to BOTH paths; acceptance criteria explicitly cover both."},
+      {"id": "PM5", "scenario": "Wave 4 theme picker regresses default dark theme", "likelihood": "low", "impact": "medium", "mitigation": "All targets (Chrome 90+, Safari 14+, Firefox 90+) support CSS custom properties; verify via existing _midnight.scss precedence; browser-test against default dark before toggling."},
+      {"id": "PM6", "scenario": "Wave 5 WS→XHR fallback sends duplicate events on WS reconnect mid-stream", "likelihood": "medium", "impact": "medium", "mitigation": "maxEidTracker for eid-based dedup; explicit 'WS primary, XHR shadow' lifecycle. See PM8 for XHR lifecycle race."},
+      {"id": "PM7", "scenario": "Wave 1 deploy order races with frontend refresh (engine-before-frontend)", "likelihood": "high", "impact": "medium", "mitigation": "Two-phase deploy for Wave 1: frontend FIRST via make update-assets, wait ≥10 minutes, THEN engine via make handoff."},
+      {"id": "PM8", "scenario": "Wave 5 XHR fallback double-applies events on WS reconnect race", "likelihood": "medium", "impact": "medium", "mitigation": "Explicit 'WS primary, XHR shadow' lifecycle: WS on → XHR off (close XHR); WS off → XHR on. xhrStreamHandler.close() on WS reconnection success BEFORE WS handshake completes."},
+      {"id": "PM9", "scenario": "Wave 4 theme picker drops default dark theme on cache-bust for existing midnight users", "likelihood": "low", "impact": "high", "mitigation": "W4b-T03 keeps `#app.midnight-theme` as backward-compat selector. W4a-T13 visual regression test with saved `theme: 'midnight'` localStorage value verifies."},
+      {"id": "PM10", "scenario": "Wave 3 archive-names endpoint server RAM cost (500+ archives = ~50KB JSON per Cmd+K open)", "likelihood": "medium", "impact": "medium", "mitigation": "5-minute in-memory TTL on client cache; re-fetch on cache age > TTL. Server-side: bulk Mongo query + Redis cache invalidated on PART."},
+      {"id": "PM11", "scenario": "Wave 5 lastSpoke persistence creates Mongo hot-write path", "likelihood": "high", "impact": "low-to-medium", "mitigation": "Debounce persist to 30s per (networkId, nick); skip if delta < 60s. Redis hash (NOT Mongo) with 30s debounce per key."}
+    ],
+    "reuse_notes": [
+      {"path": "frontend/src/App.svelte:737-837 (handlePrefUpdate)", "trust": "high"},
+      {"path": "frontend/src/App.svelte:630-735 (mergePreferences)", "trust": "high"},
+      {"path": "frontend/src/stores/preferences.svelte.ts:1-402 (full preferences store; needs W0-T01 extension)", "trust": "high"},
+      {"path": "frontend/src/stores/wsConnection.svelte.ts:1-209 (WS client)", "trust": "high"},
+      {"path": "frontend/src/stores/ircStore.svelte.ts:1-1340 (network + buffer state)", "trust": "high"},
+      {"path": "frontend/src/components/MemberList.svelte:1-81 (member panel — symbols table defined but not rendered)", "trust": "high"},
+      {"path": "frontend/src/components/DateChange.svelte:1-30 (date row)", "trust": "high"},
+      {"path": "frontend/src/components/InputArea.svelte:176-249 (handleKeyDown + tab completion)", "trust": "high"},
+      {"path": "frontend/src/lib/notifications.ts:1-69 (Notification API wrapper)", "trust": "high"},
+      {"path": "frontend/src/lib/tabCompletion.ts:1-141 (tab completion engine)", "trust": "high"},
+      {"path": "frontend/src/lib/slashCommands.ts:1-242 (slash commands; /cycle + /quote already at 140, 177)", "trust": "high"},
+      {"path": "frontend/src/lib/inputHistory.ts:1-109 (per-buffer history; isMultiline at 106-108)", "trust": "high"},
+      {"path": "frontend/src/lib/utils.ts:4 (existing escapeHtml — REUSED by W5-T03 M4 fix)", "trust": "high"},
+      {"path": "frontend/src/lib/utils.test.ts:19-46 (escapeHtml tests — no new test scaffolding needed for W5-T03)", "trust": "high"},
+      {"path": "frontend/src/components/BufferHeader.svelte (per-buffer status pill — W1-T08 renders temp_unavailable here)", "trust": "high"},
+      {"path": "source/ircfiber/db/preferences.d:1-157 (UserPreferences struct + repository; needs prefVersion + MULTI/EXEC)", "trust": "high"},
+      {"path": "source/ircfiber/api/rest.d:1-1445 (REST API + broadcastPrefUpdate; needs /api/buffers/archive-names in W3-T01a)", "trust": "high"},
+      {"path": "source/ircfiber/irc/manager.d:1-491 (ConnectionManager + holder mode dispatch)", "trust": "high"},
+      {"path": "source/ircfiber/irc/parser.d:26-117 (parseIRCLinePublic; safeChanSuffix + temp_unavailable parsing)", "trust": "high"},
+      {"path": "source/ircfiber/engine/processor.d:1-137 (event processor; heartbeat_echo batched emit)", "trust": "high"},
+      {"path": "deploy/roles/caddy/templates/Caddyfile.j2:61 (ACTUAL CSP location — NOT source/ircfiber/web/package.d)", "trust": "high"},
+      {"path": "Makefile:1299-1364 (deploy targets: update, handoff, update-assets)", "trust": "high"},
+      {"path": "docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:1-632 (designer audit)", "trust": "high"},
+      {"path": "/Users/zodiac/Downloads/webpack:/app/src/ignore.js:1-160 (IRCCloud ignore 3-level)", "trust": "high"},
+      {"path": "/Users/zodiac/Downloads/webpack:/app/src/onlinechecker.js:1-76 (IRCCloud OnlineChecker)", "trust": "high"},
+      {"path": "/Users/zodiac/Downloads/webpack:/app/src/irccloudnotifier.js:1-152 (IRCCloud notifier + notStore)", "trust": "high"},
+      {"path": "/Users/zodiac/Downloads/webpack:/app/src/ircformatter.js:131-141 (escapeHtmlMinimal — pattern for W5-T03)", "trust": "high"},
+      {"path": "/Users/zodiac/Downloads/webpack:/app/src/view/channelswitchdialog.es6:154-238 (cross-network switcher + archive-names fetch)", "trust": "high"}
+    ]
+  }
+}

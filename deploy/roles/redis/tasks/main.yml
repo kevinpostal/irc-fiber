@@ -1,0 +1,50 @@
+---
+# Note: vault_redis_password is no longer used. The D redis client can't
+# pass it (connectRedis() takes no password), and the redis container is
+# bound only to the Tailscale interface for network-level isolation. The
+# password is still kept in the vault as a future-proofing artifact in case
+# the D code is patched to support AUTH.
+
+- name: Ensure redis data volume exists
+  community.docker.docker_volume:
+    name: "{{ redis_data_volume }}"
+    state: present
+
+- name: Render redis.conf
+  ansible.builtin.template:
+    src: redis.conf.j2
+    dest: /etc/ircfiber/redis.conf
+    owner: root
+    group: root
+    # Redis container runs as the redis user (uid 999); the config file
+    # needs to be world-readable, not just root-readable.
+    mode: "0644"
+  notify: Restart redis
+
+- name: Run ircfiber-redis
+  community.docker.docker_container:
+    name: "{{ redis_container_name }}"
+    image: "{{ redis_image }}"
+    state: started
+    restart_policy: unless-stopped
+    network_mode: host
+    command:
+      - "redis-server"
+      - "/usr/local/etc/redis/redis.conf"
+    volumes:
+      - "{{ redis_data_volume }}:/data"
+      - "/etc/ircfiber/redis.conf:/usr/local/etc/redis/redis.conf:ro"
+    security_opts:
+      - "no-new-privileges:true"
+    ulimits:
+      - "nofile:65536:65536"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "redis-cli -h 127.0.0.1 ping | grep -q PONG || redis-cli -h {{ redis_bind_ip }} ping | grep -q PONG"
+      interval: "{{ redis_healthcheck_interval }}"
+      timeout: "{{ redis_healthcheck_timeout }}"
+      retries: "{{ redis_healthcheck_retries }}"
+    labels:
+      com.ircfiber.component: "redis"
+      com.ircfiber.version: "{{ ircfiber_version }}"

@@ -1,0 +1,15 @@
+---
+# Deploy the IRC engine. Targets [ircfiber_engines] (all engine hosts).
+# To add a new engine host: append it to [ircfiber_engines] in hosts.ini,
+# then run this playbook limited to that host:
+#   ansible-playbook playbooks/engine.yml -l newengine.example.com
+# (The new host must already have Docker + Tailscale installed; run
+# playbooks/docker.yml and playbooks/tailscale.yml first if needed.)
+- name: Deploy irc-fiber engine(s)
+  hosts: ircfiber_engines
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: engine

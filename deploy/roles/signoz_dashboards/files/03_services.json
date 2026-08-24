@@ -1,0 +1,40 @@
+{
+  "title": "IRC Fiber — Services Inventory",
+  "description": "NR-style all-services view. One row per service with health, throughput, error rate.",
+  "tags": ["ircfiber", "services", "inventory", "newrelic"],
+  "version": "v5",
+  "layout": [
+    {"h": 1, "i": "row-title", "w": 24, "x": 0, "y": 0},
+    {"h": 14, "i": "service-list", "w": 24, "x": 0, "y": 1}
+  ],
+  "widgets": [
+    {"id": "row-title", "panelTypes": "row", "title": "Services (last 15m)"},
+    {
+      "id": "service-list",
+      "panelTypes": "table",
+      "title": "Service inventory",
+      "description": "Per service: throughput, error rate, average latency, p99",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "dataSource": "logs",
+              "aggregateOperator": "count",
+              "filter": {"expression": "service.name != nil"},
+              "filters": {"items": [], "op": "AND"},
+              "groupBy": [{"key": "service.name", "dataType": "string", "type": "tag"}],
+            "having": {"expression": ""},
+            "orderBy": [{"columnName": "count()", "order": "desc"}],
+            "limit": 50
+            }
+          ],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    }
+  ]
+}

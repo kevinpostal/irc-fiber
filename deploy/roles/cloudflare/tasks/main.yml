@@ -1,0 +1,108 @@
+---
+# Manages Cloudflare DNS records that point at this host.
+#
+# NOTE: This role manages A records for direct DNS resolution. If you are
+# using Cloudflare Tunnel (cloudflared), DNS is handled automatically by
+# Cloudflare Zero Trust when Public Hostnames are configured on the tunnel.
+# In that case this role is optional — you can skip it or keep it as a
+# migration fallback (set cloudflare_proxied: true for orange-cloud mode).
+#
+# Idempotent: re-running the playbook with no config changes is a no-op.
+# Replaces existing A records at the same name+zone when value/proxied/ttl
+# differ from what's already in CF (community.general.cloudflare_dns does
+# this via its state=present + value + proxied + ttl comparison).
+#
+# Operates on the [ircfiber_backend] group (the host that runs Caddy and
+# therefore needs DNS pointed at it). For a multi-host setup, run this
+# role with -l <hostname> per host and set cloudflare_target_ip per host.
+
+- name: Preflight — CF creds must be defined
+  ansible.builtin.assert:
+    that:
+      - vault_cloudflare_api_token is defined
+      - vault_cloudflare_api_token | length > 0
+      - vault_cloudflare_api_token != "REPLACE-WITH-CF-API-TOKEN"
+      - vault_cloudflare_account_id is defined
+      - vault_cloudflare_account_id | length > 0
+      - vault_cloudflare_account_id != "REPLACE-WITH-CF-ACCOUNT-ID"
+    fail_msg: |
+      vault_cloudflare_api_token / vault_cloudflare_account_id are missing
+      or still placeholders. Run:
+        ansible-vault edit inventories/production/group_vars/vault.yml
+      and fill them in. The API token needs Zone:DNS:Edit permission
+      scoped to the zone you'll be managing. Account ID is shown in the
+      Cloudflare dashboard sidebar on any zone page.
+
+- name: Preflight — cloudflare_zone must be set
+  ansible.builtin.assert:
+    that:
+      - cloudflare_zone is defined
+      - cloudflare_zone | length > 0
+    fail_msg: |
+      cloudflare_zone is empty. Set it in
+      inventories/production/group_vars/all.yml (or per-host in
+      inventories/production/host_vars/<hostname>.yml) to the registered
+      Cloudflare zone that owns the records you want managed.
+
+- name: Preflight — cloudflare_target_ip must be set
+  ansible.builtin.assert:
+    that:
+      - cloudflare_target_ip is defined
+      - cloudflare_target_ip | length > 0
+      - cloudflare_target_ip != "0.0.0.0"
+    fail_msg: |
+      cloudflare_target_ip is empty on {{ inventory_hostname }}.
+      Set it in inventories/production/host_vars/{{ inventory_hostname }}.yml
+      to the public IP this host should be reachable at (find it via
+      `tailscale netcheck`).
+
+- name: Build list of CF records to manage
+  ansible.builtin.set_fact:
+    cloudflare_records_to_manage: >-
+      {{
+        cloudflare_records
+        | default(cloudflare_records_default)
+      }}
+
+- name: Manage Cloudflare DNS records (A + CNAME)
+  community.general.cloudflare_dns:
+    api_token: "{{ vault_cloudflare_api_token }}"
+    zone: "{{ cloudflare_zone }}"
+    record: "{{ item.name }}"
+    type: "{{ item.type }}"
+    # A records get the host's public IP; CNAME records get their target
+    # hostname specified in the item's `value` field.
+    value: >-
+      {{
+        cloudflare_target_ip if item.type == 'A'
+        else (item.value | default(cloudflare_zone))
+      }}
+    ttl: "{{ cloudflare_record_ttl | int if not (item_proxied | bool) else omit }}"
+    proxied: "{{ item_proxied | bool }}"
+    state: present
+  loop: "{{ cloudflare_records_to_manage }}"
+  loop_control:
+    label: "{{ item.name | default('@') }}.{{ cloudflare_zone }}"
+  register: cloudflare_records_changed
+  vars:
+    # Per-record proxied override: each record entry can optionally specify
+    # `proxied` to override the global cloudflare_proxied default.
+    # Used for subdomains like "irc" that serve non-HTTP protocols and must
+    # remain DNS-only (Cloudflare only proxies HTTP/S on ports 80/443).
+    item_proxied: "{{ item.proxied | default(cloudflare_proxied) }}"
+
+- name: Summary of CF record changes
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        (cloudflare_records_changed.results
+         | default([])
+         | selectattr('changed', 'defined')
+         | selectattr('changed', 'equalto', true)
+         | map(attribute='item.name', default='?')
+         | map('regex_replace', '^$', '@')
+         | map('regex_replace', '^(.*)$', '\\1.' + cloudflare_zone)
+         | list)
+        | default([], true)
+      }}
+  when: cloudflare_records_changed is defined

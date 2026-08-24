@@ -1,0 +1,326 @@
+{
+  "title": "IRC Fiber — Infrastructure",
+  "description": "NR-style infrastructure view: host + containers, USE method (Utilization / Saturation / Errors).",
+  "tags": ["ircfiber", "infrastructure", "newrelic"],
+  "version": "v5",
+  "layout": [
+    {"h": 1, "i": "row-summary", "w": 24, "x": 0, "y": 0},
+    {"h": 3, "i": "s-host-cpu", "w": 6, "x": 0, "y": 1},
+    {"h": 3, "i": "s-host-mem", "w": 6, "x": 6, "y": 1},
+    {"h": 3, "i": "s-host-disk", "w": 6, "x": 12, "y": 1},
+    {"h": 3, "i": "s-containers", "w": 6, "x": 18, "y": 1},
+    {"h": 1, "i": "row-host", "w": 24, "x": 0, "y": 4},
+    {"h": 8, "i": "host-cpu", "w": 8, "x": 0, "y": 5},
+    {"h": 8, "i": "host-mem-by-state", "w": 8, "x": 8, "y": 5},
+    {"h": 8, "i": "host-network", "w": 8, "x": 16, "y": 5},
+    {"h": 8, "i": "host-disk-io", "w": 12, "x": 0, "y": 13},
+    {"h": 8, "i": "host-fs", "w": 12, "x": 12, "y": 13},
+    {"h": 1, "i": "row-containers", "w": 24, "x": 0, "y": 21},
+    {"h": 10, "i": "container-grid", "w": 24, "x": 0, "y": 22}
+  ],
+  "widgets": [
+    {
+      "id": "row-summary",
+      "panelTypes": "row",
+      "title": "OVH host — summary"
+    },
+    {
+      "id": "s-host-cpu",
+      "panelTypes": "value",
+      "title": "CPU",
+      "yAxisUnit": "percent",
+      "thresholds": [
+        {"thresholdValue": 70, "thresholdColor": "#facc15"},
+        {"thresholdValue": 85, "thresholdColor": "#ef4444"}
+      ],
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.cpu.utilization", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "avg",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 30
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "s-host-mem",
+      "panelTypes": "value",
+      "title": "Memory",
+      "yAxisUnit": "percent",
+      "thresholds": [
+        {"thresholdValue": 75, "thresholdColor": "#facc15"},
+        {"thresholdValue": 90, "thresholdColor": "#ef4444"}
+      ],
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.memory.utilization", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "avg",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 30
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "s-host-disk",
+      "panelTypes": "value",
+      "title": "Disk (root)",
+      "yAxisUnit": "percent",
+      "thresholds": [
+        {"thresholdValue": 75, "thresholdColor": "#facc15"},
+        {"thresholdValue": 85, "thresholdColor": "#ef4444"}
+      ],
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.filesystem.utilization", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "avg",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 60
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "s-containers",
+      "panelTypes": "value",
+      "title": "Running containers",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "container.cpu.usage", "dataType": "float64"},
+            "timeAggregation": "count",
+            "spaceAggregation": "sum",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [{"key": "container.name", "dataType": "string", "type": "tag"}],
+            "having": {"expression": "sum(count()) > 0"},
+            "orderBy": [],
+            "limit": 100,
+            "stepInterval": 30
+          }],
+          "queryFormulas": [{"queryName": "F1", "expression": "count(A)", "legend": "containers", "disabled": false}]
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {"id": "row-host", "panelTypes": "row", "title": "Host details"},
+    {
+      "id": "host-cpu",
+      "panelTypes": "graph",
+      "title": "CPU by state",
+      "yAxisUnit": "percent",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.cpu.utilization", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "avg",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [{"key": "state", "dataType": "string", "type": "tag"}],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 30
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "host-mem-by-state",
+      "panelTypes": "graph",
+      "title": "Memory by state (used/cached/free/buffer)",
+      "yAxisUnit": "bytes",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.memory.usage", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "sum",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [{"key": "state", "dataType": "string", "type": "tag"}],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 30
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "host-network",
+      "panelTypes": "graph",
+      "title": "Network I/O (per device, per direction)",
+      "yAxisUnit": "Bps",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.network.io", "dataType": "float64"},
+            "timeAggregation": "rate",
+            "spaceAggregation": "sum",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [
+              {"key": "device", "dataType": "string", "type": "tag"},
+              {"key": "direction", "dataType": "string", "type": "tag"}
+            ],
+            "having": {"expression": "sum(rate(system.network.io)) > 0"},
+            "orderBy": [],
+            "limit": 30,
+            "stepInterval": 60
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "host-disk-io",
+      "panelTypes": "graph",
+      "title": "Disk I/O",
+      "yAxisUnit": "Bps",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.disk.io", "dataType": "float64"},
+            "timeAggregation": "rate",
+            "spaceAggregation": "sum",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [{"key": "direction", "dataType": "string", "type": "tag"}],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 60
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {
+      "id": "host-fs",
+      "panelTypes": "graph",
+      "title": "Filesystem usage (per mount)",
+      "yAxisUnit": "bytes",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "system.filesystem.usage", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "sum",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [{"key": "filesystem.mode", "dataType": "string", "type": "tag"}],
+            "having": {"expression": ""},
+            "orderBy": [],
+            "limit": null,
+            "stepInterval": 60
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    },
+    {"id": "row-containers", "panelTypes": "row", "title": "Container grid (USE method per container)"},
+    {
+      "id": "container-grid",
+      "panelTypes": "table",
+      "title": "Top containers by CPU",
+      "query": {
+        "queryType": "builder",
+        "builder": {
+          "queryData": [{
+            "queryName": "A",
+            "dataSource": "metrics",
+            "aggregateAttribute": {"key": "container.cpu.percent", "dataType": "float64"},
+            "timeAggregation": "avg",
+            "spaceAggregation": "avg",
+            "filter": {"expression": ""},
+            "filters": {"items": [], "op": "AND"},
+            "groupBy": [
+              {"key": "container.name", "dataType": "string", "type": "tag"},
+              {"key": "container.image", "dataType": "string", "type": "tag"}
+            ],
+            "having": {"expression": ""},
+            "orderBy": [{"columnName": "container.cpu.percent", "order": "desc"}],
+            "limit": 20
+          }],
+          "queryFormulas": []
+        },
+        "promql": [{"name": "A", "query": "", "disabled": false}],
+        "clickhouse_sql": [{"name": "A", "query": "", "disabled": false}]
+      }
+    }
+  ]
+}

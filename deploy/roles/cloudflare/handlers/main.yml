@@ -1,0 +1,3 @@
+---
+# The cloudflare role has no handlers — every task is already idempotent
+# at the API level (community.general.cloudflare_dns does its own diffing).

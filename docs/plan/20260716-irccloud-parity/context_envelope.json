@@ -1,0 +1,261 @@
+{
+  "context_envelope": {
+    "meta": {
+      "plan_id": "20260716-irccloud-parity",
+      "created_at": "2026-07-16T18:00:00Z",
+      "last_updated": "2026-07-16T18:00:00Z",
+      "version": 1
+    },
+    "tech_stack": [
+      {
+        "name": "Svelte 5 (runes only)",
+        "version": "5.x",
+        "usage_context": "ConnectionStatus and ServerLogTimeline UI; runes-only component state and reactivity.",
+        "config_files": [
+          "frontend/svelte.config.js",
+          "frontend/vite.config.ts",
+          "frontend/package.json"
+        ]
+      },
+      {
+        "name": "TypeScript",
+        "version": "5.x strict",
+        "usage_context": "Strict frontend types, pure connection helpers, network state, and WS event plumbing.",
+        "config_files": [
+          "frontend/tsconfig.json"
+        ]
+      },
+      {
+        "name": "vitest",
+        "version": "2.x",
+        "usage_context": "Two projects: lib for pure helpers and client for Svelte components and stores.",
+        "config_files": [
+          "frontend/vitest.config.ts",
+          "frontend/package.json"
+        ]
+      },
+      {
+        "name": "vibe.d (D backend)",
+        "version": "Dub-locked current",
+        "usage_context": "In scope in Wave 1 for retry/fail events, additive snapshots, and WS sync payloads.",
+        "config_files": [
+          "dub.sdl",
+          "dub.selections.json"
+        ]
+      }
+    ],
+    "conventions": [
+      "runes-only-no-class-directive: use `:class={...}`; never use Svelte `class:` directives.",
+      "Declare reactive Set state with `$state(new Set(...))`; mutate the proxied Set directly.",
+      "Reuse createNetwork/createBuffer in ircStore.svelte.test.ts:~200-300 for store tests.",
+      "Keep buffer field comments namespaced by their W-plan task ID when editing nearby state.",
+      "Plan artifacts live together as plan.yaml + context_envelope.json + plan-summary.md.",
+      "reuse-before-rewrite: extend trusted helpers and event paths before adding parallel mechanisms."
+    ],
+    "constraints": {
+      "hard": [
+        "Engine changes are in scope in Wave 1.",
+        "Wire additions CONNECTION_RETRY_STATUS and CONNECTION_FAIL are allowed and additive.",
+        "Redis snapshot schema changes must remain backward-compatible and additive only.",
+        "Svelte 5 runes only; bind props with `$props()` and state with `$state()`.",
+        "Use `$derived()` or `$derived.by()` for derived state and `:class={...}` for classes.",
+        "Cleanup uses an `$effect` return function or `onCleanup`; never leave timer teardown implicit.",
+        "The 1s banner refill interval must stop on status change and component unmount.",
+        "ServerLogTimeline must preserve ServerFeaturesPanel and the 005 ISUPPORT flow.",
+        "Emit both legacy `disconnectReason` and structured `failInfo` during the transition.",
+        "`serverlogCollapseEvents` is global, not per-network, matching IRCCloud's model.",
+        "Existing CONNECTED, DISCONNECTED, NOTICE, PRIVMSG, and ISUPPORT wire shapes are frozen.",
+        "Keep the fiber palette; IRCCloud colors are references and must not become new tokens."
+      ],
+      "soft": [
+        "Prefer native details/summary behavior over a custom disclosure component.",
+        "Keep visual changes typographic and structural rather than cloning IRCCloud branding.",
+        "Prefer pure TypeScript helpers with no Svelte imports for reason and suspicion rules.",
+        "Minimize blast radius and avoid unrelated cleanup in the 1,145-line timeline component.",
+        "Add no external dependencies unless existing platform APIs cannot meet an acceptance check."
+      ],
+      "compatibility": [
+        "Legacy snapshots may omit retryStatus and failInfo; frontend fallback behavior must still work.",
+        "New frontend code prefers failInfo but falls back to disconnectReason.",
+        "Modern Chromium remains the component-test browser target.",
+        "Existing lib and client vitest suites must remain green."
+      ],
+      "security_requirements": [
+        "No new credentials, remote origins, or privileged APIs are introduced.",
+        "Failure text is rendered as text; structured engine reasons are not treated as markup."
+      ]
+    },
+    "architecture_snapshot": {
+      "key_dirs": [
+        "source/ircfiber/irc/ - connection lifecycle and reconnect backoff",
+        "source/ircfiber/models/ - synthetic IRC event factories and payload types",
+        "source/ircfiber/redis/ and source/ircfiber/engine/ - additive network snapshots",
+        "source/ircfiber/api/ - fresh WebSocket state dump serialization",
+        "frontend/src/lib/ - pure reason and suspicious-connection helpers",
+        "frontend/src/stores/ - network state, preferences, and event application",
+        "frontend/src/components/ - connection banner and server-log timeline"
+      ],
+      "patterns": [
+        "Engine lifecycle state flows through synthetic events and additive NetworkStateSnapshot fields.",
+        "Frontend WS dispatch mutates the rune-backed Network object through named store functions.",
+        "Structured failInfo is preferred while disconnectReason remains the compatibility fallback.",
+        "Server-log attempts retain per-attempt collapse state beneath one global events disclosure pref."
+      ],
+      "key_components": [
+        {
+          "name": "ConnectionStatus.svelte",
+          "location": "frontend/src/components/ConnectionStatus.svelte",
+          "responsibility": [
+            "Current 3-state connection banner.",
+            "Target surface for 11 states, countdown, failures, warnings, and state-aware actions."
+          ]
+        },
+        {
+          "name": "ServerLogTimeline.svelte",
+          "location": "frontend/src/components/ServerLogTimeline.svelte",
+          "responsibility": [
+            "Current 1,145 LOC connection-attempt timeline.",
+            "Renders phases, welcome, MOTD, numerics, ISUPPORT, and notices.",
+            "Target for one global connection-events disclosure and restrained row typography."
+          ]
+        },
+        {
+          "name": "ServerLogCard.svelte",
+          "location": "frontend/src/components/ServerLogCard.svelte",
+          "responsibility": [
+            "Legacy server-log card retained only by tests.",
+            "Not the production parity surface and not a rewrite target."
+          ]
+        },
+        {
+          "name": "PersistentIRCClient reconnect loop",
+          "location": "source/ircfiber/irc/connection.d",
+          "responsibility": [
+            "Computes reconnect attempt count and backoff delay.",
+            "Owns disconnect reasons and emits lifecycle transitions."
+          ]
+        },
+        {
+          "name": "NetworkStateSnapshot",
+          "location": "source/ircfiber/redis/protocol.d",
+          "responsibility": [
+            "Persists network state for resume and fresh-client sync.",
+            "Receives additive retryStatus data without breaking older snapshots."
+          ]
+        },
+        {
+          "name": "WebSocket state dump",
+          "location": "source/ircfiber/api/websocket.d",
+          "responsibility": [
+            "Serializes NetworkStateSnapshot into the fresh WebSocket sync payload.",
+            "Ships retryStatus only when present."
+          ]
+        }
+      ]
+    },
+    "research_digest": [
+      {
+        "file": "irccloud-webpack-study/app/src/view/connectionstatusview.js",
+        "what_it_informs": "The 11 visible states, retry ordinal/countdown copy, failures, and action branches."
+      },
+      {
+        "file": "irccloud-webpack-study/app/src/view/renderreasons.js",
+        "what_it_informs": "Human-readable reason, SSL verification, restricted, and post-error maps."
+      },
+      {
+        "file": "irccloud-webpack-study/app/src/view/serverlog.js",
+        "what_it_informs": "The global collapseDisco preference and collapsed connection-event grouping model."
+      },
+      {
+        "file": "irccloud-webpack-study/app/src/view/linemessagerenderer.js",
+        "what_it_informs": "The type_status, type_notice, type_info_response, and type_motd_response classes."
+      },
+      {
+        "file": "irccloud_chat_css_extracted.md",
+        "what_it_informs": "Reference visual grammar: hairlines, restrained fills, spacing, and mono prefixes."
+      },
+      {
+        "file": "irccloud_chat_css_categorized.json",
+        "what_it_informs": "Critic evidence for mapping IRCCloud grammar to existing fiber palette tokens."
+      }
+    ],
+    "prior_decisions": [
+      {
+        "date": "2026-07-16",
+        "decision": "Implement full parity rather than a visual-only restyle.",
+        "rationale": [
+          "The current banner drops lifecycle and failure data, so CSS alone cannot close the UX gap.",
+          "Engine, wire, store, and UI changes are all included in the five-wave DAG."
+        ],
+        "decided_by": "user",
+        "plan_ref": "docs/plan/20260716-irccloud-parity/plan.yaml"
+      },
+      {
+        "date": "2026-07-16",
+        "decision": "Collapse connection events by default with one global preference.",
+        "rationale": [
+          "This matches IRCCloud's model and reduces server-log density.",
+          "A global key avoids per-network preference proliferation."
+        ],
+        "decided_by": "user",
+        "plan_ref": "docs/plan/20260716-irccloud-parity/plan.yaml"
+      },
+      {
+        "date": "2026-07-16",
+        "decision": "Implement the live retry countdown.",
+        "rationale": [
+          "Users need visible retry timing and ordinal attempt context.",
+          "A 1s interval is acceptable only with status-change and unmount cleanup."
+        ],
+        "decided_by": "user",
+        "plan_ref": "docs/plan/20260716-irccloud-parity/plan.yaml"
+      },
+      {
+        "date": "2026-07-16",
+        "decision": "Dual-emit disconnectReason and failInfo during migration.",
+        "rationale": [
+          "Existing consumers still read disconnectReason.",
+          "New rendering needs structured reason, SSL, and killed fields."
+        ],
+        "decided_by": "user",
+        "plan_ref": "docs/plan/20260716-irccloud-parity/plan.yaml"
+      },
+      {
+        "date": "2026-07-16",
+        "decision": "Restricted or blocked tier states degrade to the reconnect path in fiber.",
+        "rationale": [
+          "IRC Fiber has no paid-tier upgrade surface.",
+          "Generic disconnected behavior preserves function without inventing an upgrade flow."
+        ],
+        "decided_by": "user",
+        "plan_ref": "docs/plan/20260716-irccloud-parity/plan.yaml"
+      }
+    ],
+    "reuse_notes": [
+      {
+        "path": "docs/plan/20260716-irccloud-parity/plan.yaml",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/components/ConnectionStatus.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "frontend/src/components/ServerLogTimeline.svelte",
+        "trust": "high"
+      },
+      {
+        "path": "source/ircfiber/irc/connection.d",
+        "trust": "high"
+      },
+      {
+        "path": "irccloud-webpack-study/app/src/view/connectionstatusview.js",
+        "trust": "low"
+      },
+      {
+        "path": "irccloud_chat_css_categorized.json",
+        "trust": "low"
+      }
+    ]
+  }
+}

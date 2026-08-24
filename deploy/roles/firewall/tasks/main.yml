@@ -1,0 +1,98 @@
+---
+- name: Set ufw default policies
+  community.general.ufw:
+    state: enabled
+    direction: incoming
+    policy: deny
+
+- name: Allow SSH (rate-limited)
+  community.general.ufw:
+    rule: limit
+    port: "22"
+    proto: tcp
+    src: "{{ firewall_allow_ssh_cidr }}"
+  when: firewall_allow_ssh | bool
+
+- name: Allow HTTP
+  community.general.ufw:
+    rule: allow
+    port: "80"
+    proto: tcp
+  when: firewall_allow_http | bool
+
+- name: Allow HTTPS
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp
+  when: firewall_allow_https | bool
+
+- name: Allow MongoDB from Tailscale subnet
+  community.general.ufw:
+    rule: allow
+    port: "{{ mongo_port }}"
+    proto: tcp
+    src: "{{ firewall_open_tailscale_subnet }}"
+  when: firewall_open_engine_admin | bool or true
+
+- name: Allow MongoDB from local Docker subnet
+  community.general.ufw:
+    rule: allow
+    port: "{{ mongo_port }}"
+    proto: tcp
+    src: "{{ firewall_open_docker_subnet }}"
+  when: firewall_open_mongo_to_docker | bool
+
+- name: Allow Redis from Tailscale subnet
+  community.general.ufw:
+    rule: allow
+    port: "{{ redis_port }}"
+    proto: tcp
+    src: "{{ firewall_open_tailscale_subnet }}"
+
+- name: Allow Redis from local Docker subnet
+  community.general.ufw:
+    rule: allow
+    port: "{{ redis_port }}"
+    proto: tcp
+    src: "{{ firewall_open_docker_subnet }}"
+
+- name: Allow engine admin port from Tailscale (ufw)
+  community.general.ufw:
+    rule: allow
+    port: "{{ ircfiber_engine_admin_port }}"
+    proto: tcp
+    src: "{{ firewall_open_tailscale_subnet }}"
+  when: firewall_open_engine_admin | bool
+
+
+
+- name: Allow IRC (plain) from anywhere
+  community.general.ufw:
+    rule: allow
+    port: "{{ ircd_port_plain }}"
+    proto: tcp
+
+- name: Allow IRC (TLS) from anywhere
+  community.general.ufw:
+    rule: allow
+    port: "{{ ircd_port_tls }}"
+    proto: tcp
+
+- name: Allow additional TCP ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: "{{ firewall_extra_tcp_ports }}"
+
+- name: Allow additional UDP ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: udp
+  loop: "{{ firewall_extra_udp_ports }}"
+
+- name: Reload ufw
+  community.general.ufw:
+    state: reloaded

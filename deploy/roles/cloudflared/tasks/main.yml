@@ -1,0 +1,59 @@
+---
+# Sets up cloudflared (Cloudflare Tunnel) as a Docker container.
+#
+# cloudflared creates an outbound-encrypted tunnel from this host to
+# Cloudflare's edge, so public HTTP/HTTPS traffic reaches the gateway
+# without opening firewall ports. The tunnel forwards to Caddy on the
+# ircfiber Docker network (ircfiber-caddy:80), which already handles
+# security headers, CSP, and proxying to the gateway.
+
+- name: Preflight — tunnel token must be set
+  ansible.builtin.assert:
+    that:
+      - cloudflared_tunnel_token is defined
+      - cloudflared_tunnel_token | length > 0
+    fail_msg: |
+      cloudflared_tunnel_token is empty. Set vault_cloudflared_tunnel_token
+      in inventories/production/group_vars/vault.yml to the tunnel token
+      from Cloudflare Zero Trust dashboard (Networks → Tunnels → your tunnel).
+      Alternatively, pass it at runtime with -e.
+
+- name: Pull cloudflared image
+  community.docker.docker_image:
+    name: "{{ cloudflared_image }}"
+    source: pull
+    state: present
+
+- name: Ensure cloudflared config directory exists
+  ansible.builtin.file:
+    path: /etc/ircfiber/cloudflared
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Run cloudflared tunnel container
+  community.docker.docker_container:
+    name: "{{ cloudflared_container_name }}"
+    image: "{{ cloudflared_image }}"
+    state: started
+    restart_policy: "{{ cloudflared_restart_policy }}"
+    command: >-
+      tunnel
+      {% if cloudflared_no_autoupdate %}--no-autoupdate{% endif %}
+      run
+      --token={{ cloudflared_tunnel_token }}
+    networks:
+      - name: "{{ docker_ircfiber_network }}"
+    networks_cli_compatible: true
+    # cloudflared connects outbound to Cloudflare's edge via TCP/7844
+    # (quic) or TCP/443 (fallback). No inbound host ports needed.
+    # Logs go to docker logs; cloudflared writes its own internal
+    # metrics to localhost:PORT (not exposed outside the container).
+    security_opts:
+      - "no-new-privileges:true"
+    ulimits:
+      - "nofile:65536:65536"
+    labels:
+      com.ircfiber.component: "cloudflared"
+      com.ircfiber.version: "{{ ircfiber_version }}"

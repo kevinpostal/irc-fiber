@@ -1,0 +1,2062 @@
+plan_id: 2026-06-27-irccloud-design-parity
+objective: Ship 34 IRCCloud-parity improvements across 7 staged waves (Wave 0 prep + Wave 1..5 with Wave 4 split into 4a + 4b) to OVH with reviewer + critic gates, tests, docs, and make-update deploys per
+  AGENTS.md. Plan integrated gem-critic APPROVED_WITH_CHANGES (1 BLOCKING + 4 MAJOR + 6 MINOR + 5 pre-mortems).
+created_at: 2026-06-27
+created_by: gem-planner
+status: pending
+complexity: HIGH
+tldr: 7 waves (Wave 0 feature-flag prep, Wave 1 cross-cutting protocol layer, Wave 2 cross-device sync, Wave 3 power-user UX, Wave 4a visual states + dividers, Wave 4b themes + remaining visual, Wave 5
+  resilience) — gate each wave with reviewer (full depth), critic reviews after Wave 0 + Wave 1 + Wave 4a, deploy via `make update` to ircfiber-ovh-1 per AGENTS.md. Wave 1 ships behind feature flags default
+  OFF; Wave 1 deploy is TWO-PHASE (frontend first, wait 10 min for cache, then engine).
+plan_metrics:
+  wave_0_task_count: 4
+  wave_1_task_count: 13
+  wave_2_task_count: 7
+  wave_3_task_count: 10
+  wave_4a_task_count: 13
+  wave_4b_task_count: 8
+  wave_5_task_count: 9
+  total_tasks: 64
+  improvement_items: 34
+  already_matched_items: 2
+  wave_1_dependencies: 0
+  wave_2_dependencies: 3
+  wave_3_dependencies: 9
+  wave_4a_dependencies: 8
+  wave_4b_dependencies: 5
+  wave_5_dependencies: 8
+  total_dependencies: 38
+  risk_score: high
+  pre_mortem_count: 11
+  user_decisions_resolved: 5
+quality_warnings:
+- Wave 0 must complete before Wave 1 — feature-flag plumbing (W0-T01) is a hard prerequisite for ALL Wave 1 protocol changes (prefs.usePrefVersion, heartbeat.enabled, editMessage.enabled, buffersToDelete.enabled,
+  idleEvents.enabled).
+- 'Wave 1 protocol changes (prefVersion, expanded pref_update keys, heartbeat_echo batched-per-network) are wire-format mutations: ship behind feature flags, default OFF for first deploy per spec.'
+- 'R#6 Ignore migration heuristic: upgrade ONLY pure bare-nick patterns (no `!`, `@`, `*`, `?`). Patterns with separators or wildcards preserved as-is in the 3-level map (host=''*'', user=''*'', nick=literal).
+  One-way; audit-log original via console before upgrade.'
+- 'R#5 buffersToDelete: always-on per WS reconnect; client-side guard `(bid NOT in activeJoinList)` before deletion; intersect with archived/pinned/hidden maps.'
+- 'R#10 temp_unavailable: rendered in BufferHeader (per-buffer); engine emits idle:since per NETWORK (one timer per connection); client countdown anchored on serverTs + remaining_ms.'
+- W1-T01 covers BOTH handlePrefUpdate AND mergePreferences for conversationsCollapsed — verified against App.svelte:630-735.
+- Wave 4a/4b theming touches 12 SCSS partials; theme picker default = dark (existing) to avoid regression. W4b-T03 keeps `#app.midnight-theme` as backward-compat selector mapping to same `--chat-bg` overrides.
+- Local Mac ARM64 build forbidden for D binaries (AGENTS.md deploy architecture). All engine deploys go through `make update` BuildKit pipeline.
+- 'CSP reality: existing CSP at deploy/roles/caddy/templates/Caddyfile.j2:61 ALREADY permits style-src ''unsafe-inline'' AND script-src ''unsafe-inline'' ''unsafe-eval''. Wave 4 theming uses CSS variables
+  as a BEST PRACTICE (not because CSP forbids it). Existing script-src ''unsafe-inline'' is a known security concern — track separately for future tightening.'
+open_questions: []
+assumptions:
+- 'AGENTS.md deploy architecture is the source of truth: `make update` (Makefile:1299) builds D binaries in BuildKit on the remote x86_64 server, then runs `playbooks/deploy-update.yml`.'
+- Vitest projects (lib + client) per AGENTS.md testing guide; Wave 4 visual items use Playwright via gem-browser-tester.
+- CSP is at deploy/roles/caddy/templates/Caddyfile.j2:61 — currently permits style-src 'unsafe-inline' and script-src 'unsafe-inline' 'unsafe-eval'. Wave 4 theming uses CSS variables as a BEST PRACTICE
+  (not because CSP forbids inline styles). The existing script-src 'unsafe-inline' is tracked as a separate future security item.
+- Feature flags do NOT exist in GlobalPrefs yet — Wave 0 W0-T01 creates the plumbing (frontend/src/stores/preferences.svelte.ts:7-33). All Wave 1 protocol changes gate on these new flags.
+- Existing IRCFiber patterns (backlog_ready two-phase boot, pref_update additive merge, messageBatcher 200ms flush, LoadingSkeleton, per-buffer inputHistory) are stable — new code conforms.
+- Engine `IRCFIBER_RELOAD_FROM_PID` handoff path (AGENTS.md graceful engine hot-reload) preserves connections during deploy; tests assume handoff is non-disruptive.
+- D#3 + D#14 are a single task (mode prefix glyph + away/match styling) per the user's explicit merged spec.
+- R#20 (/cycle + /quote slash commands) is already implemented at frontend/src/lib/slashCommands.ts:140 and :177.
+- R#21 (inputHistory multiline gating) is already implemented at frontend/src/lib/inputHistory.ts:106-108 + InputArea.svelte:189-202.
+- 'Wave 5 implementation order (highest-risk-first): W5-T05 (lastSpoke persistence, schema_change) → W5-T01 (XHR fallback) → W5-T02 (OnlineChecker) → W5-T03 (Linux escape, reuse existing escapeHtml) → W5-T04
+  (already matched verification).'
+- 'Wave 1 reorder rationale: T07 (safeChanSuffix) before T05 (buffersToDelete) so W3-T01 channel switcher has getDisplayName() helper available without re-import dance.'
+- Wave 4b-T03 keeps `#app.midnight-theme` selector as backward-compat mapping to the same `--chat-bg` overrides; new themes use `body.theme-*` (matches IRCCloud convention).
+pre_mortem:
+  overall_risk_level: high
+  critical_failure_modes:
+  - scenario: Wave 1 wire-format changes break existing pre-update clients (old SPA talking to new engine or vice versa)
+    likelihood: medium
+    impact: critical
+    mitigation: Gate all Wave 1 wire changes behind feature flags; default OFF for first wave deploy. Old clients continue to function when flags are off. See PM7 for two-phase deploy ordering.
+  - scenario: R#6 Ignore migration silently breaks user's existing ignore list (e.g. nick 'evil*' was regex wildcard, now becomes literal in IRCCloud 3-level map and matches nothing)
+    likelihood: high
+    impact: high
+    mitigation: 'Heuristic: upgrade ONLY pure bare-nick patterns (NOT contains(''!'') AND NOT contains(''@'') AND NOT contains(''*'') AND NOT contains(''?'')). Patterns with any separator OR wildcard are
+      preserved as-is in the IRCCloud 3-level map (host=''*'', user=''*'', nick=pattern literal). Console-log the original pattern before any transformation for audit.'
+  - scenario: R#5 buffersToDelete deletes user-rejoined channels on reconnection (wire race)
+    likelihood: medium
+    impact: high
+    mitigation: 'Client-side guard: `(bid NOT in activeJoinList)` before calling deleteBuffer; intersect with archivedMap + pinnedMap + hiddenChannelsMap. Existing hideChannel at ircStore.svelte.ts:301
+      protects user-deleted; extend same guard.'
+  - scenario: W1-T01 pref_update expansion only fixes half the gap (handlePrefUpdate but not mergePreferences) — conversationsCollapsed silently resets on stat_user boot
+    likelihood: high
+    impact: high
+    mitigation: W1-T01 MUST add `conversationsCollapsed` case to BOTH handlePrefUpdate (App.svelte:737-837) AND mergePreferences (App.svelte:630-735), mirroring the inactiveCollapsed pattern. Acceptance
+      criteria explicitly cover both paths.
+  - scenario: Wave 4 theme picker regresses default dark theme on browsers without CSS-variable support
+    likelihood: low
+    impact: medium
+    mitigation: All IRC Fiber targets (Chrome 90+, Safari 14+, Firefox 90+) support CSS custom properties. Verify via existing `_midnight.scss` precedence in test. Browser-test against default dark before
+      toggling.
+  - scenario: Wave 5 WS→XHR fallback sends duplicate events when WS reconnects mid-stream
+    likelihood: medium
+    impact: medium
+    mitigation: 'Reuse existing `maxEidTracker` (wsConnection.svelte.ts:13-17) for eid-based dedup. Explicit ''WS primary, XHR shadow'' lifecycle: WS on → XHR off; WS off → XHR on. See PM8 for XHR lifecycle
+      race.'
+  - scenario: Pref-update fan-out floods Redis pub/sub on rapid collapse toggles (member panel slide)
+    likelihood: medium
+    impact: low
+    mitigation: Existing additive-only merge at App.svelte:737-837 already handles bursts. Apply 250ms debounce on the broadcast side in rest.d (mirroring the localStorage 500ms debounce in preferences.svelte.ts:181-194).
+  - scenario: PM7 — Wave 1 deploy order races with frontend refresh (engine-before-frontend)
+    likelihood: high
+    impact: medium
+    mitigation: 'Two-phase deploy for Wave 1: frontend FIRST via `make update-assets`, wait 10 minutes for clients to refresh, THEN engine via `make handoff`. Specified in W1-DEPLOY coordination_notes.'
+  - scenario: PM8 — Wave 5 XHR fallback double-applies events on WS reconnect race
+    likelihood: medium
+    impact: medium
+    mitigation: 'Explicit ''WS primary, XHR shadow'' lifecycle: WS on → XHR off (close XHR); WS off → XHR on. Add `xhrStreamHandler.close()` call to WS reconnection success path BEFORE the WS handshake
+      completes. W5-T01 acceptance criterion enforces this.'
+  - scenario: PM9 — Wave 4 theme picker drops default dark theme on cache-bust for existing midnight users
+    likelihood: low
+    impact: high
+    mitigation: 'W4b-T03 keeps `#app.midnight-theme` as backward-compat selector mapping to the same `--chat-bg` overrides. W4a-T13 visual regression test with saved `theme: ''midnight''` localStorage value
+      verifies.'
+  - scenario: PM10 — Wave 3 archive-names endpoint server RAM cost (500+ archives = ~50KB JSON per Cmd+K open)
+    likelihood: medium
+    impact: medium
+    mitigation: '5-minute in-memory TTL on client cache; re-fetch on cache age > TTL. Documented in W3-T01 acceptance criteria. Server-side: bulk query against Mongo with Redis cache invalidated on PART
+      events.'
+  - scenario: PM11 — Wave 5 lastSpoke persistence creates Mongo hot-write path
+    likelihood: high
+    impact: low-to-medium
+    mitigation: Debounce persist to 30s per (networkId, nick); skip if lastSpoke delta < 60s. Redis hash `member-activity:<networkId>:<nick>` with 30s debounce per key + skip no-op writes. This is a `schema_change`
+      — flagged as high_risk_signal.
+coordination_notes:
+- Each wave's reviewer gate (W*-REV) blocks deploy. Deploy task (`make update` / `make update-assets`) only starts after reviewer returns `approved`.
+- Critic reviews (W0-CRIT-as-needed, W1-CRIT, W4a-CRIT) run AFTER wave items complete but BEFORE reviewer. Critic is read-only; produces verdict + open issues for the reviewer.
+- Engine changes must build on the BuildKit pipeline — no local `dub build` then `scp` per AGENTS.md. Verifier checks `engine` artifact size delta before/after.
+- Frontend dist rebuilt with `npm run build` before `make update`; vite output to `public/dist/`. Frontend-only deploys use `make update-assets` (Makefile:1325) to skip D rebuild.
+- 'Test pattern: lib tests in `frontend/src/lib/**/*.test.ts` use vitest directly (Node); client tests in `frontend/src/**/*.test.ts` and `*.svelte.test.ts` run in headless Chromium. NO `__tests__/` directory
+  (AGENTS.md).'
+- Wave 4 visual regression uses existing `capture_comparison.js` script (project root) + Playwright snapshots per AGENTS.md Testing Guide.
+- docs/CHANGELOG.md entries ship with each wave; protocol-change notes go in docs/HEARTBEAT.md, docs/IGNORE_MIGRATION.md, docs/PREF_VERSION.md, docs/ARCHIVE_NAMES.md.
+- 'W1-DEPLOY is TWO-PHASE: (1) `make update-assets` first to push frontend with new WS handlers; (2) wait ≥10 minutes for browser cache + load balancer refresh; (3) `make handoff` to deploy engine. Closes
+  PM7 race.'
+- 'Wave 5 implementation order (highest-risk-first): W5-T05 → W5-T01 → W5-T02 → W5-T03 → W5-T04. Implementer may execute in this order regardless of task ID sequence.'
+- 'Wave 4b-T03 must keep `#app.midnight-theme` selector active alongside new `body.theme-*` family for backward compatibility with users whose localStorage holds `theme: ''midnight''`.'
+contracts:
+- from_task: W0-T01
+  to_task: W1-T02, W1-T03, W1-T04, W1-T06, W1-T08
+  interface: 'GlobalPrefs.featureFlags.{usePrefVersion, heartbeat, editMessage, buffersToDelete, idleEvents} : boolean (default false)'
+  format: Extends GlobalPrefs in frontend/src/stores/preferences.svelte.ts:7-33; DEFAULT_PREFS at :35-... initialized to false. UI toggle in SettingsAdvanced.svelte; admin API via /api/admin/prefs/:uid.
+    Persisted to localStorage + server pref blob.
+- from_task: W1-T01
+  to_task: W2-T02
+  interface: pref_update key `conversationsCollapsed` value is Record<string, boolean>; ALSO seeded by mergePreferences on stat_user boot
+  format: Mirrors existing inactiveCollapsed/membersCollapsed envelope at App.svelte:801-808 (handlePrefUpdate) AND App.svelte:690-699 (mergePreferences)
+- from_task: W1-T02
+  to_task: W2-T03
+  interface: 'UserPreferences.prefVersion : long (incremented on every write; persisted alongside pref blob)'
+  format: D `long` in JSON; TS `number`; used for last-write-wins resolution. Atomic increment+save via Redis MULTI/EXEC (NOT fetch-then-write). Documented that prefVersion resolves engine-vs-client but
+    NOT tab-vs-tab (handled by localStorage events).
+- from_task: W1-T03
+  to_task: W2-T01
+  interface: 'WS message envelope: { type: ''heartbeat_echo'', cid: networkId, bid: string[], ts: number_ms }'
+  format: JSON object; bid is ARRAY of buffer names for ONE network per 30s frame (NOT one frame per buffer). Engine batches per network to keep frame count ~N-networks per 30s regardless of buffer count.
+- from_task: W1-T05
+  to_task: W1-T06, W3-T01
+  interface: getDisplayName(bufName, isupport) → string (strips safeChanPrefix)
+  format: Pure function in frontend/src/lib/utils.ts; null-safe (returns input unchanged if no prefix configured). Used by W3-T01 ChannelSwitcher for archive disambiguation.
+- from_task: W1-T06
+  to_task: W3-T01
+  interface: 'WS message envelope: { type: ''buffersToDelete'', bid: string[] } (buffer IDs to drop on resync)'
+  format: 'Mirrors IRCCloud''s `buffers_to_delete` envelope; bid = `${networkId}:${bufferName}`. Client guard: `(bid NOT in activeJoinList)` AND intersect with archived/pinned/hidden maps before deletion.'
+- from_task: W1-T08
+  to_task: W3-T01, W3-T03
+  interface: Engine events `temp_unavailable` (with countdown_ms + serverTs) and `idle` (per-network idle_since)
+  format: Extends IRCRawEvent in source/ircfiber/models/irc_event.d; parsed via parser.d:26. Per NETWORK idle timer (one timer per connection). Client countdown anchored on `serverTs + remaining_ms` not
+    `Date.now() + countdown_ms` to avoid drift.
+- from_task: W3-T01a
+  to_task: W3-T01
+  interface: 'REST GET /api/buffers/archive-names → { networkId: string[] } (archived buffer names for ALL user''s networks in one bulk payload)'
+  format: JSON object keyed by networkId; bulk Mongo query; Redis cache with TTL invalidation on PART. <100ms for users with up to 500 archives. NOT per-network endpoint.
+- from_task: W3-T01
+  to_task: ChannelSwitcher.svelte consumers
+  interface: '<ChannelSwitcher scope: ''all'' | ''active'' /> (default ''all'')'
+  format: Svelte 5 component prop; 'all' = cross-network with serverName disambiguation badge; 'active' = active-network-only (future refactor path). IRCCloud parity is 'all'.
+tasks:
+- id: W0-T01
+  title: Feature flag scaffolding in GlobalPrefs (WAVE 0 prep)
+  description: 'Add feature-flag plumbing to GlobalPrefs in frontend/src/stores/preferences.svelte.ts:7-33 + DEFAULT_PREFS at :35+. Flags: `usePrefVersion: boolean = false`, `heartbeat.enabled: boolean
+    = false`, `editMessage.enabled: boolean = false`, `buffersToDelete.enabled: boolean = false`, `idleEvents.enabled: boolean = false`. Add UI toggles in SettingsAdvanced.svelte (or admin API). m1 critic
+    fix: ZERO existing flag infrastructure — this task creates it.'
+  wave: 0
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/stores/preferences.svelte.ts:7-33 (GlobalPrefs) + frontend/src/stores/preferences.svelte.ts:35-... (DEFAULT_PREFS) + frontend/src/components/SettingsAdvanced.svelte (or admin
+      API)
+    irccloud: N/A — internal IRC Fiber scaffolding
+  outputs:
+    modify:
+    - frontend/src/stores/preferences.svelte.ts (add featureFlags namespace to GlobalPrefs with 5 boolean flags; update DEFAULT_PREFS to false for all)
+    - frontend/src/components/SettingsAdvanced.svelte (add toggles for each flag with descriptive labels)
+    - frontend/src/stores/preferences.svelte.ts (add `featureFlags` interface + serialization)
+    create:
+    - frontend/src/stores/preferences.svelte.test.ts (extend DEFAULT_PREFS tests to cover flag initial values)
+  acceptance_criteria:
+  - 'GlobalPrefs.featureFlags.{usePrefVersion, heartbeat, editMessage, buffersToDelete, idleEvents} : boolean all default false'
+  - Toggling updates localStorage AND server pref blob (via existing broadcastPrefUpdate)
+  - Flags readable via `globalPrefs.featureFlags.X` in any component
+  - SettingsAdvanced.svelte shows toggles with labels matching their Wave 1 task IDs
+  - DEFAULT_PREFS test confirms all flags initial to false
+  - All 5 flags persist across reload via localStorage + server pref blob
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'm1 critic fix: explicit Wave 0 prep task. All Wave 1 protocol changes (W1-T02, W1-T03, W1-T04, W1-T06, W1-T08) gate behind these flags. NO new flag infrastructure exists today — this task creates
+    it.'
+- id: W0-T02
+  title: W0-REV reviewer gate (full depth)
+  description: 'Reviewer audits feature-flag plumbing: GlobalPrefs type surface, DEFAULT_PREFS correctness, SettingsAdvanced toggle UX, persistence (localStorage + server), no regression to existing prefs.'
+  wave: 0
+  agent: gem-reviewer
+  status: pending
+  dependencies:
+  - W0-T01
+  conflicts_with: []
+  inputs:
+    ircfiber: All W0 implementation diffs
+    irccloud: N/A
+  outputs:
+    produce:
+    - review-verdict-w0.md
+  acceptance_criteria:
+  - All 5 flags default OFF (verified in DEFAULT_PREFS test)
+  - Toggle persists across reload (localStorage roundtrip)
+  - No regression to existing GlobalPrefs surface (other prefs still load)
+  - SettingsAdvanced.svelte renders new toggles correctly
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: BLOCKS W0-DEPLOY.
+- id: W0-T03
+  title: W0-DEPLOY make update-assets to ircfiber-ovh-1
+  description: Push frontend dist with feature-flag plumbing; no engine changes. Frontend-only deploy.
+  wave: 0
+  agent: gem-devops
+  status: blocked
+  dependencies:
+  - W0-T02
+  conflicts_with: []
+  inputs:
+    ircfiber: Makefile:1325 (`update-assets`)
+    irccloud: N/A
+  outputs:
+    execute:
+    - '`make update-assets`'
+  acceptance_criteria:
+  - OVH gateway serves Wave 0 frontend with feature flags
+  - SettingsAdvanced.svelte shows 5 toggles
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  devops_security_sensitive: false
+  environment: production
+  requires_approval: true
+  approval_state: approved
+  approval_reason: "Dirty working tree: 48 modified + 35 untracked files from prior agent sessions. public/dist/ built from dirty tree bundles uncommitted WIP into main-oRvNXe1r.js. Deploying as-is would push uncommitted WIP (App.svelte/ChatArea/MessageList/etc. refactors, ServerLogCard.svelte new component WIP) to ircfiber.com. Committed d47c00b is clean; only the dist build is contaminated."
+  approved_strategy: "A) STASH WIP + rebuild dist + deploy + pop stash"
+  user_decision_required:
+    - "A) STASH WIP + rebuild + deploy + pop stash (recommended; lowest risk, WIP preserved in stash reflog)"
+    - "B) COMMIT WIP first (separate branch), then deploy from clean main"
+    - "C) DEPLOY DIRTY DIST as-is (UNSAFE; requires explicit override)"
+    - "D) ABORT W0-T03, address WIP in separate task"
+  notes: "Frontend-only deploy (no engine changes). MUST complete before Wave 1 begins. Blocked on user decision re: dirty working tree."
+- id: W0-T04
+  title: W0-DOCS CHANGELOG + feature-flag rollout guide
+  description: CHANGELOG entry for Wave 0; feature-flag rollout guide for admins (which flag gates what; how to enable for testing).
+  wave: 0
+  agent: gem-documentation-writer
+  status: pending
+  dependencies:
+  - W0-T02
+  conflicts_with: []
+  inputs:
+    ircfiber: All W0 implementation diffs
+    irccloud: N/A
+  outputs:
+    modify:
+    - docs/CHANGELOG.md (Wave 0 section appended)
+    create:
+    - 'docs/FEATURE_FLAGS.md (rollout guide: which flag controls what Wave 1 item; how to enable/disable per user)'
+  acceptance_criteria:
+  - FEATURE_FLAGS.md documents each flag, the task it gates, default state, rollout strategy
+  - CHANGELOG entry for Wave 0 lists all 5 flags
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Docs ship with the wave. FEATURE_FLAGS.md is the operator-facing rollout reference.
+- id: W1-T01
+  title: R#19 pref_update expansion — add conversationsCollapsed handler (BOTH paths)
+  description: 'Add missing `conversationsCollapsed` case to BOTH handlePrefUpdate (App.svelte:737-837) AND mergePreferences (App.svelte:630-735) in App.svelte. Other 5 keys (pinned/archived/collapsed/inactiveCollapsed/serverlogCollapsed/membersCollapsed)
+    are already handled in both paths. M2-fix: handlePrefUpdate alone is insufficient because stat_user boot seeds from mergePreferences — without it, conversationsCollapsedMap silently resets on first
+    load.'
+  wave: 1
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/App.svelte:737-837 (handlePrefUpdate) + frontend/src/App.svelte:630-735 (mergePreferences) + frontend/src/stores/preferences.svelte.ts:111 (conversationsCollapsedMap)
+    irccloud: N/A — pattern is internal to IRC Fiber (cross-tab sync via storage event)
+  outputs:
+    modify:
+    - frontend/src/App.svelte (add `else if (key === 'conversationsCollapsed')` block in handlePrefUpdate BEFORE line 837)
+    - frontend/src/App.svelte (add `else if (key === 'conversationsCollapsed')` block in mergePreferences mirroring inactiveCollapsed pattern at App.svelte:690-699)
+  acceptance_criteria:
+  - App.svelte handlePrefUpdate handles `conversationsCollapsed` key with same additive-only pattern as `inactiveCollapsed` (App.svelte:801-808)
+  - App.svelte mergePreferences handles `conversationsCollapsed` key mirroring the `inactiveCollapsed` pattern at App.svelte:690-699
+  - conversationsCollapsedMap updated when pref_update fires (cross-tab path)
+  - conversationsCollapsedMap seeded from server stat_user payload on first boot (mergePreferences path)
+  - 'Test in frontend/src/App.test.ts: BOTH cases — (a) simulate WS `pref_update` with key=conversationsCollapsed → conversationsCollapsedMap updated; (b) simulate stat_user payload with conversationsCollapsed
+    → conversationsCollapsedMap seeded'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'M2 critic fix: BOTH paths required. Without mergePreferences path, conversationsCollapsedMap resets on every stat_user boot. Implementer must verify both cases pass before marking task complete.'
+- id: W1-T02
+  title: R#11 prefVersion schema (engine + frontend merge resolution)
+  description: Add prefVersion counter to UserPreferences D struct; increment on every prefsRepo.save via Redis MULTI/EXEC (atomic increment+save in single transaction); include in stat_user payload; frontend
+    mergePreferences uses prefVersion as last-write-wins tiebreaker. Document that prefVersion resolves engine-vs-client but NOT tab-vs-tab (tab-vs-tab handled by localStorage events already).
+  wave: 1
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W0-T01
+  conflicts_with: []
+  inputs:
+    ircfiber: source/ircfiber/db/preferences.d:9-128 (UserPreferences); frontend/src/App.svelte:568-575 (handleStatUser) + 630-735 (mergePreferences)
+    irccloud: Pattern inferred from IRCCloud's stat_user merge — IRCCloud uses `prefs_version` field that increments per save
+  outputs:
+    modify:
+    - source/ircfiber/db/preferences.d (add long prefVersion field; serialize/deserialize)
+    - source/ircfiber/db/preferences.d (prefsRepo.save uses Redis MULTI/EXEC for atomic increment+set JSON)
+    - source/ircfiber/api/rest.d (broadcastPrefUpdate increments prefVersion atomically)
+    - frontend/src/App.svelte (handleStatUser reads obj.prefVersion; mergePreferences compares local vs server)
+  acceptance_criteria:
+  - D struct UserPreferences has `long prefVersion` field
+  - prefsRepo.save() uses Redis MULTI/EXEC for atomic increment+JSON-set (single transaction, no fetch-then-write race)
+  - Every prefsRepo.save() increments prefVersion by 1 inside the MULTI
+  - stat_user payload includes prefVersion; mergePreferences chooses highest version as source of truth
+  - Documentation in docs/PREF_VERSION.md explicitly states prefVersion resolves engine-vs-client but NOT tab-vs-tab
+  - 'Unit test in source/ircfiber/db/preferences.d-test: load/save roundtrip preserves prefVersion; concurrent saves produce strictly monotonic prefVersion'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Wire-format change — gate via feature flag `prefs.usePrefVersion` (created in W0-T01; default false for Wave 1 deploy, on in Wave 2). Q2 user decision: inlined JSON field, atomic MULTI/EXEC.'
+- id: W1-T03
+  title: R#4 heartbeat_echo wire (BATCHED per network) + frontend heartbeat client
+  description: Engine emits heartbeat_echo messages BATCHED PER NETWORK (one frame per 30s per network with bid[] array, NOT one frame per buffer). New top-level WS type `{type:'heartbeat_echo', cid, bid,
+    ts}` — does NOT overload irc_event. Frontend wsConnection subscribes and updates lastSeenMap.
+  wave: 1
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W0-T01
+  conflicts_with: []
+  inputs:
+    ircfiber: source/ircfiber/engine/processor.d (event emit point) + frontend/src/stores/wsConnection.svelte.ts:75-90 (handleResponse) + App.svelte:558-562 (WS dispatch)
+    irccloud: 'Pattern: `oob-include` heartbeat with lastSeen per buffer (IRCCloud''s `heartbeat_echo` stream message); batched per network'
+  outputs:
+    modify:
+    - source/ircfiber/engine/processor.d (add 30s heartbeat timer publishing heartbeat_echo events BATCHED PER NETWORK to user channels — one frame per network per 30s with bid[] array)
+    - frontend/src/stores/wsConnection.svelte.ts (route type=heartbeat_echo to handleHeartbeat)
+    - frontend/src/App.svelte:560 (add `else if (obj.type === 'heartbeat_echo')` case)
+    - frontend/src/stores/preferences.svelte.ts:119 (lastSeenMap already exists; add heartbeat setter hook)
+  acceptance_criteria:
+  - Engine publishes `{type:'heartbeat_echo', cid, bid:[...], ts}` to Redis channel every 30s PER NETWORK (batched), NOT per buffer — keeps frame count ~N-networks per 30s regardless of buffer count
+  - bid array contains all active buffer names for that network with their last-seen timestamps
+  - Frontend handleHeartbeat merges batched payload into lastSeenMap (no flicker — debounced)
+  - 'Unit test: simulate WS heartbeat_echo with bid[] array → lastSeenMap updated for all bid entries atomically'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Wire-format change — gate via `heartbeat.enabled` feature flag (created in W0-T01; default false Wave 1, on Wave 2). Q1 user decision: new top-level WS type (NOT overload irc_event); batched per
+    network with bid[] array.'
+- id: W1-T04
+  title: R#2 edit-message IRCv3 binding (engine + frontend Ctrl/Cmd+Up label echo)
+  description: 'Implement IRCv3 draft/edit-message capability: frontend Ctrl/Cmd+Up in InputArea triggers edit of last sent message; engine handles EditMsgOut and emits label echo.'
+  wave: 1
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W0-T01
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/InputArea.svelte:176-220 (handleKeyDown) + frontend/src/lib/inputHistory.ts:55-91 (history navigation) + source/ircfiber/irc/connection.d (outbound command sender)
+    irccloud: 'Pattern: IRCv3 edit-message (https://ircv3.net/specs/extensions/edit-message); IRCCloud binds it to last sent message via label'
+  outputs:
+    modify:
+    - frontend/src/components/InputArea.svelte (add Ctrl/Cmd+Up binding after ArrowUp handler; if inputValue empty AND last sent has label, load edit mode)
+    - source/ircfiber/irc/connection.d (add EditMsgOut send path)
+    - frontend/src/stores/ircStore.svelte.ts (track last sent label per buffer for edit target)
+  acceptance_criteria:
+  - Ctrl/Cmd+Up when input is empty and a sent message exists → load that message into input as edit (visually distinct, e.g. prefix '[edit] ')
+  - Sending the edit invokes EditMsgOut IRCv3 command with original label
+  - Engine label echo on receipt merges edit into the original message (no new optimistic row)
+  - 'Test in frontend/src/components/InputArea.test.ts: Ctrl+Up with empty input + last sent → input value = edit-prefixed message'
+  - Gated behind `editMessage.enabled` feature flag (W0-T01); default OFF Wave 1
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Capability negotiation via existing CAP extension list — check server advertises draft/edit-message before sending.
+- id: W1-T05
+  title: R#13 safeChanSuffix IDCHAN parser (`getDisplayName(buf, isupport)`)
+  description: Parse IRCv3 CHANMODES ISUPPORT idchan suffix (e.g. `%#channel` for safe channel refs); expose getDisplayName helper for UI use. Moved EARLIER in Wave 1 so W3-T01 ChannelSwitcher has the helper
+    available without re-import dance.
+  wave: 1
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: source/ircfiber/irc/parser.d:26-117 (parseIRCLinePublic) + ircStore.svelte.ts:1055 (net.isupport)
+    irccloud: IRCCloud's CHANMODES D (safeChanPrefix) handling in common.js
+  outputs:
+    modify:
+    - source/ircfiber/irc/parser.d (parse ISUPPORT tokens; populate network.isupport.chanmodes)
+    - frontend/src/lib/utils.ts (add getDisplayName(bufName, isupport) that strips safeChanPrefix)
+    - frontend/src/lib/utils.test.ts (test getDisplayName with/without safeChanPrefix)
+  acceptance_criteria:
+  - ISUPPORT `CHANMODES=D,mov` + buffer `%#secret` → displayName returns `#secret`
+  - getDisplayName is null-safe (returns input unchanged if no prefix configured)
+  - Unit test in frontend/src/lib/utils.test.ts covering prefix present/absent/invalid
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Was W1-T07 in original plan; moved EARLIER so W3-T01 ChannelSwitcher can import getDisplayName cleanly. Low-impact but correctness-required for safe-chan-aware networks (e.g. freenode's `%#`, OFTC's
+    similar).
+- id: W1-T06
+  title: R#5 buffersToDelete wire + frontend ghost-channel prune (`resumed` flag)
+  description: Engine emits `buffersToDelete` ALWAYS-ON per WS reconnect (not per IRC reconnect) with bid[] list of ghost channels to drop. Frontend prunes ghosts intersected with activeJoinList (Q3 user
+    decision) AND archived/pinned/hidden maps.
+  wave: 1
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W0-T01
+  conflicts_with: []
+  inputs:
+    ircfiber: source/ircfiber/irc/manager.d (network state) + frontend/src/stores/ircStore.svelte.ts:285-305 (deleteBuffer + hideChannel)
+    irccloud: IRCCloud's `buffers_to_delete` message envelope on reconnect
+  outputs:
+    modify:
+    - source/ircfiber/irc/manager.d (on WS resume, emit `buffersToDelete` with bid[] for channels that no longer exist server-side)
+    - 'frontend/src/stores/ircStore.svelte.ts (handleBuffersToDelete: client-side guard `(bid NOT in activeJoinList)` AND intersect with archived/pinned/hidden maps before deleteBuffer)'
+    - frontend/src/App.svelte:558-562 (route type=buffersToDelete)
+  acceptance_criteria:
+  - Engine emits buffersToDelete ONCE per WS reconnect (NOT per IRC reconnect) with bid[]
+  - 'Client-side guard: `(bid NOT in activeJoinList)` before deleteBuffer (Q3 fix — protects user re-joins between engine snapshot and client receipt)'
+  - Frontend prune skips any bid that's pinned or in archived/hidden maps (preserves user intent)
+  - '`resumed` flag added to existing restart logic at connection.d:772/919 — engine signals successful resume vs full reconnect'
+  - 'Integration test: simulate WS buffersToDelete with mixed bid list → only non-pinned/non-archived/not-active bids are removed'
+  - Gated behind `buffersToDelete.enabled` feature flag (W0-T01); default OFF Wave 1
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Q3 user decision: always-on per WS reconnect. Existing hideChannel at ircStore.svelte.ts:301 already persists deletions; the new wire path is the engine-initiated counterpart. activeJoinList guard
+    prevents deleting fresh user re-joins.'
+- id: W1-T07
+  title: R#6 Ignore.check 3-level map (port irccloud-webpack-study/app/src/ignore.js)
+  description: 'Replace simple nick-only regex (preferences.svelte.ts:274-283) with 3-level map (nick→user@*→*!user@host→*!*@host) per IRCCloud''s ignore.js. C1-fix: migration heuristic is `NOT (pattern.includes(''!'')
+    || pattern.includes(''@'')) AND NOT (pattern.includes(''*'') || pattern.includes(''?''))` — only PURE bare-nick patterns (no separators, no wildcards) are upgraded to `*!*@*`. Patterns with any separator
+    OR wildcard are preserved as-is in the 3-level map (host=''*'', user=''*'', nick=pattern literal). Console-log original pattern before any transformation.'
+  wave: 1
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/stores/preferences.svelte.ts:274-283 (isIgnored) + frontend/src/lib/slashCommands.ts:65-81 (/ignore /unignore)
+    irccloud: 'irccloud-webpack-study/app/src/ignore.js:1-160 (full port: parse + check + checkWildcard)'
+  outputs:
+    modify:
+    - frontend/src/lib/ignore.ts (new file — port of ignore.js with TS types)
+    - frontend/src/stores/preferences.svelte.ts (replace isIgnored with 3-level lookup via ignore.ts)
+    - frontend/src/lib/slashCommands.ts (parse user input through ignore.parse before push)
+    - frontend/src/lib/ignore.test.ts (new file — port tests for parse + check + migration heuristic)
+    create:
+    - docs/IGNORE_MIGRATION.md (one-way nick → 3-level map upgrade; describes safe vs unsafe patterns; rollback procedure)
+  acceptance_criteria:
+  - ignore.parse(`alice!*@*`) creates 3-level entry; ignore.check matches nick='alice' host='anywhere'
+  - ignore.check matches wildcards (`*!*@evil.host` matches any nick from evil.host)
+  - 'Migration heuristic: pure bare-nick (no `!`, `@`, `*`, `?`) → upgrade to `*!*@*`'
+  - 'Migration heuristic: pattern with `!` or `@` → preserve as-is in 3-level map (host=''*'', user=''*'', nick=pattern literal)'
+  - 'Migration heuristic: pattern with `*` or `?` but no separator → preserve as-is in 3-level map (host=''*'', user=''*'', nick=pattern literal) — C1 fix prevents `evil*` from flipping to literal'
+  - Console.log original pattern BEFORE any transformation (audit trail)
+  - 'Test coverage for: nick-only, nick!user, *!user, full mask, * wildcards, mixed bare-nick-with-wildcard, mixed bare-nick-with-separator'
+  - 'docs/IGNORE_MIGRATION.md exists and covers: schema change, what changes, why pure bare-nick is safe to upgrade, what patterns are preserved, how to rollback via prefs'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'C1 critic fix: heuristic must check BOTH separators AND wildcards. The existing isIgnored treats `evil*` as regex wildcard; after migration the 3-level map would treat it as literal nick ''evil*''
+    (matches nothing). Without the fix, user spam protection silently breaks. Audit log original pattern via console before any upgrade.'
+- id: W1-T08
+  title: R#10 temp_unavailable + idle server signals (engine emit + BufferHeader countdown)
+  description: 'Engine parses IRC server signals (RPL_TRYAGAIN/temp_unavailable, AWAY idle, IRCv3 away-watcher idle) and emits synthetic IRCRawEvents. Q4 user decision: countdown rendered in BUFFERHEADER
+    (per-buffer) NOT MessageList. Engine emits `idle:since` per NETWORK (one timer per connection), not per channel. Client countdown anchored on `serverTs + remaining_ms` not `Date.now() + countdown_ms`
+    to avoid clock drift.'
+  wave: 1
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W0-T01
+  conflicts_with: []
+  inputs:
+    ircfiber: source/ircfiber/irc/parser.d:26-117 + connection.d (event emit) + frontend/src/components/BufferHeader.svelte (existing per-buffer status pill)
+    irccloud: 'Pattern: IRCCloud''s temp_unavailable UI as a small banner at top of chat (semantically equivalent to BufferHeader); IRCv3 away-watcher idle events'
+  outputs:
+    modify:
+    - source/ircfiber/irc/parser.d (add 'temp_unavailable' command recognition + idle_since tag handling)
+    - source/ircfiber/irc/connection.d (emit IRCRawEvent with command='temp_unavailable', countdown_ms, serverTs on RPL_TRYAGAIN numeric 263)
+    - source/ircfiber/irc/connection.d (one idle timer per NETWORK connection; emits idle_since_ms)
+    - frontend/src/components/BufferHeader.svelte (render countdown chip when activeBuffer has temp_unavailable state; countdown anchored on serverTs+remaining_ms)
+    - frontend/src/stores/ircStore.svelte.ts (track temp_unavailable state per buffer; awayNicks Set per network)
+  acceptance_criteria:
+  - Engine emits IRCRawEvent{command:'temp_unavailable', countdown_ms, serverTs} on RPL_TRYAGAIN (numeric 263)
+  - Engine emits idle event PER NETWORK (one timer per connection, NOT per channel); idle per-NICK is separate (Member list dim only)
+  - Frontend renders 'Server busy — retry in {n}s' chip in BufferHeader (NOT MessageList) when active buffer has temp_unavailable
+  - Client countdown computation uses `serverTs + remaining_ms`, NOT `Date.now() + countdown_ms` (avoids clock drift)
+  - idle event updates awayNicks Set on the network; idle users dim in MemberList
+  - 'Test in frontend/src/components/BufferHeader.test.ts: simulate temp_unavailable event with serverTs → countdown chip renders in BufferHeader, NOT MessageList'
+  - Gated behind `idleEvents.enabled` feature flag (W0-T01); default OFF Wave 1
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Q4 user decision: render in BufferHeader (per-buffer), not MessageList. Engine emits idle:since per NETWORK. Two different idle signals: per-NETWORK (BufferHeader countdown) vs per-NICK (Member
+    list dim).'
+- id: W1-T09
+  title: W1-REV reviewer gate (full depth)
+  description: 'Reviewer audits all W1-T01..T08 tasks: protocol correctness, wire-format compatibility, feature-flag gating, test coverage, doc consistency.'
+  wave: 1
+  agent: gem-reviewer
+  status: pending
+  dependencies:
+  - W1-T01
+  - W1-T02
+  - W1-T03
+  - W1-T04
+  - W1-T05
+  - W1-T06
+  - W1-T07
+  - W1-T08
+  conflicts_with: []
+  inputs:
+    ircfiber: All W1 implementation diffs; AGENTS.md testing guide; source/ircfiber/api/rest.d for broadcastPrefUpdate pattern
+    irccloud: irccloud-webpack-study/ignore.js for R#6 parity
+  outputs:
+    produce:
+    - review verdict (approved | changes_requested) with per-task comment
+  acceptance_criteria:
+  - 'Reviewer gates: wire-format compatibility (old clients still work), feature flags default OFF, test coverage ≥ 80%, no CSP regressions'
+  - 'Output: review-verdict.md (per-wave report)'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: BLOCKS W1-DEPLOY. If changes_requested, implementer iterates then re-reviews.
+- id: W1-T10
+  title: W1-CRIT critic review (architectural risk audit)
+  description: 'Critic reviews W1 plan + impl for architectural risks: contract_change, breaking_change, schema_change, migration, cross_domain_impact. Produces a risk register and ships to reviewer.'
+  wave: 1
+  agent: gem-critic
+  status: pending
+  dependencies:
+  - W1-T09
+  conflicts_with: []
+  inputs:
+    ircfiber: All W1 implementation diffs + spec
+    irccloud: 'Cross-reference: irccloud-webpack-study/ for parity depth'
+  outputs:
+    produce:
+    - 'W1-risk-register.md (structured: scenario | likelihood | impact | mitigation)'
+  acceptance_criteria:
+  - Identifies ≥3 specific risks per task with mitigation
+  - 'Verdict: proceed_with_mitigations | revise | escalate'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: HIGH-complexity gates (contract change, schema migration, breaking change).
+- id: W1-T11
+  title: W1-DEPLOY make update to ircfiber-ovh-1
+  description: Build D binaries in BuildKit on remote + push frontend dist; trigger engine hot-reload (graceful handoff per AGENTS.md).
+  wave: 1
+  agent: gem-devops
+  status: pending
+  dependencies:
+  - W1-T10
+  conflicts_with: []
+  inputs:
+    ircfiber: Makefile:1299 (`update` target) + Makefile:1351 (`handoff` for engine-only)
+    irccloud: N/A
+  outputs:
+    execute:
+    - '`make update` (builds on remote x86_64 via BuildKit)'
+    - '`make handoff` if engine-only changes'
+  acceptance_criteria:
+  - OVH gateway running new gateway binary; engine hot-reloaded without disconnect (harness verifies IRC socket persistence)
+  - Frontend dist served from `/assets/index-*.js` contains W1 changes
+  - Engine admin endpoint `/api/admin/handoff/status` reports successful handoff with duration
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  devops_security_sensitive: true
+  environment: production
+  requires_approval: true
+  notes: Local ARM64 binary is forbidden per AGENTS.md deploy architecture; only BuildKit build is acceptable.
+- id: W1-T12
+  title: W1-DOCS CHANGELOG + architecture notes (Heartbeat, Ignore migration, prefVersion)
+  description: Write CHANGELOG entry for Wave 1; produce architecture notes for protocol changes (heartbeat_echo, ignore migration, prefVersion).
+  wave: 1
+  agent: gem-documentation-writer
+  status: pending
+  dependencies:
+  - W1-T09
+  conflicts_with: []
+  inputs:
+    ircfiber: All W1 implementation diffs + spec
+    irccloud: irccloud-webpack-study/ for reference
+  outputs:
+    create:
+    - docs/CHANGELOG.md (Wave 1 section)
+    - docs/HEARTBEAT.md (heartbeat_echo protocol)
+    - docs/IGNORE_MIGRATION.md (one-way nick → *!*@* upgrade)
+    - docs/PREF_VERSION.md (prefVersion conflict resolution)
+  acceptance_criteria:
+  - 'Each doc file ≥ 50 lines; covers: schema, wire format, migration path, rollback'
+  - CHANGELOG entry lists all 8 R# items with link to docs
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Docs ship with the wave, not after.
+- id: W1-T13
+  title: W1 protocol integration tests
+  description: 'Integration tests for Wave 1 wire-format changes: heartbeat_echo batched roundtrip, buffersToDelete handling (with activeJoinList guard), pref_update fan-out, Ignore migration edge cases
+    (C1 heuristic), conversationsCollapsed BOTH paths (M2).'
+  wave: 1
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W1-T01
+  - W1-T02
+  - W1-T03
+  - W1-T04
+  - W1-T05
+  - W1-T06
+  - W1-T07
+  - W1-T08
+  conflicts_with: []
+  inputs:
+    ircfiber: 'Existing test patterns in frontend/src/lib/*.test.ts + frontend/src/App.test.ts (per AGENTS.md: NO __tests__/ directory)'
+    irccloud: N/A
+  outputs:
+    create:
+    - frontend/src/lib/ignore.test.ts (port of ignore.js tests + C1 migration heuristic tests)
+    - frontend/src/App.test.ts (extend with heartbeat_echo batched + buffersToDelete + conversationsCollapsed BOTH paths)
+    - frontend/src/lib/heartbeat.test.ts (new — heartbeat handler unit tests, FLAT convention per AGENTS.md)
+    - frontend/src/lib/utils.test.ts (extend with getDisplayName tests for W1-T05 safeChanSuffix)
+  acceptance_criteria:
+  - All new tests pass under `npm run test:lib` + `npm run test:client`
+  - Coverage of all 8 R# items in Wave 1
+  - No test depends on existing tests (each is independently runnable)
+  - 'Test path convention: flat `src/lib/*.test.ts` (NO `__tests__/` subdirectory — AGENTS.md)'
+  - conversationsCollapsed tested for BOTH handlePrefUpdate AND mergePreferences paths (M2 fix)
+  - 'Ignore migration tested for: pure bare-nick (upgraded), bare-nick-with-separator (preserved), bare-nick-with-wildcard (preserved)'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'm2 critic fix: test path uses flat convention. Test-first where possible — implementer writes failing test, then minimal impl, then commit.'
+- id: W2-T01
+  title: R#4b lastSeen heartbeat UI implementation (5-10s interval)
+  description: Frontend heartbeat client (5-10s interval) builds {cid:{bid:lastSeen}} payload and emits via WS; UI uses lastSeen to mark buffers read.
+  wave: 2
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W1-T03
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/stores/wsConnection.svelte.ts (existing WS client) + preferences.svelte.ts:119 (lastSeenMap)
+    irccloud: IRCCloud's lastSeen heartbeat payload shape
+  outputs:
+    modify:
+    - frontend/src/lib/heartbeatClient.ts (new — periodic emit per active buffer)
+    - frontend/src/App.svelte (start heartbeat on mount; stop on unmount)
+  acceptance_criteria:
+  - Heartbeat client emits `{cmd:'heartbeat', cid, bid, ts}` every 5-10s for the active buffer
+  - Server echoes back heartbeat_echo (W1-T03) → lastSeenMap updated
+  - Buffer header shows 'last seen N minutes ago' using lastSeenMap
+  - 'Unit test: heartbeatClient with vi.useFakeTimers fires every 5s'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Now safe to enable Wave 1 heartbeat feature flag.
+- id: W2-T02
+  title: R#19b pref_update fan-out verification (enable Wave 1 flag)
+  description: 'Flip Wave 1 feature flags on: enable pref_update expanded keys (R#19), enable prefVersion resolution (R#11/R#11b). Verify all 6 pref keys route correctly.'
+  wave: 2
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W1-T01
+  - W1-T02
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/App.svelte:737-837 + preferencesStore gating
+    irccloud: N/A
+  outputs:
+    modify:
+    - frontend/src/stores/preferences.svelte.ts (default feature flags ON)
+    - source/ircfiber/api/rest.d (remove wave-1 default-off conditional)
+  acceptance_criteria:
+  - All 6 pref keys (pinned/archived/collapsed/conversationsCollapsed/inactiveCollapsed/serverlogCollapsed/membersCollapsed) route in handlePrefUpdate
+  - prefVersion resolution in mergePreferences chooses highest version
+  - Cross-tab sync via storage event (preferences.svelte.ts:312-380) still works
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: This is largely a verification + flag-flip task. The actual handler code landed in W1-T01.
+- id: W2-T03
+  title: R#11b prefVersion resolution in mergePreferences
+  description: Frontend mergePreferences uses prefVersion as last-write-wins tiebreaker; resolves stat_user merge flicker (App.svelte:629-735).
+  wave: 2
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W1-T02
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/App.svelte:630-735 (mergePreferences)
+    irccloud: 'Pattern: IRCCloud''s stat_user merge with prefs_version field'
+  outputs:
+    modify:
+    - frontend/src/App.svelte (compare local stored prefVersion vs server payload; choose highest)
+  acceptance_criteria:
+  - mergePreferences compares prefVersion; newer version wins, older version no-op'd
+  - No visible flicker on tab switch (existing additive-only merge still applies)
+  - 'Unit test: simulate stat_user with older prefVersion → local state unchanged'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Final wire-format stabilization; safe to enable flag.
+- id: W2-T04
+  title: W2-REV reviewer gate (full depth)
+  description: Reviewer audits Wave 2 cross-device sync behavior; verifies no regression in Wave 1 pref_update path.
+  wave: 2
+  agent: gem-reviewer
+  status: pending
+  dependencies:
+  - W2-T01
+  - W2-T02
+  - W2-T03
+  conflicts_with: []
+  inputs:
+    ircfiber: All W2 implementation diffs; existing cross-tab storage event handler
+    irccloud: N/A
+  outputs:
+    produce:
+    - review-verdict-w2.md
+  acceptance_criteria:
+  - Verifies lastSeen roundtrip via two simulated tabs
+  - Confirms prefVersion prevents stat_user flicker regression
+  - 'All gates: wire compat, tests, docs'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: BLOCKS W2-DEPLOY.
+- id: W2-T05
+  title: W2-DEPLOY make update to ircfiber-ovh-1
+  description: 'Deploy Wave 2: enable prefVersion + heartbeat feature flags; push frontend dist; graceful engine handoff if engine changed.'
+  wave: 2
+  agent: gem-devops
+  status: pending
+  dependencies:
+  - W2-T04
+  conflicts_with: []
+  inputs:
+    ircfiber: Makefile:1299 (update target); Makefile:1325 (update-assets for frontend-only)
+    irccloud: N/A
+  outputs:
+    execute:
+    - '`make update-assets` (frontend-only — no engine changes expected)'
+  acceptance_criteria:
+  - OVH gateway serves Wave 2 frontend; feature flags default ON
+  - Cross-tab pref_update sync works between two browser tabs
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  devops_security_sensitive: true
+  environment: production
+  requires_approval: true
+  notes: Use update-assets (not full update) since engine unchanged.
+- id: W2-T06
+  title: W2-DOCS CHANGELOG + cross-device sync guide
+  description: CHANGELOG entry for Wave 2; user-facing doc on cross-device sync (lastSeen, pref update fan-out).
+  wave: 2
+  agent: gem-documentation-writer
+  status: pending
+  dependencies:
+  - W2-T04
+  conflicts_with: []
+  inputs:
+    ircfiber: All W2 implementation diffs
+    irccloud: N/A
+  outputs:
+    create:
+    - docs/CHANGELOG.md (Wave 2 section appended)
+    - docs/CROSS_DEVICE_SYNC.md (user-facing guide)
+  acceptance_criteria:
+  - CHANGELOG covers R#4b, R#19b, R#11b with feature flag rollout notes
+  - Cross-device guide explains heartbeat interval + conflict resolution
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Docs ship with the wave.
+- id: W2-T07
+  title: W2 cross-device sync tests
+  description: Tests for lastSeen heartbeat roundtrip, prefVersion conflict resolution, storage event handling.
+  wave: 2
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W2-T01
+  - W2-T02
+  - W2-T03
+  conflicts_with: []
+  inputs:
+    ircfiber: Existing test patterns; W1 protocol test scaffolding
+    irccloud: N/A
+  outputs:
+    create:
+    - frontend/src/lib/heartbeatClient.test.ts (new)
+    - frontend/src/App.test.ts (extend with prefVersion merge cases)
+  acceptance_criteria:
+  - All tests pass; coverage ≥ 80% for new code
+  - 'Two-tab scenario test: storage event triggers handlePrefUpdate equivalent'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Use fake-timers + fake-storage events per vitest patterns in ircStore.svelte.test.ts.
+- id: W3-T01a
+  title: Archive-names bulk endpoint + Mongo/Redis integration (engine-side prep for W3-T01)
+  description: 'Engine-side `/api/buffers/archive-names` endpoint returning archived buffer names for ALL user''s networks in ONE bulk payload (NOT per-network). Bulk Mongo query against archived channels
+    collection; Redis cache with TTL; cache invalidated on PART events. Q5 user decision: cross-network search requires bulk endpoint to avoid N parallel requests on Cmd+K open.'
+  wave: 3
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W1-T05
+  conflicts_with: []
+  inputs:
+    ircfiber: source/ircfiber/db/messages.d (archived channels collection) + source/ircfiber/api/rest.d:79 (existing /api/me/archives endpoint)
+    irccloud: irccloud-webpack-study/app/src/view/channelswitchdialog.es6:154-171 (fetchArchiveNames bulk pattern)
+  outputs:
+    create:
+    - source/ircfiber/web/archive_names.d (new — bulk endpoint handler)
+    - source/ircfiber/db/messages.d (add bulk archive-names query + Redis cache wrapper)
+    modify:
+    - source/ircfiber/api/rest.d (register GET /api/buffers/archive-names route)
+    - source/ircfiber/irc/connection.d (invalidate Redis cache on PART events)
+  acceptance_criteria:
+  - 'GET /api/buffers/archive-names returns `{ networkId: string[] }` — archived buffer names for ALL user''s networks in ONE payload'
+  - Response time <100ms for users with up to 500 archives
+  - Redis cache key `archive-names:<uid>` with 5-minute TTL; invalidated on PART events for that uid
+  - 'Unit test: handler returns archived names keyed by networkId; cache hit returns within 5ms'
+  - 'Integration test: bulk query returns expected archived channels from seeded Mongo'
+  - 'Doc in docs/ARCHIVE_NAMES.md: endpoint contract, cache strategy, invalidation triggers'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'M3 critic fix: explicit engine-side task for /api/buffers/archive-names. Q5 user decision: bulk endpoint (not per-network). PM10 mitigation: client-side 5-minute in-memory TTL also documented
+    in W3-T01 acceptance criteria.'
+- id: W3-T01
+  title: R#1 Cmd/Ctrl+K channel quick-switcher (channel-switch-dialog)
+  description: 'Port IRCCloud''s channel-switch-dialog: Cmd/Ctrl+K opens a modal with fuzzaldrin-plus search over buffers; select switches buffer. Q5 user decision: cross-network search with disambiguation
+    badge showing serverName; single bulk `/api/buffers/archive-names` endpoint (W3-T01a); component takes `scope: ''all'' | ''active''` prop for future refactor.'
+  wave: 3
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W1-T05
+  - W1-T06
+  - W3-T01a
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/App.svelte:389 (existing `?` shortcut handler) + new frontend/src/components/ChannelSwitcher.svelte + W1-T05 getDisplayName() helper
+    irccloud: irccloud-webpack-study/app/src/view/channelswitchdialogview.js (Backbone view) + channel-switch-dialog DOM pattern; channel-switch-dialog.es6:175-238 (cross-network searchKey = buffer.name
+      + connectionName)
+  outputs:
+    create:
+    - frontend/src/components/ChannelSwitcher.svelte (new — modal with fuzzy search input + scope prop)
+    - frontend/src/lib/fuzzyMatch.ts (new — port fuzzaldrin-plus core or use match-sorter library)
+    - frontend/src/components/ChannelSwitcher.test.ts (new)
+    modify:
+    - frontend/src/App.svelte (add Cmd/Ctrl+K global keydown handler that mounts ChannelSwitcher)
+    - frontend/src/components/ShortcutsPage.svelte (add `K — Quick switch channel` entry)
+    - frontend/src/stores/ircStore.svelte.ts (5-minute client cache for archive-names via W3-T01a endpoint)
+  acceptance_criteria:
+  - Cmd/Ctrl+K opens modal; type filters buffers by fuzzy match (score-based)
+  - ↑/↓ navigates results; Enter switches to selected buffer; Esc closes
+  - 'Modal searches across ALL networks (cross-network; default `scope: ''all''`) with serverName disambiguation badge in result row'
+  - Disambiguation badge shows `serverName` (matches IRCCloud) for buffers with duplicate displayName across networks
+  - Single bulk fetch via GET /api/buffers/archive-names (W3-T01a endpoint); NO N parallel per-network requests
+  - 'Component accepts `scope: ''all'' | ''active''` prop (default ''all''); future ''active-network-only'' mode possible without refactor'
+  - Client-side 5-minute in-memory TTL on archive-names cache; re-fetch on cache age > TTL (PM10 mitigation)
+  - 'Test in ChannelSwitcher.test.ts: type ''foo'' returns `#food` + `#foobar` ranked by score; cross-network returns duplicate `#general` with serverName badge'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Q5 user decision: cross-network with disambiguation badge. M3 critic fix: added W3-T01a engine task as dep. PM10 mitigation: 5-min client cache TTL. Requires `match-sorter` (already a dep candidate)
+    or hand-roll fuzzy match; verify `npm ls match-sorter` first.'
+- id: W3-T02
+  title: D#2 Per-row hover actions toolbar (copy / quote / mark-read)
+  description: 'Add hover toolbar slot to MessageRow.svelte with copy text, quote reply, mark-as-read icons. Hidden on touch (hover: none).'
+  wave: 3
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/MessageRow.svelte:506-510 (current right-side gutter) + frontend/src/components/ChannelContextMenu.svelte (existing copyText/markReadHere)
+    irccloud: irccloud_chat_css_categorized.json:21214-21243 (IRCCloud messageActions toolbar)
+  outputs:
+    modify:
+    - frontend/src/components/MessageRow.svelte (add rowActions div with copy/quote/mark-read buttons on hover)
+    - frontend/src/styles/components/_messageGrouping.scss (add .rowActions styles + .row.messageRow:hover trigger + @media hover:none hide)
+  acceptance_criteria:
+  - Hovering a chat message row reveals 3 icons in the right gutter (existing 118px padding absorbs them)
+  - Click 'copy' → clipboard receives full row text including nick + timestamp
+  - Click 'quote' → input is prepended with `<nick> ` and message text wrapped in << >>
+  - Click 'mark-read' → updates lastSeenMap; SeenDivider appears
+  - 'Hidden on touch devices (`@media (hover: none)`)'
+  - Reuses existing .bot/.blockArt short-circuit pattern at app.css:79-87
+  - Visual regression snapshot in Wave 4 W4-VISUAL test
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: High-impact visual feature — top user-facing win in IRCCloud feedback. Test in MessageRow.test.ts with fireEvent.mouseEnter.
+- id: W3-T03
+  title: R#2b Ctrl/Cmd+Up edit-last-message binding in InputArea
+  description: Add Ctrl/Cmd+Up binding in InputArea.svelte that loads last sent message into input as an edit (when input is empty).
+  wave: 3
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W1-T04
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/InputArea.svelte:176-220 (handleKeyDown) + ircStore.svelte.ts (track last sent label per buffer)
+    irccloud: 'Pattern: IRCCloud''s Ctrl/Cmd+Up edit-last-sent binding'
+  outputs:
+    modify:
+    - 'frontend/src/components/InputArea.svelte (after ArrowUp handler at line 188: add Ctrl/Cmd+Up branch)'
+    - frontend/src/components/InputArea.test.ts (extend with Ctrl+Up test case)
+  acceptance_criteria:
+  - Ctrl/Cmd+Up with empty inputValue AND a sent message in active buffer → load that message into input with edit-prefix marker
+  - Ctrl/Cmd+Up with non-empty input → falls through to history navigation
+  - Pressing Enter sends the edit via EditMsgOut (W1-T04 wire path)
+  - 'Test: simulate Ctrl+Up after sending ''hello'' → inputValue = ''[edit] hello'''
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Mac: Cmd; Win/Linux: Ctrl — use (e.metaKey || e.ctrlKey) && e.key === ''ArrowUp'' per keyboard.es6:45-54.'
+- id: W3-T04
+  title: R#15 Tab completion cycling modes (last-highlighters, topic, join cycling)
+  description: 'Extend TabCompletionEngine to cycle through: (1) recent highlighters, (2) topic cycling words, (3) recently joined nicks. Defaults to last-highlighters first.'
+  wave: 3
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/lib/tabCompletion.ts:49-68 (getNickCandidates) + InputArea.svelte:222-248 (handleTabCompletion)
+    irccloud: 'Pattern: IRCCloud''s tab cycling through highlighters, then topic, then members'
+  outputs:
+    modify:
+    - frontend/src/lib/tabCompletion.ts (add getHighlighterCandidates using existing highlightWords + lastSpoke from messages)
+    - frontend/src/lib/tabCompletion.test.ts (extend with highlighter cycle cases)
+  acceptance_criteria:
+  - First Tab in empty input → cycles recent highlighters (from highlightWords + nick mentions in last 50 messages)
+  - Subsequent Tab → cycles topic words (split on whitespace, take first 50 unique)
+  - Then → cycles recently joined nicks (from Member[].lastJoinedAt or equivalent)
+  - 'Test in tabCompletion.test.ts: empty input + Tab cycles through 3 distinct categories'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Build on existing Member.lastSpoke / lastHighlighted fields (already at types.ts); ensure Member type carries lastJoinedAt or similar.
+- id: W3-T05
+  title: R#20 /cycle + /quote slash commands (already matched)
+  description: Both /cycle and /quote are already implemented at slashCommands.ts:140 (/quote as /raw alias) and :177 (/cycle). No new work; verify in shortcuts overlay.
+  wave: 3
+  agent: gem-implementer
+  status: already_matched
+  dependencies: []
+  conflicts_with:
+  - frontend/src/lib/slashCommands.ts:140 (registerSlash(['raw', 'quote']))
+  - frontend/src/lib/slashCommands.ts:177 (registerSlash(['cycle', 'hop', 'rejoin']))
+  inputs:
+    ircfiber: frontend/src/lib/slashCommands.ts:140 + :177
+    irccloud: N/A — already mirrored
+  outputs:
+    produce:
+    - verification note (no code change)
+  acceptance_criteria:
+  - Verify /cycle + /quote appear in `?` shortcuts overlay (ShortcutsPage.svelte)
+  - No regression in /raw or /hop
+  review_depth: lightweight
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Already implemented. Listed for traceability.
+- id: W3-T06
+  title: W3-REV reviewer gate (full depth)
+  description: 'Reviewer audits power-user UX features: keyboard binding parity, accessibility, visual regression baselines.'
+  wave: 3
+  agent: gem-reviewer
+  status: pending
+  dependencies:
+  - W3-T01
+  - W3-T02
+  - W3-T03
+  - W3-T04
+  - W3-T05
+  conflicts_with: []
+  inputs:
+    ircfiber: All W3 implementation diffs; existing test patterns
+    irccloud: irccloud-webpack-study/app/src/view/channelswitchdialogview.js for switcher parity
+  outputs:
+    produce:
+    - review-verdict-w3.md
+  acceptance_criteria:
+  - Keyboard bindings conform to macOS modifierName() pattern at keyboard.es6:31-36
+  - All interactive elements have aria-label and role
+  - Visual regression baselines captured for Wave 4 replay
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: BLOCKS W3-DEPLOY.
+- id: W3-T07
+  title: W3-DEPLOY make update to ircfiber-ovh-1
+  description: 'Deploy Wave 3: push frontend dist (no engine changes expected).'
+  wave: 3
+  agent: gem-devops
+  status: pending
+  dependencies:
+  - W3-T06
+  conflicts_with: []
+  inputs:
+    ircfiber: Makefile:1325 (`update-assets`)
+    irccloud: N/A
+  outputs:
+    execute:
+    - '`make update-assets`'
+  acceptance_criteria:
+  - OVH gateway serves Wave 3 frontend
+  - All W3 shortcuts work in production
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  devops_security_sensitive: true
+  environment: production
+  requires_approval: true
+  notes: Frontend-only — no engine rebuild needed.
+- id: W3-T08
+  title: W3-DOCS CHANGELOG + shortcuts reference
+  description: CHANGELOG entry for Wave 3; update ShortcutsPage.svelte with new bindings; user-facing keyboard reference.
+  wave: 3
+  agent: gem-documentation-writer
+  status: pending
+  dependencies:
+  - W3-T06
+  conflicts_with: []
+  inputs:
+    ircfiber: All W3 implementation diffs
+    irccloud: N/A
+  outputs:
+    modify:
+    - docs/CHANGELOG.md (Wave 3 section)
+    - frontend/src/components/ShortcutsPage.svelte (add K, Ctrl/Cmd+Up entries)
+    create:
+    - docs/KEYBOARD_SHORTCUTS.md (full reference)
+  acceptance_criteria:
+  - ShortcutsPage lists all new bindings with modifierName() pattern (Mac/Win)
+  - CHANGELOG covers R#1, D#2, R#2b, R#15, R#20
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Docs ship with the wave.
+- id: W3-T09
+  title: W3 power-user UX tests
+  description: Tests for channel switcher, hover toolbar, edit-last binding, tab cycling modes.
+  wave: 3
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W3-T01
+  - W3-T02
+  - W3-T03
+  - W3-T04
+  conflicts_with: []
+  inputs:
+    ircfiber: Existing test patterns in InputArea.test.ts + MessageRow.test.ts
+    irccloud: N/A
+  outputs:
+    modify:
+    - frontend/src/components/InputArea.test.ts (extend with Ctrl+Up, tab cycling)
+    - frontend/src/components/MessageRow.test.ts (extend with hover toolbar interactions)
+    create:
+    - frontend/src/components/ChannelSwitcher.test.ts
+  acceptance_criteria:
+  - All new tests pass
+  - Coverage of new keyboard bindings in handleKeyDown
+  - Visual regression baseline captured for hover toolbar (used in Wave 4)
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: fireEvent.mouseEnter / mouseLeave for hover toolbar per Svelte testing patterns.
+- id: W4a-T01
+  title: D#1 Themed row backgrounds (.self/.notice/.highlight/.warning)
+  description: Add _rowStates.scss partial with CSS variables for row backgrounds; applies to MessageRow classes.
+  wave: 4
+  agent: gem-designer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/MessageRow.svelte:432 (class:own + class:highlight) + frontend/src/app.css
+    irccloud: irccloud_chat_css_categorized.json:212-265 (dusk + midnight theme variants)
+  outputs:
+    create:
+    - frontend/src/styles/components/_rowStates.scss (new — themed row backgrounds)
+    modify:
+    - frontend/src/styles/main.scss (import _rowStates.scss)
+  acceptance_criteria:
+  - Theme-aware row backgrounds for .self/.notice/.highlight/.warning/.status using CSS variables (--row-notice-bg, --row-highlight-bg, etc.)
+  - 'Midnight theme overrides via existing #app.midnight-theme class (backward-compat selector — PM9 mitigation)'
+  - No regression to default dark theme
+  - Visual regression snapshot test (W4a-T13) captures before/after
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:9-62 (Section 1). Was W4-T01; renamed W4a-T01 after Wave 4 split.'
+  subwave: 4a
+- id: W4a-T02
+  title: D#3+D#14 Member list mode-prefix glyphs + away/match styling
+  description: Render CATEGORY_SYMBOLS (MemberList.svelte:21-29) as a prefix span before nick; add away/match styles; wire match from MessageRow hover.
+  wave: 4
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/MemberList.svelte:21-29 (CATEGORY_SYMBOLS table — defined but not rendered) + :55-65 (template)
+    irccloud: irccloud_chat_css_categorized.json:10846-10922 (mode prefix + away opacity)
+  outputs:
+    modify:
+    - frontend/src/components/MemberList.svelte (add `<span class="member-mode-prefix">` before member-nick)
+    - frontend/src/styles/components/_memberList.scss (add .member-mode-prefix styles + .member-item.away/match styles)
+    create:
+    - frontend/src/components/MemberList.test.ts (extend with mode prefix rendering tests)
+  acceptance_criteria:
+  - Mode prefix glyph (~&@%+) renders before nick with mode-color (rgb(255,99,71) for OWNER, etc.)
+  - Away members render at .5 opacity
+  - Self member bolded; current nick has white color
+  - MessageRow nick-hover triggers .match class on corresponding MemberList row
+  - Reuses existing mode_color CSS classes at app.css:268-272
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:130-183 (Section 3 + 14). Was W4-T02.'
+  subwave: 4a
+- id: W4a-T03
+  title: D#6 Themed connection-status pill banner
+  description: Add themed pill styles to .connectionstatuscell with rotating chevron + spinner for connecting state.
+  wave: 4
+  agent: gem-designer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/ConnectionStatus.svelte:38-71 (markup) + frontend/src/styles/components/_statusCells.scss (partial exists)
+    irccloud: irccloud_chat_css_categorized.json:11014-11140 (connectionstatusview.js pill styles)
+  outputs:
+    modify:
+    - frontend/src/styles/components/_statusCells.scss (add themed pill + connecting spinner)
+  acceptance_criteria:
+  - .connectionStatus renders as rounded pill with dusk/midnight bg variants
+  - Connecting state shows animated spinner using existing `spin` keyframe from _sidebar.scss:341
+  - Reconnect hover brightens background
+  - 'Away pill: warm amber, persistent chip in input nickcell (links with W4b-T04 D#11)'
+  - Visual regression snapshot (W4a-T13) verifies pill geometry
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:288-323 (Section 6). Was W4-T03.'
+  subwave: 4a
+- id: W4a-T04
+  title: D#7 Pending/failed message visual states
+  description: Add .pendingOut (slight dim + ellipsis on timestamp) and .failed (red border + ✕ on timestamp, click retry) states; expose failed via optimisticMessages Map.
+  wave: 4
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/stores/ircStore.svelte.ts:32 (optimisticMessages Map) + MessageRow.svelte:432 (existing class derivation)
+    irccloud: 'irccloud_chat_css_categorized.json: theme-dusk div.log div.row.pendingOut/failed rules'
+  outputs:
+    modify:
+    - frontend/src/components/MessageRow.svelte (add class:pendingOut / class:failed based on msg.status)
+    - frontend/src/app.css (add .pendingOut / .failed styles)
+    - frontend/src/stores/ircStore.svelte.ts (mark optimisticMessages entry as 'failed' if WS disconnects without echo after 30s)
+  acceptance_criteria:
+  - Optimistic message renders at .75 opacity with ellipsis on timestamp
+  - Failed message renders with red left-border + ✕ glyph; click timestamp retries send
+  - Failed state auto-clears on successful echo
+  - 'Test in MessageRow.test.ts: msg.status=failed → red border applied'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:326-358 (Section 7). Was W4-T04.'
+  subwave: 4a
+- id: W4a-T05
+  title: D#10 Mobile 44×44 touch-target audit
+  description: 'Apply blanket @media (max-width: 800px) rule to bump interactive header chrome to 44×44px touch targets.'
+  wave: 4
+  agent: gem-designer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/styles/layout/_responsive.scss:144-152 (member count) + :170-180 (emoji/upload/lock)
+    irccloud: WCAG 2.5.5 (Target Size AAA) = 44×44px
+  outputs:
+    modify:
+    - frontend/src/styles/layout/_responsive.scss (add member audit section per audit Section 10)
+  acceptance_criteria:
+  - All header buttons, member count, emoji/upload/lock cells render at min 44×44px on mobile
+  - .member-item padding+min-height expanded; gap between members increased
+  - No regression to desktop layout
+  - Playwright snapshot at viewport 375×667 (iPhone SE) verifies target sizes
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:434-467 (Section 10). Was W4-T05.'
+  subwave: 4a
+- id: W4a-T06
+  title: D#5 Empty-channel hint state
+  description: Add centered hint in MessageList.svelte when messagesWithDates is empty (skip server buffer).
+  wave: 4
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/MessageList.svelte:903 (each loop) + frontend/src/components/ChatArea.svelte:132-138
+    irccloud: Empty buffer hint in IRCCloud (no specific CSS — pattern is centered text)
+  outputs:
+    modify:
+    - frontend/src/components/MessageList.svelte (add empty-channel block above the each)
+    - frontend/src/styles/components/_messageGrouping.scss (add .empty-channel styles)
+    - frontend/src/components/MessageList.test.ts (extend with empty-state test)
+  acceptance_criteria:
+  - Empty channel renders centered hint '#channel — No messages yet — type below to say something'
+  - Empty DM renders 'No messages with {nick} yet'
+  - 'pointer-events: none so hint doesn''t block input clicks'
+  - 'Responsive: 32×16 padding on mobile, 64×24 on desktop'
+  - Hint disappears when first message arrives
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:241-285 (Section 5). Was W4-T06.'
+  subwave: 4a
+- id: W4a-T07
+  title: D#9 Typing-indicator dot bounce + prefers-reduced-motion
+  description: Add nth-child bounce animation to .typing-dots; honor prefers-reduced-motion.
+  wave: 4
+  agent: gem-designer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/InputArea.svelte:537-540 (typing-cell markup) + frontend/src/styles/components/_chatInput.scss
+    irccloud: irccloud_chat_css_categorized.json inputInfo rules (3-dot wave)
+  outputs:
+    modify:
+    - frontend/src/styles/components/_chatInput.scss (add .typing-dots bounce keyframes + reduced-motion override)
+  acceptance_criteria:
+  - Three dots bounce with staggered animation-delay (.15s, .3s)
+  - '@media (prefers-reduced-motion: reduce) disables animation'
+  - WCAG 2.3.3 compliant
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:386-432 (Section 9). Was W4-T07.'
+  subwave: 4a
+- id: W4a-T08
+  title: D#12 Settings page section dividers
+  description: Add .settings-section wrapper to all Settings*.svelte tabs; 1px dividers + section headings.
+  wave: 4
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/SettingsPage.svelte + SettingsAccount.svelte + SettingsChat.svelte + SettingsDesign.svelte + SettingsNotifications.svelte
+    irccloud: Settings page section rhythm
+  outputs:
+    modify:
+    - frontend/src/components/SettingsPage.svelte (add .settings-section wrapper)
+    - frontend/src/styles/components/_settings.scss (add .settings-section styles)
+  acceptance_criteria:
+  - Each Settings*.svelte tab uses consistent .settings-section wrapper
+  - 1px dividers between sections; last-child has no border
+  - Section heading 14px/600 weight; body 13px secondary color
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:505-536 (Section 12). Was W4-T13; repositioned to W4a since dividers affect Settings chrome (not theme system).'
+  subwave: 4a
+- id: W4a-T09
+  title: W4a-REV reviewer gate (full depth)
+  description: 'Reviewer audits all 8 Wave 4a visual items (D#1, D#3+D#14, D#5, D#6, D#7, D#9, D#10, D#12): CSS variable consistency, accessibility (contrast, target size), no CSP regressions, midnight-theme
+    backward-compat preserved.'
+  wave: 4
+  agent: gem-reviewer
+  status: pending
+  dependencies:
+  - W4a-T01
+  - W4a-T02
+  - W4a-T03
+  - W4a-T04
+  - W4a-T05
+  - W4a-T06
+  - W4a-T07
+  - W4a-T08
+  conflicts_with: []
+  inputs:
+    ircfiber: All W4a implementation diffs; CSP at deploy/roles/caddy/templates/Caddyfile.j2:61
+    irccloud: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md as parity reference
+  outputs:
+    produce:
+    - review-verdict-w4a.md (per-item visual regression report)
+  acceptance_criteria:
+  - No CSP regressions (CSS variables used for theming; existing unsafe-inline tolerated per spec)
+  - Default dark theme preserved (no regression)
+  - WCAG AA contrast on all new themed surfaces
+  - '#app.midnight-theme backward-compat selector still active (PM9 verification)'
+  - Visual regression baselines captured for W4a items
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: BLOCKS W4a-DEPLOY. Theming is cross-cutting — verify CSS-var surface consistency. Was W4-T14; renamed W4a-T09 after Wave 4 split.
+  subwave: 4a
+- id: W4a-T10
+  title: W4a-CRIT critic review (visual states risk audit)
+  description: Critic reviews Wave 4a for cross-cutting visual state risks, accessibility regressions, midnight-theme backward-compat regression risk (PM9).
+  wave: 4
+  agent: gem-critic
+  status: pending
+  dependencies:
+  - W4a-T09
+  conflicts_with: []
+  inputs:
+    ircfiber: All W4a implementation diffs + spec
+    irccloud: Visual design audit doc as parity reference
+  outputs:
+    produce:
+    - W4a-risk-register.md
+  acceptance_criteria:
+  - Identifies regression risk per SCSS partial touched
+  - Explicitly verifies PM9 (midnight-theme backward-compat) is preserved
+  - 'Verdict: proceed | revise | escalate'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Wave 4a critic focuses on visual state consistency + midnight backward-compat (PM9). Was W4-T15.
+  subwave: 4a
+- id: W4a-T11
+  title: W4a-DEPLOY make update-assets to ircfiber-ovh-1
+  description: Push frontend dist with all Wave 4a visual states + dividers; no engine changes. Frontend-only deploy.
+  wave: 4
+  agent: gem-devops
+  status: pending
+  dependencies:
+  - W4a-T10
+  conflicts_with: []
+  inputs:
+    ircfiber: Makefile:1325 (`update-assets`)
+    irccloud: N/A
+  outputs:
+    execute:
+    - '`make update-assets`'
+  acceptance_criteria:
+  - OVH gateway serves Wave 4a frontend with new visual states
+  - Visual regression snapshot from local matches production (post-deploy verification via capture_comparison.js)
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  devops_security_sensitive: true
+  environment: production
+  requires_approval: true
+  notes: Frontend-only deploy. Was W4-T16.
+  subwave: 4a
+- id: W4a-T12
+  title: W4a-DOCS CHANGELOG + visual states guide
+  description: CHANGELOG entry for Wave 4a; visual states user guide covering row backgrounds, member list modes, connection pill, pending/failed, mobile audit, empty channel, typing bounce, settings dividers.
+  wave: 4
+  agent: gem-documentation-writer
+  status: pending
+  dependencies:
+  - W4a-T09
+  conflicts_with: []
+  inputs:
+    ircfiber: All W4a implementation diffs
+    irccloud: N/A
+  outputs:
+    modify:
+    - docs/CHANGELOG.md (Wave 4a section)
+    create:
+    - docs/VISUAL_STATES.md (Wave 4a visual items with screenshots)
+  acceptance_criteria:
+  - VISUAL_STATES.md covers all 8 Wave 4a items with screenshots
+  - CHANGELOG covers D#1, D#3+D#14, D#5, D#6, D#7, D#9, D#10, D#12
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Docs ship with the wave. Was W4-T17; split into W4a/W4b docs.
+  subwave: 4a
+- id: W4a-T13
+  title: W4a visual regression tests (Playwright snapshots + midnight backward-compat)
+  description: 'Capture Playwright snapshots for all 8 Wave 4a visual items; verify midnight-theme backward-compat with saved `theme: ''midnight''` localStorage value (PM9 mitigation). Compare with IRCCloud
+    reference via existing capture_comparison.js.'
+  wave: 4
+  agent: gem-browser-tester
+  status: pending
+  dependencies:
+  - W4a-T01
+  - W4a-T02
+  - W4a-T03
+  - W4a-T04
+  - W4a-T05
+  - W4a-T06
+  - W4a-T07
+  - W4a-T08
+  conflicts_with: []
+  inputs:
+    ircfiber: Existing capture_comparison.js (project root) + capture_comparison_full.json output
+    irccloud: irccloud_chat_css_categorized.json as reference baseline
+  outputs:
+    create:
+    - tests/visual/w4a-*.snap.png (per-item snapshots)
+    modify:
+    - tests/visual/comparison_w4a.json (before/after report)
+  acceptance_criteria:
+  - Snapshots captured for all 8 Wave 4a visual items in default dark + midnight themes
+  - 'Explicit test: theme=''midnight'' localStorage value → `#app.midnight-theme` selector active (PM9 verification)'
+  - Visual diff per item reports <5% pixel difference vs IRCCloud reference
+  - All Wave 4a baselines committed to repo for regression detection
+  review_depth: full
+  flags:
+    flaky: true
+    retries_used: 0
+    requires_design_validation: false
+  visual_regression:
+    snapshots:
+    - row-states
+    - member-prefix
+    - connection-pill
+    - pending-failed
+    - empty-channel
+    - typing-bounce
+    - mobile-audit
+    - settings-dividers
+    - midnight-backcompat
+    reference: irccloud_chat_css_categorized.json
+  notes: 'Was W4-T18. PM9 mitigation test: midnight-theme saved localStorage value still works after Wave 4a deploy. Use existing capture_comparison.js as foundation.'
+  subwave: 4a
+- id: W4b-T01
+  title: D#4 Date-header gradient + text shadow
+  description: Tokenize DateChange.svelte row with gradient + text shadow; midnight override.
+  wave: 4
+  agent: gem-designer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: 'frontend/src/components/DateChange.svelte:15-26 (current hardcoded #333 background)'
+    irccloud: irccloud_chat_css_categorized.json:11:466-477 (gistwrap title gradient)
+  outputs:
+    modify:
+    - 'frontend/src/components/DateChange.svelte (replace hardcoded #333 with CSS variables)'
+    - frontend/src/styles/themes/_midnight.scss (add midnight row-date-bg vars)
+  acceptance_criteria:
+  - Date row uses --row-date-bg-from/to/fg/shadow CSS variables
+  - Default + midnight themes both have distinct but compatible gradients
+  - No regression to existing rendered date rows
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:186-240 (Section 4). Was W4-T10.'
+  subwave: 4b
+- id: W4b-T02
+  title: D#13 Sidebar chevron color + drag cursor
+  description: Apply light-blue accent on hover (#b3cfff); add cursor:grab/grabbing on network-header.
+  wave: 4
+  agent: gem-designer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: 'frontend/src/components/Sidebar.svelte:222-230 (chevron toggle) + :168-187 (drag handle) + frontend/src/styles/components/_sidebar.scss:68 (cursor: grabbing)'
+    irccloud: 'Sidebar rules in irccloud_chat_css_categorized.json: span.collapseWidget'
+  outputs:
+    modify:
+    - frontend/src/styles/components/_sidebar.scss (add hover color + grab cursor + rotate transform)
+  acceptance_criteria:
+  - 'Chevron hover color = #b3cfff (light blue accent)'
+  - Drag handle cursor = grab on hover, grabbing on active
+  - Chevron rotates -90deg when network collapsed (optional animation)
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:539-563 (Section 13). Was W4-T12.'
+  subwave: 4b
+- id: W4b-T03
+  title: D#8 5+ theme palettes (dusk, tropic, emerald, sand, orchid) + theme picker + midnight backward-compat
+  description: 'Add 5 new theme palettes via CSS partials (dusk, tropic, emerald, sand, orchid); add theme dropdown to SettingsDesign.svelte; persist via globalPrefs.theme. m4 fix: new theme palette class
+    scope = `body.theme-*` (matches IRCCloud convention); KEEP `#app.midnight-theme` selector as backward-compat mapping to same `--chat-bg` overrides for users with cached `theme: ''midnight''` localStorage
+    value (PM9 mitigation).'
+  wave: 4
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: 'frontend/src/stores/preferences.svelte.ts:8 (theme: ''auto''|''dark''|''midnight'') + App.svelte:223-225 (midnight-theme toggle)'
+    irccloud: '8 themes: dusk, tropic, emerald, sand, rust, orchid, ash, midnight'
+  outputs:
+    create:
+    - frontend/src/styles/themes/_dusk.scss
+    - frontend/src/styles/themes/_tropic.scss
+    - frontend/src/styles/themes/_emerald.scss
+    - frontend/src/styles/themes/_sand.scss
+    - frontend/src/styles/themes/_orchid.scss
+    modify:
+    - frontend/src/styles/main.scss (import new themes)
+    - frontend/src/stores/preferences.svelte.ts (extend GlobalPrefs.theme union to include dusk/tropic/emerald/sand/orchid)
+    - frontend/src/App.svelte:223-225 (generalize theme toggle to body.theme-* family)
+    - frontend/src/components/SettingsDesign.svelte (add theme dropdown)
+    - frontend/src/styles/themes/_midnight.scss (preserve `#app.midnight-theme` selector as backward-compat alias for `--chat-bg` overrides)
+  acceptance_criteria:
+  - 5 themes selectable from SettingsDesign.svelte; each persists to localStorage
+  - New themes use `body.theme-{name}` class (IRCCloud convention); midnight stays as `#app.midnight-theme` for backward-compat (PM9)
+  - 'Users with cached `theme: ''midnight''` localStorage value still see themed UI after deploy (PM9 verification)'
+  - No regression to existing dark theme (default)
+  - CSS variables (--row-*, --accent, --link, --chat-bg) map per theme
+  - Visual regression snapshot for each theme (W4a-T13 / W4b-T07)
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'm4 critic fix: new theme class scope = body.theme-*; `#app.midnight-theme` kept as backward-compat alias. Was W4-T08.'
+  subwave: 4b
+- id: W4b-T04
+  title: D#11 Away indicator in input nickcell
+  description: Add small dot/glyph to .buffernick when activeNetwork.isAway; warm amber color + pulse animation.
+  wave: 4
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/components/InputArea.svelte:543-550 (buffernick markup) + preferences.svelte.ts:120 (awayMessage)
+    irccloud: ConnectionStatus away chip + input cell glyph
+  outputs:
+    modify:
+    - frontend/src/components/InputArea.svelte (add away-indicator span when isAway)
+    - frontend/src/styles/components/_chatInput.scss (add .away-indicator with pulse keyframe + reduced-motion override)
+  acceptance_criteria:
+  - When activeNetwork.isAway, amber dot renders next to nick in input
+  - Pulse animation respects prefers-reduced-motion
+  - 'Test: simulate isAway=true → away-indicator renders'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:469-503 (Section 11). Was W4-T11.'
+  subwave: 4b
+- id: W4b-T05
+  title: D#15 Custom CSS editor polish (validation + preview + reset)
+  description: Add textarea validation via CSSStyleSheet.replaceSync; preview toggle scoping to current buffer; reset to default button.
+  wave: 4
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/App.svelte:228-242 (custom CSS injection) + frontend/src/components/SettingsDesign.svelte
+    irccloud: N/A — IRC Fiber has better baseline; polish only
+  outputs:
+    modify:
+    - frontend/src/components/SettingsDesign.svelte (add validation feedback, preview toggle, reset button)
+  acceptance_criteria:
+  - 'Validation: try/catch around new CSSStyleSheet().replaceSync(css); error message displays inline'
+  - Preview toggle scopes custom CSS to current buffer only (scopedClass wrapper)
+  - Reset button clears customCSS from globalPrefs
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: true
+  notes: 'Spec reference: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md:590-612 (Section 15). Was W4-T09.'
+  subwave: 4b
+- id: W4b-T06
+  title: W4b-REV reviewer gate (full depth)
+  description: Reviewer audits all 5 Wave 4b visual items (D#4, D#8 themes, D#11, D#13, D#15) plus midnight-theme backward-compat preservation across the full theme picker surface.
+  wave: 4
+  agent: gem-reviewer
+  status: pending
+  dependencies:
+  - W4b-T01
+  - W4b-T02
+  - W4b-T03
+  - W4b-T04
+  - W4b-T05
+  conflicts_with: []
+  inputs:
+    ircfiber: All W4b implementation diffs
+    irccloud: docs/IRCCLOUD_VISUAL_DESIGN_AUDIT.md as parity reference
+  outputs:
+    produce:
+    - review-verdict-w4b.md (per-item visual regression report)
+  acceptance_criteria:
+  - All 5 Wave 4b items render correctly
+  - Theme picker persists selection to localStorage; body.theme-* class applied for new themes
+  - 'Midnight-theme backward-compat verified (PM9): `#app.midnight-theme` selector still maps to --chat-bg overrides'
+  - WCAG AA contrast on all new themed surfaces
+  - Visual regression baselines captured for each new theme
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: BLOCKS W4b-DEPLOY. New reviewer gate after Wave 4 split (m3 fix).
+  subwave: 4b
+- id: W4b-T07
+  title: W4b-DEPLOY make update-assets to ircfiber-ovh-1
+  description: Push frontend dist with all Wave 4b themes + remaining visual items; no engine changes. Frontend-only deploy.
+  wave: 4
+  agent: gem-devops
+  status: pending
+  dependencies:
+  - W4b-T06
+  conflicts_with: []
+  inputs:
+    ircfiber: Makefile:1325 (`update-assets`)
+    irccloud: N/A
+  outputs:
+    execute:
+    - '`make update-assets`'
+  acceptance_criteria:
+  - OVH gateway serves Wave 4b frontend with new themes
+  - Visual regression snapshot from local matches production (post-deploy verification via capture_comparison.js)
+  - Midnight-theme users still see themed UI after deploy (PM9 verification)
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  devops_security_sensitive: true
+  environment: production
+  requires_approval: true
+  notes: Frontend-only deploy. New deploy task after Wave 4 split.
+  subwave: 4b
+- id: W4b-T08
+  title: W4b-DOCS CHANGELOG + theme reference
+  description: CHANGELOG entry for Wave 4b; theme picker user guide; visual customization overview. THEMES.md lists all 7 themes (dark, midnight, dusk, tropic, emerald, sand, orchid) with color samples
+    + midnight backward-compat note.
+  wave: 4
+  agent: gem-documentation-writer
+  status: pending
+  dependencies:
+  - W4b-T06
+  conflicts_with: []
+  inputs:
+    ircfiber: All W4b implementation diffs
+    irccloud: N/A
+  outputs:
+    modify:
+    - docs/CHANGELOG.md (Wave 4b section appended)
+    create:
+    - docs/THEMES.md (theme picker reference + custom CSS guide + midnight backward-compat note)
+  acceptance_criteria:
+  - THEMES.md lists all 7 themes with color samples
+  - 'THEMES.md includes backward-compat note for users with cached `theme: ''midnight''` localStorage value'
+  - CHANGELOG covers D#4, D#8, D#11, D#13, D#15
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Docs ship with the wave. New docs task after Wave 4 split.
+  subwave: 4b
+- id: W5-T01
+  title: R#9 WS → XHR stream fallback (corporate proxies, captive portals)
+  description: Add XHR long-poll fallback when WebSocket fails (corporate proxies, captive portals). Reuses maxEidTracker for dedup.
+  wave: 5
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W1-T03
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/stores/wsConnection.svelte.ts:19-167 (existing WS client)
+    irccloud: irccloud-webpack-study/app/src/xhrstreamhandler.js + irccloud-webpack-study/app/src/streamhandler.js (XHR fallback path)
+  outputs:
+    create:
+    - frontend/src/stores/xhrStreamHandler.svelte.ts (new — long-poll fallback)
+    - frontend/src/stores/xhrStreamHandler.test.ts
+    modify:
+    - frontend/src/stores/wsConnection.svelte.ts (on WS error, fall through to XHR if probe fails)
+  acceptance_criteria:
+  - WS connection failure triggers XHR long-poll probe (`GET /api/stream?since=<eid>`)
+  - XHR events dedupe against maxEidTracker (no duplicate messages)
+  - 'Reconnect transitions: WS → XHR → WS on next page load'
+  - 'Test: simulate WS error → XHR handler activates; eid-based dedup verified'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Captive portal detection: HEAD /ping probe with 3s timeout (cross-reference R#8 OnlineChecker).'
+- id: W5-T02
+  title: R#8 OnlineChecker + HEAD /ping + 30s poll
+  description: 'Port IRCCloud''s OnlineChecker: HEAD /ping probe; 30s interval poll; onlineChange event dispatches to wsConnection.'
+  wave: 5
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/stores/wsConnection.svelte.ts (existing reconnect loop)
+    irccloud: irccloud-webpack-study/app/src/onlinechecker.js:1-76 (full OnlineChecker pattern)
+  outputs:
+    create:
+    - frontend/src/lib/onlineChecker.ts (new — port of onlinechecker.js)
+    - frontend/src/lib/onlineChecker.test.ts
+    modify:
+    - frontend/src/stores/wsConnection.svelte.ts (subscribe to onlineChange event)
+  acceptance_criteria:
+  - OnlineChecker polls HEAD /ping every 30s
+  - Online/offline state exposed via onlineChange event
+  - wsConnection pauses reconnect when offline; resumes when online
+  - 'Test: simulate offline event → reconnect timeout paused'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'Spec reference: irccloud-webpack-study/app/src/onlinechecker.js:1-76.'
+- id: W5-T03
+  title: R#7 Notification notStore + tag dedup + Linux body escape (reuse existing escapeHtml)
+  description: Add notStore map for GC safety; Linux body HTML escape REUSING existing `escapeHtml` from frontend/src/lib/utils.ts:4 (M4 fix — NOT DOMParser; matches IRCCloud escapeHtmlMinimal behavior
+    at ircformatter.js:131-141 which escapes only &, <, >, ").
+  wave: 5
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/lib/notifications.ts:33-68 (existing notify function) + frontend/src/lib/utils.ts:4 (existing escapeHtml — REUSE)
+    irccloud: irccloud-webpack-study/app/src/irccloudnotifier.js:6-7 (notStore), ircformatter.js:131-141 (escapeHtmlMinimal — escape &, <, >, ")
+  outputs:
+    modify:
+    - frontend/src/lib/notifications.ts (add notStore map; import + use existing escapeHtml from lib/utils.ts for Linux body escape)
+    - frontend/src/lib/notifications.test.ts (extend with notStore + Linux escape cases)
+  acceptance_criteria:
+  - notStore retains Notification refs to prevent GC loss of onclick handlers
+  - 'Linux body escape: detect `navigator.userAgent` matches Linux; REUSE existing escapeHtml from frontend/src/lib/utils.ts:4 (NOT new DOMParser)'
+  - 'Escaped body matches IRCCloud''s `escapeHtmlMinimal` behavior: escapes `&`, `<`, `>`, `"` (does NOT escape single quote — matches IRCCloud reference)'
+  - 'Tag-based dedup: identical tag replaces existing notification (per IRCCloud pattern)'
+  - 'Test: simulate Linux UA → body is escaped via existing escapeHtml; notStore retains notification ref'
+  - No new escape logic added; only import + use existing utility
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: 'M4 critic fix: reuse existing escapeHtml from frontend/src/lib/utils.ts:4 (already tested at frontend/src/lib/utils.test.ts:19-46). DO NOT use DOMParser. Notification body matches IRCCloud''s
+    escapeHtmlMinimal (4 entities: &, <, >, ").'
+- id: W5-T04
+  title: R#21 inputHistory multiline gating (already matched + visual wrap check)
+  description: Multiline gating already implemented at InputArea.svelte:189-202 + InputHistory.isMultiline. Verify + check visual wrap on multiline paste.
+  wave: 5
+  agent: gem-implementer
+  status: already_matched
+  dependencies: []
+  conflicts_with:
+  - frontend/src/lib/inputHistory.ts:106-108 (isMultiline)
+  - frontend/src/components/InputArea.svelte:189,202 (gate)
+  inputs:
+    ircfiber: frontend/src/lib/inputHistory.ts:106-108 + frontend/src/components/InputArea.svelte:188-209
+    irccloud: N/A — already mirrored
+  outputs:
+    produce:
+    - verification note (no code change expected)
+    - 'minor: ensure textarea autoResize handles multiline (already in InputArea.svelte:296)'
+  acceptance_criteria:
+  - Verify isMultiline gates ArrowUp/ArrowDown correctly
+  - Verify textarea renders pasted multi-line text with proper wrap (no overflow)
+  review_depth: lightweight
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Already implemented. Listed for traceability.
+- id: W5-T05
+  title: R#24 Member lastSpoke/lastHighlighted merge on reload (Redis hash with debounce)
+  description: 'Persist Member.lastSpoke + lastHighlighted to Redis hash `member-activity:<networkId>:<nick>` with 30-second debounce per key + skip no-op writes (delta < 60s); restore on member rejoin
+    (re-sync). m5 fix: explicit storage location + write throttling to avoid Mongo hot-write path (PM11).'
+  wave: 5
+  agent: gem-implementer
+  status: pending
+  dependencies: []
+  conflicts_with: []
+  inputs:
+    ircfiber: frontend/src/lib/tabCompletion.ts:57-58 (uses lastSpoke + lastHighlighted) + ircStore.svelte.ts (Member type)
+    irccloud: 'Pattern: IRCCloud persists member activity across reload'
+  outputs:
+    modify:
+    - source/ircfiber/db/redis.d (add `member-activity:<networkId>:<nick>` hash with 30s debounce per key)
+    - source/ircfiber/engine/processor.d (debounced persist; skip if delta < 60s)
+    - frontend/src/stores/ircStore.svelte.ts (merge incoming member activity with local cache on re-sync; fetch on member rejoin)
+  acceptance_criteria:
+  - Member.lastSpoke + lastHighlighted persist across page reload
+  - 'Storage: Redis hash `member-activity:<networkId>:<nick>` (NOT Mongo) — PM11 mitigation against Mongo hot-write'
+  - 30-second debounce per (networkId, nick) key on writes
+  - 'Skip no-op writes: delta < 60s does not trigger write (avoid pointless Redis churn)'
+  - On rejoin (resync), preserved values are merged into fresh Member objects (highest timestamp wins)
+  - 'Test: simulate reload → Member with lastSpoke=10min-ago retains timestamp'
+  - 'Test: rapid message burst in busy channel → only 1 write per 30s per nick (debounce verified)'
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  high_risk_signals:
+  - schema_change
+  - hot_write_path
+  notes: 'm5 critic fix: storage = Redis hash member-activity:<networkId>:<nick> (NOT NetworkConfig blob). PM11 mitigation: 30s debounce + 60s delta skip. This IS a schema_change — flagged as high_risk_signal.'
+- id: W5-T06
+  title: W5-REV reviewer gate (full depth)
+  description: 'Reviewer audits resilience features: XHR fallback correctness, online checker reliability, notification GC safety, member merge logic.'
+  wave: 5
+  agent: gem-reviewer
+  status: pending
+  dependencies:
+  - W5-T01
+  - W5-T02
+  - W5-T03
+  - W5-T04
+  - W5-T05
+  conflicts_with: []
+  inputs:
+    ircfiber: All W5 implementation diffs
+    irccloud: xhrstreamhandler.js + onlinechecker.js + irccloudnotifier.js references
+  outputs:
+    produce:
+    - review-verdict-w5.md
+  acceptance_criteria:
+  - XHR fallback dedup verified via maxEidTracker
+  - Online checker pause/resume reconnect loop verified
+  - Notification notStore + Linux escape tests pass
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: BLOCKS W5-DEPLOY.
+- id: W5-T07
+  title: W5-DEPLOY make update to ircfiber-ovh-1
+  description: 'Deploy Wave 5: engine changes (XHR/online/notStore persistence) + frontend dist. Uses graceful handoff.'
+  wave: 5
+  agent: gem-devops
+  status: pending
+  dependencies:
+  - W5-T06
+  conflicts_with: []
+  inputs:
+    ircfiber: Makefile:1299 (`update`) + Makefile:1351 (`handoff`)
+    irccloud: N/A
+  outputs:
+    execute:
+    - '`make update` (engine rebuild + frontend push)'
+    - Verify handoff preserves IRC sockets via /api/admin/handoff/status
+  acceptance_criteria:
+  - OVH gateway running new gateway; engine hot-reloaded without IRC disconnect
+  - XHR fallback activates on simulated WS error
+  - OnlineChecker polls /ping every 30s
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  devops_security_sensitive: true
+  environment: production
+  requires_approval: true
+  notes: Final deploy; verify handoff completes cleanly before announcing GA.
+- id: W5-T08
+  title: W5-DOCS CHANGELOG + resilience guide
+  description: CHANGELOG entry for Wave 5; user-facing resilience guide (XHR fallback, online checker, notification dedup).
+  wave: 5
+  agent: gem-documentation-writer
+  status: pending
+  dependencies:
+  - W5-T06
+  conflicts_with: []
+  inputs:
+    ircfiber: All W5 implementation diffs
+    irccloud: N/A
+  outputs:
+    modify:
+    - docs/CHANGELOG.md (Wave 5 section + GA announcement)
+    create:
+    - docs/RESILIENCE.md (corporate proxy support, offline behavior, notification handling)
+  acceptance_criteria:
+  - RESILIENCE.md covers captive portal, corporate proxy, Linux notification body escape
+  - CHANGELOG announces full GA of all 34 IRCCloud-parity items
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Final docs ship; entry doubles as GA announcement.
+- id: W5-T09
+  title: W5 resilience tests
+  description: Tests for XHR fallback, online checker, notification notStore/Linux escape, member activity merge.
+  wave: 5
+  agent: gem-implementer
+  status: pending
+  dependencies:
+  - W5-T01
+  - W5-T02
+  - W5-T03
+  - W5-T05
+  conflicts_with: []
+  inputs:
+    ircfiber: Existing test patterns; W1/W2 protocol test scaffolding
+    irccloud: N/A
+  outputs:
+    modify:
+    - frontend/src/lib/notifications.test.ts (extend with Linux escape cases)
+    - frontend/src/App.test.ts (extend with XHR fallback flow)
+    create:
+    - frontend/src/lib/onlineChecker.test.ts
+    - frontend/src/stores/xhrStreamHandler.test.ts
+  acceptance_criteria:
+  - All tests pass; coverage ≥ 80% for new code
+  - XHR fallback tested with fake fetch + maxEidTracker
+  - Online checker tested with fake timers + offline events
+  review_depth: full
+  flags:
+    flaky: false
+    retries_used: 0
+    requires_design_validation: false
+  notes: Final test pass before GA.

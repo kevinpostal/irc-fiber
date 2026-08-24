@@ -1,0 +1,55 @@
+{
+  "annotations": {"list": []},
+  "description": "Distributed tracing for IRC Fiber. Use the Explore link to search traces via TraceQL. Correlate trace IDs with Loki logs.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Distributed Traces: IRC Fiber Engine",
+      "type": "text",
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 0},
+      "options": {
+        "mode": "markdown",
+        "content": "## Distributed Traces: IRC Fiber Engine\n\n**[Open Explore → Tempo](/grafana/explore?schemaVersion=1&panes=%7B%22traces%22%3A%7B%22datasource%22%3A%22Tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7B.service.name%20%3D%20%5C%22ircfiber-engine%5C%22%7D%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22now-1h%22%2C%22to%22%3A%22now%22%7D%7D%7D&orgId=1)** with this TraceQL query pre-loaded:\n\n```\n{.service.name = \"ircfiber-engine\"}\n```\n\nClick a trace in the results to open its waterfall. From any span, use **Traces to logs** to pivot to the matching Loki log line(s)."
+      }
+    },
+    {
+      "id": 3,
+      "title": "Engine logs — search by event or network",
+      "type": "logs",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 18, "w": 24, "x": 0, "y": 4},
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [{
+        "refId": "A",
+        "datasource": {"type": "loki", "uid": "Loki"},
+        "expr": "{job=\"ircfiber_containers\", component=\"engine-ovh\"}",
+        "queryType": "range"
+      }]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["ircfiber", "tracing", "tempo"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Distributed Traces",
+  "uid": "ircfiber-distributed-traces",
+  "version": 1,
+  "weekStart": ""
+}

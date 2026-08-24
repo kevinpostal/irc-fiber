@@ -1,0 +1,177 @@
+{
+  "annotations": {"list": []},
+  "description": "Per-container log volume and error/warn rates. One row per IRC Fiber container.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Volumes",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "id": 100,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "title": "Log volume per container (lines/sec)",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 1},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "mean", "max"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "spanNulls": false},
+          "color": {"mode": "palette-classic"}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (container_name) (rate({job=\"ircfiber_containers\"}[$__interval]))",
+          "legendFormat": "{{container_name}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "ERROR rate by container",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 11},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10},
+          "color": {"mode": "fixed", "fixedColor": "red"}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (container_name) (rate({job=\"ircfiber_containers\", level=\"error\"}[$__interval]))",
+          "legendFormat": "{{container_name}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "WARN rate by container",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 11},
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10},
+          "color": {"mode": "fixed", "fixedColor": "yellow"}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (container_name) (rate({job=\"ircfiber_containers\", level=\"warn\"}[$__interval]))",
+          "legendFormat": "{{container_name}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Per-container log totals (1h)",
+      "type": "bargauge",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 20},
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1000}, {"color": "red", "value": 100000}]}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (container_name) (count_over_time({job=\"ircfiber_containers\"}[1h]))",
+          "legendFormat": "{{container_name}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Errors by component",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 29},
+      "collapsed": false,
+      "id": 101,
+      "panels": []
+    },
+    {
+      "id": 5,
+      "title": "Recent errors (last 1h)",
+      "type": "logs",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 14, "w": 24, "x": 0, "y": 30},
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "{job=\"ircfiber_containers\", level=~\"error|warn\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["ircfiber", "containers", "health"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Container Health",
+  "uid": "ircfiber-container-health",
+  "version": 1,
+  "weekStart": ""
+}

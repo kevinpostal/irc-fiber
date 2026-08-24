@@ -1,0 +1,63 @@
+---
+- name: Ensure SigNoz bridge config dir exists
+  ansible.builtin.file:
+    path: /etc/ircfiber/signoz-bridge
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render OTEL collector config
+  ansible.builtin.template:
+    src: otel-collector-config.yaml.j2
+    dest: /etc/ircfiber/signoz-bridge/otel-collector-config.yaml
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart otel bridge
+
+- name: Pull bridge collector image
+  community.docker.docker_image:
+    name: "{{ signoz_bridge_image }}"
+    source: pull
+    state: present
+  when: docker_registry_url | length == 0
+
+- name: Ensure ircfiber_net network exists (gateway/engine live here)
+  community.docker.docker_network:
+    name: ircfiber_net
+    state: present
+  when: not (ircfiber_net_external | default(false))
+
+- name: Run ircfiber-otel-collector
+  community.docker.docker_container:
+    name: "{{ signoz_bridge_container }}"
+    image: "{{ signoz_bridge_image }}"
+    state: started
+    restart_policy: unless-stopped
+    user: "0"   # numeric root UID; required for /var/run/docker.sock access (docker_stats receiver). Distroless image has no `root` user entry.
+    command:
+      - "--config=/etc/otelcol/config.yaml"
+    networks_cli_compatible: true
+    networks:
+      - name: "{{ signoz_bridge_networks[0] }}"
+        aliases:
+          - ircfiber-signoz-otel    # matches the engine's configureTracing() call
+          - ircfiber-otel-collector # matches the hardcoded default in tracing.d
+      - name: "{{ signoz_bridge_networks[1] }}"
+    volumes:
+      - /etc/ircfiber/signoz-bridge/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/lib/docker/volumes/ircfiber_caddy_data/_data:/var/lib/docker/volumes/ircfiber_caddy_data/_data:ro
+    security_opts:
+      - "no-new-privileges:true"
+    memory: "{{ signoz_bridge_mem }}"
+    cpus: "{{ signoz_bridge_cpus }}"
+    # Distroless image — binary is /signoz-otel-collector, no shell/wget.
+    # No validate subcommand exists. restart: unless-stopped handles crashes.
+    healthcheck:
+      disable: true
+    labels:
+      com.ircfiber.component: "otel-bridge"
+      com.ircfiber.version: "{{ ircfiber_version | default('0.3.0') }}"

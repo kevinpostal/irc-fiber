@@ -1,0 +1,75 @@
+---
+# IRC Fiber — deploy Loki + Promtail + Grafana logging stack.
+#
+# Stack topology:
+#   grafana  → UI on ircfiber-grafana:3000, served externally via Caddy at /grafana/*
+#   loki     → log storage on ircfiber-loki:3100 (Promtail-only ingestion)
+#   promtail → scrapes /var/lib/docker/containers/*/*-json.log, ships to loki
+#
+# All three containers join the dedicated ircfiber_logging Docker bridge
+# network. Promtail mounts /var/run/docker.sock read-only to discover
+# containers — no host access otherwise.
+#
+# Storage:
+#   Loki chunks live in a named Docker volume (ircfiber_loki_data).
+#   Backed by ext4 — no replication, but acceptable for single-host.
+#   Retention: 30 days default (configurable in defaults/main.yml).
+#
+# Auth:
+#   Grafana runs with auth_proxy_enabled — trusts the X-WebAuth-User
+#   header set by Caddy. The container is NOT exposed publicly without
+#   Caddy in front. NEVER bind the Grafana port to the host.
+
+- name: Deploy IRC Fiber logging stack
+  hosts: ircfiber
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Ensure logging stack dependencies are present
+      ansible.builtin.include_role:
+        name: docker
+
+    - name: Ensure logging stack config dirs exist
+      ansible.builtin.include_role:
+        name: logging
+
+  tasks:
+    - name: Deploy the stack
+      ansible.builtin.include_role:
+        name: logging
+        tasks_from: main
+
+    - name: Re-render Caddyfile to include /grafana proxy route
+      ansible.builtin.include_role:
+        name: caddy
+        tasks_from: main
+
+  post_tasks:
+    - name: Wait for Loki /ready (via docker exec)
+      ansible.builtin.command:
+        cmd: "docker exec ircfiber-loki wget -qO- http://127.0.0.1:3100/ready"
+      register: loki_health
+      changed_when: false
+      until: loki_health.rc == 0 and (loki_health.stdout | trim) == 'ready'
+      retries: 12
+      delay: 5
+      failed_when: false
+
+    - name: Wait for Grafana /api/health (via docker exec)
+      ansible.builtin.command:
+        cmd: "docker exec ircfiber-grafana wget -qO- http://127.0.0.1:3000/api/health"
+      register: grafana_health
+      changed_when: false
+      until: grafana_health.rc == 0 and (grafana_health.stdout | trim) != ''
+      retries: 12
+      delay: 5
+      failed_when: false
+
+    - name: Report health
+      ansible.builtin.debug:
+        msg: |
+          Logging stack deployment result:
+            - Loki:    {{ 'OK' if (loki_health.rc | default(-1)) == 0 else 'FAILED' }} (stdout: {{ (loki_health.stdout | default('n/a')) | trim }})
+            - Grafana: {{ 'OK' if (grafana_health.rc | default(-1)) == 0 else 'FAILED' }} (stdout: {{ (grafana_health.stdout | default('n/a')) | trim }})
+          External URL: https://{{ ircfiber_domain }}/grafana/

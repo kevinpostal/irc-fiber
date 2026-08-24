@@ -1,0 +1,237 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e3]:
+      - link "IRC Fiber home" [ref=e4] [cursor=pointer]:
+        - /url: /
+        - img [ref=e6]
+        - generic [ref=e8]: IRCFiber
+      - navigation "Primary" [ref=e9]:
+        - link "Preview" [ref=e10] [cursor=pointer]:
+          - /url: "#preview"
+        - link "Features" [ref=e11] [cursor=pointer]:
+          - /url: "#features"
+        - link "How it works" [ref=e12] [cursor=pointer]:
+          - /url: "#how"
+        - link "Pricing" [ref=e13] [cursor=pointer]:
+          - /url: "#pricing"
+        - link "FAQ" [ref=e14] [cursor=pointer]:
+          - /url: "#faq"
+      - form "Sign in" [ref=e15]:
+        - textbox "Username" [ref=e16]
+        - textbox "Password" [ref=e17]
+        - button "Sign in" [ref=e18] [cursor=pointer]
+      - link "Start free →" [ref=e19] [cursor=pointer]:
+        - /url: "#cta"
+        - text: Start free
+        - generic [ref=e20]: →
+  - generic "Supported IRC networks" [ref=e21]:
+    - generic [ref=e22]:
+      - generic [ref=e23]:
+        - generic [ref=e24]: ">"
+        - text: networks
+      - generic [ref=e25]: Libera
+      - generic [ref=e26]: OFTC
+      - generic [ref=e27]: hackint
+      - generic [ref=e28]: EFnet
+      - generic [ref=e29]: QuakeNet
+      - generic [ref=e30]: Undernet
+      - generic [ref=e31]: DALnet
+      - generic [ref=e32]: IRCNet
+      - generic [ref=e33]: Rizon
+      - generic [ref=e34]: 100+
+      - generic [ref=e35]:
+        - generic [ref=e36]: ">"
+        - text: networks
+      - generic [ref=e37]: Libera
+      - generic [ref=e38]: OFTC
+      - generic [ref=e39]: hackint
+      - generic [ref=e40]: EFnet
+      - generic [ref=e41]: QuakeNet
+      - generic [ref=e42]: Undernet
+      - generic [ref=e43]: DALnet
+      - generic [ref=e44]: IRCNet
+      - generic [ref=e45]: Rizon
+      - generic [ref=e46]: 100+
+  - main [ref=e47]:
+    - generic [ref=e50]:
+      - generic [ref=e51]:
+        - generic [ref=e53]: Now in public beta
+        - generic [ref=e54]: ·
+        - generic [ref=e55]: free tier — no credit card
+      - heading "IRC that remembers everything." [level=1] [ref=e56]:
+        - text: IRC that remembers
+        - generic [ref=e57]: everything.
+      - paragraph [ref=e58]: A cloud-hosted bouncer that keeps you connected and your history searchable. Open IRC in any browser, on any device, pick up exactly where you left off — even after a week offline.
+      - generic [ref=e59]:
+        - link "Start free →" [ref=e60] [cursor=pointer]:
+          - /url: "#cta"
+          - text: Start free
+          - generic [ref=e61]: →
+        - link "See it in action" [ref=e62] [cursor=pointer]:
+          - /url: "#preview"
+      - generic [ref=e63]:
+        - generic [ref=e64]:
+          - generic [ref=e65]: License
+          - generic [ref=e66]: Apache 2.0
+        - generic [ref=e67]:
+          - generic [ref=e68]: Networks
+          - generic [ref=e69]: 100+
+        - generic [ref=e70]:
+          - generic [ref=e71]: Stack
+          - generic [ref=e72]: Svelte 5 · D
+        - generic [ref=e73]:
+          - generic [ref=e74]: History
+          - generic [ref=e75]: Indefinite
+    - generic [ref=e81]:
+      - generic [ref=e82]:
+        - generic [ref=e83]: Preview
+        - heading "The IRC client you already know — in your browser." [level=2] [ref=e84]
+        - paragraph [ref=e85]: Network tree on the left, message stream in the middle, member roster on the right. Tab complete, slash commands, mIRC formatting — all in your browser, all in sync across every device you sign in from.
+      - generic [ref=e86]:
+        - generic [ref=e87]:
+          - generic [ref=e88]: fiber://preview
+          - generic [ref=e89]: "live · #design @ libera"
+        - generic [ref=e91]:
+          - generic [ref=e92]
+          - generic [ref=e96]
+          - generic [ref=e106]
+          - generic [ref=e130]
+          - generic [ref=e147]
+    - generic [ref=e156]:
+      - generic [ref=e157]:
+        - generic [ref=e158]: Features
+        - heading "Everything you'd expect from a serious IRC client." [level=2] [ref=e159]
+        - paragraph [ref=e160]: The same IRC you already know — the bouncer, the slash commands, the mode prefixes, the formatting — running in a browser, on our infrastructure, synced to every device you sign in from.
+      - generic [ref=e161]:
+        - generic [ref=e162]:
+          - generic [ref=e163]: 01 / always-on
+          - heading "#always-connected" [level=3] [ref=e164]
+          - paragraph [ref=e165]: Our edge fleet of bouncers stays in the channel 24/7. Power off your laptop, take a flight, lose wifi — when you sign back in, every message is waiting.
+          - generic [ref=e166]
+        - generic [ref=e171]:
+          - generic [ref=e172]: 02 / scrollback
+          - heading "#full-history" [level=3] [ref=e173]
+          - paragraph [ref=e174]: Every message, in every buffer, stored in our cloud. Scroll back through a week of conversation or a year — same scrollback, same slash commands.
+          - generic [ref=e175]
+        - generic [ref=e180]:
+          - generic [ref=e181]: 03 / sync
+          - heading "#any-device" [level=3] [ref=e182]
+          - paragraph [ref=e183]: Modern web app that works in every browser, on every device. Open it on your phone, switch to a desktop, jump to a tablet — the same buffers follow you.
+          - generic [ref=e184]
+        - generic [ref=e189]:
+          - generic [ref=e190]: 04 / networks
+          - heading "#multi-network" [level=3] [ref=e191]
+          - paragraph [ref=e192]: 100+ IRC networks preconfigured — Libera, OFTC, hackint, EFnet, QuakeNet, and more. Add your own private network with one form.
+          - generic [ref=e193]
+        - generic [ref=e198]:
+          - generic [ref=e199]: 05 / search
+          - heading "#fast-search" [level=3] [ref=e200]
+          - paragraph [ref=e201]: Instant full-text search across every buffer, every network, every device. Find a link someone shared years ago or every mention of your nick in the last 30 days.
+          - generic [ref=e202]
+        - generic [ref=e207]:
+          - generic [ref=e208]: 06 / themes
+          - heading "#beautiful-ui" [level=3] [ref=e209]
+          - paragraph [ref=e210]: "Themes: dark, midnight, compact, monospace, custom CSS. mIRC formatting with 16 base colors and hex RGB. Emoji picker, file uploads, pastebin."
+          - generic [ref=e211]
+    - generic [ref=e221]:
+      - generic [ref=e222]:
+        - generic [ref=e223]: How it works
+        - heading "Three steps. Thirty seconds." [level=2] [ref=e224]
+        - paragraph [ref=e225]: No servers to provision. No Docker to learn. No config to write. Sign up, add a network, start chatting — the same buffers follow you across every device.
+      - generic [ref=e226]:
+        - generic [ref=e227]:
+          - generic [ref=e229]: 01 / sign up
+          - heading "Create your account" [level=3] [ref=e230]
+          - paragraph [ref=e231]: Email + password (or your Google/GitHub account), and you're in. No credit card on the free tier, no trial countdown.
+          - generic [ref=e232]
+        - generic [ref=e242]:
+          - generic [ref=e244]: 02 / connect
+          - heading "Add an IRC network" [level=3] [ref=e245]
+          - paragraph [ref=e246]: 100+ public networks preconfigured, or paste a custom server. SASL PLAIN, EXTERNAL, or SCRAM-SHA-256. We keep the connection alive.
+          - generic [ref=e247]
+        - generic [ref=e262]:
+          - generic [ref=e264]: 03 / anywhere
+          - heading "Pick up on any device" [level=3] [ref=e265]
+          - paragraph [ref=e266]: Open the web app, join a channel, start typing. Close the tab, switch devices, come back tomorrow — the same buffers and scrollback, in sync.
+          - generic [ref=e267]
+    - generic [ref=e287]:
+      - generic [ref=e288]:
+        - generic [ref=e289]: Pricing
+        - heading "One fair price." [level=2] [ref=e290]
+        - paragraph [ref=e291]: IRC for the price of a coffee. Free tier is a real product — Pro is the price of a vending machine latte.
+      - generic [ref=e292]:
+        - generic [ref=e293]:
+          - heading "Free" [level=3] [ref=e295]
+          - generic [ref=e296]
+          - paragraph [ref=e299]: For the casual channel lurker.
+          - list [ref=e300]
+          - link "Start free" [ref=e315] [cursor=pointer]:
+            - /url: "#cta"
+        - generic [ref=e316]:
+          - generic [ref=e317]
+          - generic [ref=e320]
+          - paragraph [ref=e323]: For people who live in IRC. The price of a coffee.
+          - list [ref=e324]
+          - link "Go pro →" [ref=e340] [cursor=pointer]:
+            - /url: "#cta"
+      - generic [ref=e342]:
+        - generic [ref=e343]: →
+        - generic [ref=e344]: Pro is billed monthly. Cancel any time and export your scrollback before your account closes.
+    - generic [ref=e350]:
+      - generic [ref=e351]:
+        - generic [ref=e352]: FAQ
+        - heading "Common questions, honest answers." [level=2] [ref=e353]
+        - paragraph [ref=e354]:
+          - text: If yours isn't here, ask in
+          - link "#ircfiber @ libera" [ref=e355] [cursor=pointer]:
+            - /url: ircs://irc.libera.chat/ircfiber
+          - text: or email
+          - link "team@ircfiber.com" [ref=e356] [cursor=pointer]:
+            - /url: mailto:team@ircfiber.com
+          - text: .
+      - generic [ref=e357]:
+        - group [ref=e358]:
+          - generic "01 Where are my messages stored? +" [ref=e359] [cursor=pointer]
+        - group [ref=e362]:
+          - generic "02 Do I need to install anything? +" [ref=e363] [cursor=pointer]
+        - group [ref=e366]:
+          - generic "03 What if I already use a desktop client like WeeChat or HexChat? +" [ref=e367] [cursor=pointer]
+        - group [ref=e370]:
+          - generic "04 Can I add my own private IRC network? +" [ref=e371] [cursor=pointer]
+        - group [ref=e374]:
+          - generic "05 What happens if I cancel? +" [ref=e375] [cursor=pointer]
+    - generic [ref=e384]:
+      - generic [ref=e385]: Get started
+      - heading "Stop missing messages." [level=2] [ref=e386]
+      - paragraph [ref=e387]: Sign up in 30 seconds. No credit card for the free tier. Your history is searchable from every device the moment you join your first channel.
+      - generic [ref=e388]:
+        - link "Create account →" [ref=e389] [cursor=pointer]:
+          - /url: /register
+          - text: Create account
+          - generic [ref=e390]: →
+        - link "Watch a tour" [ref=e391] [cursor=pointer]:
+          - /url: "#preview"
+      - paragraph [ref=e392]: no credit card · no trial countdown · cancel any time, take your scrollback with you
+  - contentinfo [ref=e393]:
+    - generic [ref=e394]:
+      - generic [ref=e395]:
+        - generic [ref=e396]:
+          - link "IRC Fiber home" [ref=e397] [cursor=pointer]:
+            - /url: /
+          - paragraph [ref=e402]: A cloud-hosted IRC bouncer and web app. We run the bouncer, you run the conversation. Multi-region edge fleet, indefinite scrollback, every device in sync.
+        - generic [ref=e403]:
+          - heading "Product" [level=4] [ref=e404]
+          - list [ref=e405]
+        - generic [ref=e416]:
+          - heading "Company" [level=4] [ref=e417]
+          - list [ref=e418]
+        - generic [ref=e423]:
+          - heading "Resources" [level=4] [ref=e424]
+          - list [ref=e425]
+      - generic [ref=e430]:
+        - generic [ref=e431]: cloud-hosted IRC client + bouncer
+        - generic [ref=e433]:
+          - text: built with
+          - link "GSAP /ui/" [ref=e434] [cursor=pointer]:
+            - /url: https://gsap.com/ui/
+        - generic [ref=e436]: © 2026 IRC Fiber

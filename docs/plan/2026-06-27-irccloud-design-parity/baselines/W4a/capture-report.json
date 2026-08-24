@@ -1,0 +1,46 @@
+{
+  "task_id": "W4a-T13",
+  "captured_at": "2026-06-27T22:37:00Z",
+  "target": "http://localhost:5173 (dev server, backend via docker-compose, connected to Libera.Chat #ircfiber)",
+  "baselines_dir": "docs/plan/2026-06-27-irccloud-design-parity/baselines/W4a/",
+  "status": "completed",
+  "flows": { "passed": 10, "failed": 2 },
+  "console_errors": 4,
+  "network_failures": 0,
+  "a11y_issues": 0,
+  "screenshots_captured": [
+    { "file": "settings-design-tab.png", "focus": "Settings section dividers (Design tab)", "description": "Default dark theme; Interface, Sidebar, Messages, Theme sections visible with natural divider spacing" },
+    { "file": "settings-account-tab.png", "focus": "Settings section dividers (Account tab)", "description": "Account settings layout with profile fields section division" },
+    { "file": "settings-notifications-tab.png", "focus": "Settings section dividers (Notifications tab)", "description": "Notification preferences grouped into sections" },
+    { "file": "settings-chat-tab.png", "focus": "Settings section dividers (Chat & embeds tab)", "description": "Chat rendering, embed, and formatting sections" },
+    { "file": "settings-advanced-tab.png", "focus": "Settings section dividers (Advanced tab)", "description": "Advanced settings with experimental toggles" },
+    { "file": "channel-ircfiber-messages.png", "focus": "Themed row backgrounds + message layout", "description": "Self messages visible in #ircfiber; current no tint on .self rows (baseline before W4a-T01)" },
+    { "file": "channel-member-list.png", "focus": "Member list mode-prefix glyphs", "description": "Shows @ prefix glyph for operator (self); only 1 user in channel" },
+    { "file": "connection-status-pill.png", "focus": "Connection-status pill banner", "description": "Network server view showing 'Connected' pill with timing; logs of TCP/TLS/handshake steps" },
+    { "file": "typing-indicator.png", "focus": "Typing indicator + input area", "description": "Input area with typed text; current no dot-bounce animation (baseline before W4a-T07)" },
+    { "file": "channel-empty-test.png", "focus": "Empty/minimal channel state", "description": "#empty-test channel with only join + mode messages; no 'No messages yet' hint (baseline before W4a-T06)" },
+    { "file": "mobile-viewport-audit.png", "focus": "Mobile 44x44 touch-target audit (375x667)", "description": "iPhone SE viewport; current touch targets visible for mobile audit baseline (W4a-T05)" },
+    { "file": "full-channel-view.png", "focus": "Comprehensive full-page layout", "description": "Full app: sidebar, chat area with messages, input area, member list panel" },
+    { "file": "midnight-theme-backcompat.png", "focus": "Midnight theme backward compat (PM9)", "description": "localStorage theme='midnight' applied; verifies #app.midnight-theme selector active (baseline before W4b-T03)" }
+  ],
+  "not_captured": [
+    { "item": "Pending/failed message states (W4a-T04)", "reason": "Requires WS disconnect during message send; would need engine restart mid-flow" },
+    { "item": "Member list away dimming (W4a-T02)", "reason": "No away users on the test channel (only self-op)" },
+    { "item": "Warning/notice/highlight row backgrounds (W4a-T01)", "reason": "Message types not present in channel; highlight requires @nick mention by other user" },
+    { "item": "Connection-pill connecting/reconnect state (W4a-T03)", "reason": "Only connected and disconnected states visible; animated connecting spinner needs engine reconnect capture" }
+  ],
+  "issues": [
+    "Backend returned 500 on /api/networks on first attempt (engine not running); resolved by starting irc_engine container",
+    "Duplicated messages shown in #ircfiber (same content appears twice); appears to be a syncing artifact on the dev setup",
+    "Test IRC server (172.22.0.10:6667) unreachable from backend during first attempt; local ngircd was not running yet",
+    "Mobile viewport (375x667) sidebar tabs become unreachable via click; scroll needed"
+  ],
+  "evidence_path": "docs/plan/2026-06-27-irccloud-design-parity/baselines/W4a/",
+  "learn": [
+    "13 baselines captured across 8 visual focus areas + midnight backcompat + mobile audit",
+    "Pending/failed and away-dimming states need multi-user setup or forced disconnect to trigger",
+    "Midnight theme via localStorage works correctly (PM9 verification baseline captured)",
+    "Dev server needs irc_engine container to handle IRC connections (gateway alone returns 503)",
+    "All W4a implementation tasks are still PENDING — baselines represent pre-change state"
+  ]
+}

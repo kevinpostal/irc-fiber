@@ -1,0 +1,163 @@
+# ============================================================================
+# IRC Fiber — .gitignore
+# ============================================================================
+
+# --- Build artifacts --------------------------------------------------------
+*.o
+irc-fiber
+irc-fiber-engine
+irc-fiber-gateway
+irc-fiber-test
+sync-redis-to-mongo 2
+# Migrator + loadtest binaries — built locally via dub, never committed.
+ircfiber-default-migrate
+ircfiber-loadtest
+# Standalone test binaries (built via `make <test>`).
+# Keep them out of git — they're regenerated on every test run.
+*-test
+!*-test.d
+!*-test.py
+!run-*-tests.sh
+.worktrees/
+.dub/
+dub.userprefs
+# LDC emits CodeView debug info (.cg files) into the working dir when
+# building; not part of the repo.
+*.cg
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+.svelte-kit/
+.vite/
+frontend/dist/
+
+# --- Dependencies -----------------------------------------------------------
+node_modules/
+
+# --- Environment / secrets --------------------------------------------------
+.env
+.env.local
+
+# --- OS files ----------------------------------------------------------------
+.DS_Store
+*~
+*.swp
+*.swo
+
+# --- Logs --------------------------------------------------------------------
+*.log
+server.log
+engine.log
+
+# --- Backups / dev sessions --------------------------------------------------
+.backups/
+.superpowers/
+
+# --- Test artifacts ----------------------------------------------------------
+test-results/
+e2e/test-results/
+e2e/*.png
+coverage/
+.nyc_output/
+# Standalone-test debug binaries not matching the *-test pattern
+# (irc-fiber-test-real is the unit-threaded config, janitor-migrate
+# is the Redis-migration tool). Re-built from source via dub, never
+# committed.
+irc-fiber-test-real
+janitor-migrate
+# Browser-verification screenshots from local dev sessions.
+server-log-*.png
+irc-cloud-*.png
+*.png.snapshot
+# Vitest browser-mode test artifacts.
+.vitest-attachments/
+__screenshots__/
+
+# --- Editor / IDE ------------------------------------------------------------
+.vscode/
+.idea/
+.fleet/
+.zed/
+
+# --- Tooling / generated dirs ------------------------------------------------
+.commandcode/
+.graphify-out/
+.letta/
+.mavis/
+.opencode/
+.playwright-mcp/
+
+# --- Generated analysis / capture data ---------------------------------------
+cloud_css_rules.json
+cloud_msg_css.json
+cloud_spacing.json
+comparison_full.json
+css_comparison.json
+irccloud_*.json
+irccloud_*.txt
+local_*.json
+pad_*.json
+userlist_*.json
+cloud_page.html
+irccloud_chat_css_extracted.md
+graphify-out/
+repomix-output.xml
+scrollback-diagnostic-report.json
+irccloud-webpack-study/
+irccloud_chat_css_categorized.json
+screenshots/
+
+# --- Temp --------------------------------------------------------------------
+tmp/
+temp/
+*.tmp
+
+# --- Secrets (deploy) --------------------------------------------------------
+.vault_pass.txt
+deploy/.vault_pass.txt
+public/dist/
+# --- Docker build stamp (make debug incremental) -------------------------------
+.docker-build-stamp
+
+# Zig build artifacts
+.zig-cache/
+engine/.zig-cache/
+engine/zig-out/
+zig-out/
+zig-pkg/
+
+# --- Reasonix ----------------------------------------------------------------
+.reasonix/
+irc-fiber-engine-linux
+
+
+# APM dependencies
+apm_modules/
+
+# --- Archived-era binaries (Zig engine / conn-holder removed 2026-08-06) -----
+conn-holder-e2e
+conn-holder-test
+draining-test
+exec-reload-integration
+exec-reload-test
+handoff-test
+holder-client-compile-test
+holder-integration-test
+holder-local-engine-test
+# engine/ + backend/ + common/ — D sources (engine/source, backend/source, common/source, views); binaries ignored via irc-fiber* patterns above
+zig-engine-*.tar.gz
+*.pyc
+__pycache__/
+frontend/wasm-img2irc/target/
+
+# Lake build artifacts
+**/.lake/
+
+# Local OVH backups (72M+ each, never commit)
+backups/
+deploy/inventories/production/hosts.ini
+**/vps-efb4b52d.yml

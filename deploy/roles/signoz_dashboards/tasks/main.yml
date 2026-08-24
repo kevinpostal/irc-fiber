@@ -1,0 +1,83 @@
+---
+# Push pre-built SigNoz dashboards to the running instance.
+# Re-runs are idempotent: by-title match → POST or PUT.
+
+- name: Ensure dashboards dir on host
+  ansible.builtin.file:
+    path: "{{ signoz_dashboards_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Copy dashboard JSON files to host
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ signoz_dashboards_dir }}/{{ item | basename }}"
+    owner: root
+    group: root
+    mode: "0644"
+  with_fileglob:
+    - "{{ role_path }}/files/*.json"
+
+- name: Get admin JWT for SigNoz
+  ansible.builtin.uri:
+    url: "http://100.126.197.92:3003/api/v2/sessions/email_password"
+    method: POST
+    body_format: json
+    body:
+      email: "kevindpostal@gmail.com"
+      password: "{{ vault_signoz_admin_password }}"
+      orgId: "{{ signoz_dashboards_org_id }}"
+    status_code: 200
+  register: signoz_login
+  no_log: true
+  delegate_to: ircfiber-ovh-1
+  when: vault_signoz_admin_password | default('') | length > 0
+
+- name: Set SigNoz JWT fact
+  ansible.builtin.set_fact:
+    signoz_jwt: "{{ signoz_login.json.data.accessToken }}"
+
+- name: List existing dashboards
+  ansible.builtin.uri:
+    url: "http://100.126.197.92:3003/api/v1/dashboards"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ signoz_jwt }}"
+    status_code: 200
+  register: existing_dashboards_resp
+  delegate_to: ircfiber-ovh-1
+
+- name: Build title → uuid lookup
+  ansible.builtin.set_fact:
+    dashboard_id_by_title: "{{ dict(existing_dashboards_resp.json.data | map(attribute='title') | zip(existing_dashboards_resp.json.data | map(attribute='id')) | list) }}"
+
+- name: Read each dashboard file
+  ansible.builtin.slurp:
+    src: "{{ signoz_dashboards_dir }}/{{ item }}"
+  register: dashboard_blobs
+  loop: "{{ signoz_dashboards_files }}"
+
+- name: POST each new dashboard, PUT each updated
+  ansible.builtin.uri:
+    url: "http://100.126.197.92:3003/api/v1/dashboards{% if dashboard_id_by_title[(dashboard_blobs.results[item.0].content | b64decode | from_json).title] is defined %}/{{ dashboard_id_by_title[(dashboard_blobs.results[item.0].content | b64decode | from_json).title] }}{% endif %}"
+    method: "{% if dashboard_id_by_title[(dashboard_blobs.results[item.0].content | b64decode | from_json).title] is defined %}PUT{% else %}POST{% endif %}"
+    headers:
+      Authorization: "Bearer {{ signoz_jwt }}"
+      Content-Type: "application/json"
+    body_format: json
+    body: "{{ dashboard_blobs.results[item.0].content | b64decode | from_json }}"
+    status_code: [200, 201]
+    validate_certs: false
+  loop: "{{ range(signoz_dashboards_files | length) | list }}"
+  loop_control:
+    label: "{{ signoz_dashboards_files[item] }}"
+  delegate_to: ircfiber-ovh-1
+  register: dashboard_push_results
+
+- name: Dashboard push summary
+  ansible.builtin.debug:
+    msg: >-
+      Deployed {{ signoz_dashboards_files | length }} dashboards to SigNoz.
+      See https://100.126.197.92:3003/dashboards

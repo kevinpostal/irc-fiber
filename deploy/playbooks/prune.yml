@@ -1,0 +1,45 @@
+---
+# Prune old irc-fiber images (keeps the N most recent tags; default 3).
+# NEVER prunes volumes.
+
+- name: Prune old irc-fiber images
+  hosts: ircfiber
+  become: true
+  gather_facts: false
+  tasks:
+    - name: List irc-fiber image tags sorted by creation date
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          docker images {{ docker_registry_url }}/{{ docker_registry_namespace }}/irc-fiber \
+            --format '{{ "{{" }}.Tag{{ "}}" }}\t{{ "{{" }}.CreatedAt{{ "}}" }}\t{{ "{{" }}.ID{{ "}}" }}' \
+            | grep -v 'latest' \
+            | sort -k2 -r
+      register: image_list
+      changed_when: false
+      failed_when: false
+
+    - name: Identify tags to remove
+      ansible.builtin.set_fact:
+        images_to_remove: >-
+          {{ image_list.stdout_lines
+             | default([])
+             | reject('equalto', '')
+             | slice(image_prune_keep_count)
+             | map('split', '\t')
+             | map('first')
+             | reject('equalto', '<none>')
+             | list }}
+
+    - name: Prune tags
+      ansible.builtin.command: docker rmi {{ docker_registry_url }}/{{ docker_registry_namespace }}/irc-fiber:{{ item }}
+      loop: "{{ images_to_remove }}"
+      when: images_to_remove | length > 0
+      changed_when: true
+      failed_when: false
+
+    - name: Prune dangling images
+      community.docker.docker_prune:
+        images: true
+        images_filters:
+          dangling: true

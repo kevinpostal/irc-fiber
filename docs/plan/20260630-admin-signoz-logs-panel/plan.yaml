@@ -1,0 +1,1553 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAN METADATA
+# ═══════════════════════════════════════════════════════════════════════════
+plan_id: 20260630-admin-signoz-logs-panel
+objective: |
+  Replace the placeholder Logs.svelte with a full enterprise-grade native
+  SigNoz logs panel inside the IRC Fiber admin SPA at /admin#/logs. The panel
+  calls the SigNoz REST API directly through the existing Caddy proxy at
+  /api/v1..5/* (SIGNOZ-API-KEY header injected by Caddy from the EDITOR
+  service account). Live-tail streams over WebSocket through /signoz/ws/logs/*
+  (Caddy v2 auto-handles upgrade in the existing /signoz/* reverse_proxy).
+  A "Open SigNoz ↗" link to the tailnet listener (http://100.126.197.92:3003/logs)
+  remains for advanced features (saved views, pivots, anomalies) that the
+  native panel intentionally does not implement in v1.
+created_at: 2026-06-30T21:42:00Z
+created_by: gem-planner
+status: pending
+tldr: |
+  4-wave plan (18 tasks). Wave 1 (6): signoz.ts lib + logsStore + savedViews
+  store + Vite dev proxy + signozUrl.ts + deploy assertion + test-spike
+  gate. Wave 2 (4): LogRow/LogTable (virtualized) + JsonDrawer overlay +
+  LogsToolbar + FilterCheatsheet + Logs.svelte rewrite. Wave 3 (4): WS
+  preflight + logsLiveTail WS store + toolbar wire + Caddy WS audit.
+  Wave 4 (4): keyboard shortcuts, copy-as-cURL, empty/error states,
+  AGENTS.md update.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAN-LEVEL METRICS
+# ═══════════════════════════════════════════════════════════════════════════
+plan_metrics:
+  wave_1_task_count: 6
+  total_dependencies: 35
+  risk_score: high
+quality_warnings:
+  - "Test coverage spans both lib project (signoz.test.ts) and client project
+    (logsStore.test.ts, logsLiveTail.test.ts, LogRow.svelte.test.ts,
+    LogTable.svelte.test.ts, JsonDrawer.svelte.test.ts,
+    LogsToolbar.svelte.test.ts, Logs.svelte.test.ts). Client tests run in
+    headless Chromium with fileParallelism:false - keep fixtures minimal
+    and deterministic."
+  - "Live-tail WS endpoint /signoz/ws/logs/v5/{orgId} depends on the existing
+    /signoz/* Caddy handler auto-handling the Upgrade header. Caddy v2
+    reverse_proxy does this by default, but the dev-proxy rule in vite.config.ts
+    must mirror it: /signoz must use ws:true (handled in Wave 1)."
+  - "BLOCKER preflight: w3-t0 verifies the WS endpoint against the live
+    SigNoz instance via curl with Sec-WebSocket-Key BEFORE w3-t1 builds
+    logsLiveTail.ts. If 404/502/refused, task exits non-zero with a
+    specific remediation message (VITE_SIGNOZ_URL unset OR ircfiber-caddy
+    missing SIGNOZ_API_KEY OR /signoz/ws/logs/* not in Caddyfile)."
+  - "REVIEWER FINDING (fixed): JSON expand now uses an absolutely-positioned
+    overlay (JsonDrawer.svelte) anchored to the row, NOT inline expansion.
+    The previous inline-expand plan broke the 32px row-height invariant
+    the moment any expanded row's pretty-printed JSON exceeded 32px,
+    throwing off the 20-row overscan offset calculation. Overlay dismisses
+    on Esc, backdrop click, or X button."
+  - "Saved views are localStorage-only in v1 by user requirement. The store
+    API (listViews/saveView/loadView/deleteView) is the future contract for
+    a SigNoz SavedView backend - keep it stable."
+  - "Decision (locked): roll a simple offset-based virtualization (no new
+    dep) for LogTable. Rows are uniform-height; MessageList.svelte's complex
+    windowing is overkill here. Reuses existing CSS variables."
+  - "Cross-wave conflicts_with entries have been removed (w2-t4 <-> w4-t1).
+    Wave ordering already enforces serial execution; same-wave conflicts
+    remain for the rare intra-wave resource contention."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLANNING ANALYSIS (HIGH complexity - full section)
+# ═══════════════════════════════════════════════════════════════════════════
+open_questions:
+  - question: |
+      Is the local dev backend (gateway at 127.0.0.1:8090) configured to
+      proxy /api/v1..5/* to signoz-signoz:8080? If not, every frontend
+      call to /api/v1/services in dev will hit the gateway, return 404,
+      and the panel will look broken even though prod works.
+    context: |
+      Caddy in prod proxies /api/v1..5/* directly to signoz-signoz:8080
+      with SIGNOZ-API-KEY header. The vite dev server currently proxies
+      /api/* to BACKEND_URL (the gateway) which has no SigNoz route. The
+      gateway does not speak SigNoz protocol. This was confirmed via
+      curl http://127.0.0.1:8090/api/v1/services returning 404 today.
+    type: decision_blocker
+    affects:
+      - w1-t3-vite-dev-proxy
+      - w1-t5-deploy-assertion
+  - question: |
+      Does the existing /signoz/* Caddy handler transparently upgrade
+      WebSocket connections to signoz-signoz:8080? If Caddy v2 does not
+      auto-handle the Upgrade header (some hardened configs disable it),
+      the live-tail will silently fail.
+    context: |
+      Caddyfile.j2 line 60-79 sets up handle_path /signoz and /signoz/*
+      with reverse_proxy to signoz-signoz:8080. Caddy v2 reverse_proxy
+      directive auto-detects Upgrade websocket headers and forwards the
+      connection with proper hop-by-hop handling. RESOLVED via w3-t0
+      preflight: the BLOCKER-grade curl + Sec-WebSocket-Key test runs
+      BEFORE logsLiveTail.ts is built, with a clear remediation message
+      on any non-101 response. w3-t3 remains as a secondary audit + patch.
+    type: decision_blocker
+    affects:
+      - w3-t0-ws-preflight
+      - w3-t1-live-tail-store
+      - w3-t3-caddy-ws-audit
+assumptions:
+  - >-
+    SigNoz v5 log query contract is POST /api/v5/query_range with compositeQuery
+    payload (compositeQuery.queryType=builder, builder queries for logs).
+    v1 /api/v1/services returns {data: [{serviceName: "..."}, ...]} per
+    docs/OBSERVABILITY.md.
+  - >-
+    Org ID is discoverable from GET /api/v1/user returning
+    {data: {orgId: "..."}}.
+  - >-
+    WebSocket live-tail endpoint is /ws/logs/v5/{orgId} with query-string
+    filter and start timestamp (SigNoz v0.130 contract). v1 fallback
+    /ws/logs/tail. VERIFIED by w3-t0 preflight BEFORE logsLiveTail.ts is built.
+  - >-
+    SIGNOZ-API-KEY is injected by Caddy ONLY for paths under /signoz/*
+    and /api/v1..5/* (per Caddyfile.j2 lines 36-97). It is NOT injected
+    for /api/admin/* (gateway routes those). Confirmed by Caddyfile scope.
+    The Caddyfile conditional skip when /etc/ircfiber/signoz-mcp/.api_key
+    is missing (no route block, no startup error) is a known operational
+    gap tracked in relevant_context.vite_dev_proxy_gap.
+  - >-
+    Svelte 5.19 with runes ($state, $derived, $props, $effect) -
+    established pattern in admin App.svelte and existing pages.
+  - >-
+    Admin SPA uses hash-based router (no SvelteKit); /admin#/logs already
+    maps to Logs.svelte in App.svelte line 49.
+  - >-
+    Toast pattern via stores/ui.ts toast/toastError/toastWarn helpers -
+    ToastViewport is already mounted at app shell level.
+  - >-
+    Tailnet listener URL is centralised in frontend/src/admin/lib/signozUrl.ts
+    exporting TAILNET_SIGNOZ_URL and TAILNET_SIGNOZ_LOGS_URL. Replaces the
+    hard-coded http://100.126.197.92:3003 in Logs.svelte:15 and the planned
+    duplication in w2-t4. Keeps the IP discoverable for reconfiguration.
+  - >-
+    JSON row expansion lives in a separate JsonDrawer.svelte component
+    rendered as an absolutely-positioned overlay anchored to the clicked
+    row. This preserves the LogTable's fixed 32px row-height invariant
+    and 20-row overscan math (an inline expansion breaks the offset
+    calculation the moment pretty-printed JSON exceeds 32px).
+  - >-
+    WebSocket auto-reconnect with exponential backoff (1s to 30s, jittered)
+    matches the holder-strict-mode retry pattern in source/conn_holder/.
+    Live-status pill states are exactly: 'idle' | 'connecting' | 'open' |
+    'reconnecting' | 'closed' - the implementer does not need to guess.
+  - >-
+    No new dependency needed; svelte-virtual-list is intentionally NOT
+    added (per minimum-viable-plan rule). Offset-based virtualization
+    rolled in-house.
+pre_mortem:
+  overall_risk_level: high
+  critical_failure_modes:
+    - scenario: |
+        Operator runs npm run dev against 127.0.0.1:8090 backend; the
+        gateway returns 404 for /api/v1/services because the gateway has
+        no SigNoz route; panel shows "no services" empty state even
+        though logs exist.
+      likelihood: high
+      impact: high
+      mitigation: |
+        Wave 1 task w1-t3 adds a more specific Vite proxy rule for
+        /api/v1/, /api/v2/, /api/v3/, /api/v4/, /api/v5/, and
+        /signoz/* pointing at a configurable VITE_SIGNOZ_URL (default
+        http://127.0.0.1:8080). If unset, panel renders a clear "SigNoz
+        URL not configured - set VITE_SIGNOZ_URL" empty state. Wave 1
+        task w1-t5 explicitly verifies this end-to-end via curl against
+        ircfiber.com and the dev proxy.
+    - scenario: |
+        Caddy v2 reverse_proxy blocks WebSocket upgrade due to a custom
+        transport block missing flush_interval or WebSocket support
+        settings; live-tail silently never connects.
+      likelihood: low
+      impact: critical
+      mitigation: |
+        Wave 3 task w3-t0 is a BLOCKER preflight: curl + Sec-WebSocket-Key
+        against /signoz/ws/logs/v5/{orgId} runs BEFORE logsLiveTail.ts is
+        built. On non-101, task exits non-zero with a specific remediation
+        message (VITE_SIGNOZ_URL unset OR ircfiber-caddy missing
+        SIGNOZ_API_KEY OR /signoz/ws/logs/* not in Caddyfile). Wave 3 task
+        w3-t3 remains as secondary audit + optional flush_interval -1 patch.
+    - scenario: |
+        Inline-expanded JSON row breaks the LogTable virtualization
+        invariant: 20-row overscan is calculated assuming fixed 32px
+        row height, but the expanded JSON routinely exceeds 32px and
+        shifts every subsequent row offset. Rows render at wrong
+        positions, the user clicks the wrong row, scroll-snap
+        desynchronises from data.
+      likelihood: high
+      impact: high
+      mitigation: |
+        Wave 2 task w2-t1 splits expand UI into a separate JsonDrawer.svelte
+        overlay component. Overlay is absolutely-positioned, anchored to
+        the clicked row's viewport position, dismisses on Esc / backdrop
+        click / X button. LogTable retains the fixed-32px row invariant;
+        JsonDrawer sits in its own stacking context and does not affect
+        table offsets. Tests assert the table height is invariant under
+        expand-collapse cycles.
+    - scenario: |
+        10k+ log rows in a 24h window cause DOM thrash because rows
+        aren't virtualized.
+      likelihood: medium
+      impact: medium
+      mitigation: |
+        Wave 2 LogTable component (w2-t1) uses fixed row height + offset
+        virtualization: render only the visible slice + 20-row overscan
+        buffer. Document the row-height constant in the component.
+    - scenario: |
+        Saved views localStorage quota exceeded - silent write failure -
+        user loses their last query without warning.
+      likelihood: low
+      impact: medium
+      mitigation: |
+        Wave 1 savedViews.ts (w1-t4) wraps every localStorage write in
+        try/catch, prunes to most-recent 50 views on quota error, and
+        surfaces a toast warning when pruning happens.
+    - scenario: |
+        Live-tail WebSocket reconnect storm during SigNoz restart causes
+        1000s of failed WS connections per minute.
+      likelihood: medium
+      impact: medium
+      mitigation: |
+        Wave 3 logsLiveTail.ts (w3-t1) implements exponential backoff with
+        jitter: 1s, 2s, 4s, 8s, 16s, 30s cap, random +/-20 percent jitter,
+        stops retrying after 10 consecutive failures and surfaces a
+        permanent error toast.
+    - scenario: |
+        Org ID discovery via /api/v1/user fails (key rotation in flight)
+        and live-tail can't construct the WS URL.
+      likelihood: low
+      impact: medium
+      mitigation: |
+        logsLiveTail.ts falls back to 'default' org ID with a console.warn
+        and a single toast on first connection attempt. Subsequent fetches
+        of /api/v1/user refresh the org ID.
+    - scenario: |
+        Copy-as-cURL button on rendered query exposes the
+        SIGNOZ-API-KEY if a developer accidentally embeds it client-side.
+      likelihood: very_low
+      impact: critical
+      mitigation: |
+        signoz.ts never sees the API key - the browser only sends
+        relative /api/* requests and Caddy injects the header server-side.
+        cURL export contains ONLY the URL, method, and JSON body. Add a
+        code-comment warning in signoz.ts so future contributors don't
+        accidentally add a header parameter.
+    - scenario: |
+        Caddyfile.j2 signoz_mcp conditional skip is triggered (no route
+        block, no startup error) - ircfiber-caddy comes up but /signoz/*
+        returns 404 because /etc/ircfiber/signoz-mcp/.api_key is missing.
+        Logs panel silently returns empty results.
+      likelihood: medium
+      impact: high
+      mitigation: |
+        Wave 1 task w1-t5 deploy assertion probes
+        https://ircfiber.com/signoz/api/v1/services (or
+        /api/v1/services) and reports a specific remediation message
+        when 404 / connection refused. Wave 3 w3-t3 audit task validates
+        the Caddyfile route block is actually present and SIGNOZ_API_KEY
+        env var is set in the container.
+    - scenario: |
+        Filter syntax confusion (e.g. user types level=ERROR instead
+        of severity_text = 'ERROR') - no results, user has no idea why.
+      likelihood: high
+      impact: low
+      mitigation: |
+        Wave 2 FilterCheatsheet.svelte modal (w2-t3) opens on ? keypress
+        and lists every supported filter field with examples. Also rendered
+        inline as a placeholder hint in the query input.
+coordination_notes:
+  - "Wave 1 must complete before Wave 2; waves 2 and 3 can be parallelized
+    (3 does not depend on UI components, only on signoz.ts)."
+  - "w3-t3 Caddy audit runs in Wave 3 in parallel with w3-t1/t2 - if the
+    audit reveals a missing WS block, gem-implementer for w3-t2 is not
+    blocked because logsLiveTail.ts already retries on connection failure
+    and the toolbar surfaces a clear 'live unavailable' indicator."
+  - "All Svelte components must use Svelte 5 runes ($state, $derived,
+    $props, $effect) - established convention in admin App.svelte and
+    the components/ directory."
+  - "signoz.ts must NOT import anything from svelte/ or svelte/store -
+    keeps it eligible for the lib project test config (node, no DOM,
+    fast). Mirror fuzzyMatch.ts, autolinker.ts patterns."
+  - "All log API calls go through relative URLs (e.g. /api/v5/query_range)
+    - never absolute URLs. Caddy adds the SIGNOZ-API-KEY header server-side."
+  - "Saved views localStorage keys prefixed with ircfiber:admin:logs: to
+    namespace against other admin modules."
+  - "AGENTS.md update (w4-t4) goes last in Wave 4 to reflect the final
+    file layout and the new dev-proxy rule."
+contracts:
+  - from_task: w1-t1-signoz-lib
+    to_task: w1-t2-logs-store
+    interface: |
+      signoz.ts exports: queryRange(req), services(), fields(),
+      fieldValues(name, q?), currentUser(), wsUrl(orgId). All return
+      raw JSON (no {ok,data} envelope - SigNoz API does not use it).
+    format: TypeScript module under frontend/src/lib/signoz.ts
+  - from_task: w1-t2-logs-store
+    to_task: w2-t4-logs-page
+    interface: |
+      logsStore.ts exports: state (Readable), setQuery, setService,
+      setSeverity, setTimeRange, toggleLive, runQuery (debounced 200ms),
+      cancelQuery, resetFilters. LogsState shape: query, services,
+      severities, timeRange, results, loading, error, live, wsReady,
+      expandedRowIds, lastQueryBody.
+    format: Svelte store module under frontend/src/admin/stores/logsStore.ts
+  - from_task: w1-t4-saved-views
+    to_task: w2-t4-logs-page
+    interface: |
+      savedViews.ts exports: views (Readable), saveView(name, q),
+      loadView(id) -> LogsQuery, deleteView(id). SavedView: id, name,
+      query, timeRange, createdAt. localStorage key
+      ircfiber:admin:logs:views.
+    format: Svelte store module under frontend/src/admin/stores/savedViews.ts
+  - from_task: signoz-url-lib
+    to_task: w2-t4-logs-page
+    interface: |
+      signozUrl.ts exports TAILNET_SIGNOZ_URL and TAILNET_SIGNOZ_LOGS_URL
+      constants. Centralises the tailnet listener URL that was previously
+      hard-coded in Logs.svelte:15. Keep the IP discoverable in one place
+      for future reconfiguration. Created as part of w1-t3 (vite-dev-proxy)
+      to bundle all URL constant centralisation in one wave.
+    format: TypeScript module under frontend/src/admin/lib/signozUrl.ts
+  - from_task: w2-t1-log-row-table
+    to_task: w2-t4-logs-page
+    interface: |
+      LogTable emits expand(rowId, anchorRect) when a row is clicked.
+      JsonDrawer.svelte receives (row, anchorRect, onClose) and renders
+      an absolutely-positioned overlay anchored to the row's viewport
+      position. Dismissable via Esc, backdrop click, or X button.
+      LogTable itself never changes height - the overlay sits in its
+      own stacking context and does not affect virtualization math.
+    format: Svelte component under
+      frontend/src/admin/components/logs/JsonDrawer.svelte
+  - from_task: w3-t1-live-tail
+    to_task: w2-t3-logs-toolbar
+    interface: |
+      logsLiveTail.ts exports: startLiveTail(filter, onRow), stopLiveTail(),
+      ready (Readable boolean), error (Readable string|null), status
+      (Readable 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed').
+      Idempotent start/stop. Surfaces status/ready/error via stores so the
+      toolbar status pill renders one of the 5 enumerated states without
+      managing WS state directly.
+    format: Svelte store module under frontend/src/admin/stores/logsLiveTail.ts
+  - from_task: caddy-prod
+    to_task: w2-t4-logs-page
+    interface: |
+      Caddy reverse-proxies /api/v1..5/* to signoz-signoz:8080 with
+      header_up SIGNOZ-API-KEY (already deployed). Caddy reverse-proxies
+      /signoz/* to signoz-signoz:8080 with the same header (already
+      deployed). Caddy v2 auto-handles WebSocket upgrade inside
+      reverse_proxy - BLOCKER-graded preflight (w3-t0) confirms 101
+      against live SigNoz; w3-t3 remains as secondary audit + patch.
+    format: Caddyfile.j2 deploy/roles/caddy/templates/
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TASKS (18 across 4 waves)
+# ═══════════════════════════════════════════════════════════════════════════
+tasks:
+  # ─── Wave 1 — API wrapper, store, dev proxy, saved views ───────────────
+  - id: w1-t1-signoz-lib
+    title: Create frontend/src/lib/signoz.ts - typed SigNoz REST wrapper
+    description: |
+      Pure TypeScript wrapper around the SigNoz REST endpoints. No Svelte
+      imports - eligible for the lib project test config. Wraps fetch
+      with a 15s default timeout, AbortController, and structured error
+      mapping. Returns raw JSON (SigNoz does NOT use the {ok,data}
+      envelope that the gateway uses).
+    wave: 1
+    agent: gem-implementer
+    status: pending
+    covers:
+      - Pure fetch client to /api/v5/query_range, /api/v1/services,
+        /api/v1/logs/fields, /api/v1/values, /api/v1/user
+      - Typed return shapes inferred from SigNoz v0.130 contract
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/lib/fuzzyMatch.ts
+        description: Pattern reference for pure-function lib modules
+      - path: frontend/src/admin/lib/api-client.ts
+        description: Existing admin client - note envelope mismatch
+      - path: docs/OBSERVABILITY.md
+        description: SigNoz API contracts and curl examples (lines 220-310)
+    tech_stack:
+      - typescript
+      - vitest
+    test_coverage: |
+      frontend/src/lib/signoz.test.ts - covers queryRange builder payload,
+      error mapping (ApiError with status 0 for network, status code
+      passthrough), timeout, abort signal, wsUrl construction. Uses
+      vi.stubGlobal(fetch).
+    estimated_files:
+      - frontend/src/lib/signoz.ts
+      - frontend/src/lib/signoz.test.ts
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "signoz.ts exports queryRange, services, fields, fieldValues, currentUser, wsUrl with explicit TypeScript types"
+      - "All functions accept relative paths (no host baked in); no SIGNOZ-API-KEY header is set client-side"
+      - "ApiError thrown on non-2xx with parsed error message from {error: '...'}; status field is the HTTP code"
+      - "Default timeout 15s; AbortSignal supported via opts.signal"
+      - "signoz.test.ts under lib project - uses vi.stubGlobal(fetch), no DOM, no Svelte imports"
+    success_criteria:
+      - "npm run test:lib passes; signoz.test.ts has 8+ cases covering happy-path + each error variant"
+      - "svelte-check passes with no errors in signoz.ts"
+      - "Code comment in signoz.ts top-of-file warns future contributors not to add an API key header"
+    handoff:
+      do_not_reinvestigate:
+        - SigNoz endpoint paths
+        - query payload shape
+        - error envelope
+      required_test_first: frontend/src/lib/signoz.test.ts
+      target_files:
+        - frontend/src/lib/signoz.ts
+      minimal_change: Add one file + one test. No changes to existing files.
+      acceptance_checks:
+        - "npx vitest run --project=lib src/lib/signoz.test.ts exits 0"
+        - "npm run check reports 0 errors in frontend/src/lib/signoz.ts"
+
+  - id: w1-t2-logs-store
+    title: Create frontend/src/admin/stores/logsStore.ts - query state + debounced fetch
+    description: |
+      Svelte writable store wrapping the signoz.ts client. Mirrors the
+      dashboard.ts pattern (named exports + separate loading/error
+      writables). Maintains LogsState, debounces query changes by 200ms
+      before firing a /api/v5/query_range request, supports pagination
+      via limit/offset, exposes a runQuery() function and cancelQuery()
+      for in-flight abort.
+    wave: 1
+    agent: gem-implementer
+    status: pending
+    covers:
+      - LogsState writable, query/service/severity/timeRange mutators
+      - Debounced refetch (200ms), pagination, error mapping
+    dependencies:
+      - w1-t1-signoz-lib
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/admin/stores/dashboard.ts
+        description: Store pattern reference (named writables + fetch fn)
+      - path: frontend/src/admin/stores/polling.ts
+        description: Polling helper pattern (not used here; debounce only)
+      - path: frontend/src/lib/signoz.ts
+        description: Created in w1-t1; consumed here
+    tech_stack:
+      - typescript
+      - svelte/store
+      - vitest
+    test_coverage: |
+      frontend/src/admin/stores/logsStore.test.ts - covers debounce
+      coalescing, abort on cancelQuery, error -> error writable,
+      success -> results writable, severity toggle (multi-select),
+      time-range change triggers refetch after 200ms, persistence
+      round-trip (lastQuery localStorage). Uses vi.useFakeTimers.
+    estimated_files:
+      - frontend/src/admin/stores/logsStore.ts
+      - frontend/src/admin/stores/logsStore.test.ts
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "LogsState exported with explicit TypeScript interface; never any"
+      - "setQuery, setService, setSeverity, setTimeRange, toggleLive, runQuery, cancelQuery, resetFilters exported"
+      - "resetFilters() restores defaults: empty query, all-severities, 5m time range, clears expandedRowIds and lastQueryBody; persists the default lastQuery to localStorage"
+      - "Debounce coalesces multiple setQuery calls within 200ms into a single fetch"
+      - "lastQuery persisted to localStorage key ircfiber:admin:logs:lastQuery and restored on store init"
+      - "logsStore.test.ts under client project - uses vi.useFakeTimers for debounce verification"
+    success_criteria:
+      - "npm run test:client passes; logsStore.test.ts has 10+ cases"
+      - "logsStore exports subscribe cleanly (no leaked promises)"
+      - "store tests run in <500ms with fileParallelism:false"
+    handoff:
+      do_not_reinvestigate:
+        - store pattern shape
+        - debounce semantics
+      required_test_first: frontend/src/admin/stores/logsStore.test.ts
+      target_files:
+        - frontend/src/admin/stores/logsStore.ts
+      minimal_change: Add one store file + one test. No changes to existing files.
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/stores/logsStore.test.ts exits 0"
+        - "logsStore.ts does not import anything from svelte (only svelte/store)"
+
+  - id: w1-t3-vite-dev-proxy
+    title: Add SigNoz dev-proxy rules to frontend/vite.config.ts + centralise tailnet URL constants
+    description: |
+      Investigate whether the gateway at BACKEND_URL (default
+      127.0.0.1:8090) proxies /api/v1..5/* and /signoz/* to SigNoz. If
+      not, add more-specific Vite proxy rules that take precedence over
+      the catch-all /api proxy. The new rules target a configurable
+      VITE_SIGNOZ_URL (default http://127.0.0.1:8080 - the local SigNoz
+      port from docker-compose). Document the env var in a code comment.
+
+      ALSO create frontend/src/admin/lib/signozUrl.ts exporting
+      TAILNET_SIGNOZ_URL and TAILNET_SIGNOZ_LOGS_URL constants. This
+      centralises the tailnet listener URL that was previously hard-coded
+      in Logs.svelte:15 and would otherwise be re-hard-coded by w2-t4.
+      Keep the IP discoverable in one place for future reconfiguration.
+    wave: 1
+    agent: gem-implementer
+    status: pending
+    covers:
+      - Vite server.proxy rules for /api/v1/, /api/v2/, /api/v3/,
+        /api/v4/, /api/v5/, /signoz/ (all with ws:true where applicable)
+      - VITE_SIGNOZ_URL env var with documented default
+      - signozUrl.ts module exporting TAILNET_SIGNOZ_URL + TAILNET_SIGNOZ_LOGS_URL
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: frontend/vite.config.ts
+        description: Current proxy block (lines 66-93)
+      - path: AGENTS.md
+        description: Admin dev workflow section (npm run dev:local)
+      - path: frontend/src/admin/pages/Logs.svelte
+        description: Hard-coded tailnet URL on line 15 (will be replaced by import)
+    tech_stack:
+      - typescript
+      - vite
+    test_coverage: null
+    estimated_files:
+      - frontend/vite.config.ts
+      - frontend/src/admin/lib/signozUrl.ts
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "vite.config.ts has explicit SIGNOZ_URL constant from process.env.VITE_SIGNOZ_URL || 'http://127.0.0.1:8080'"
+      - "Proxy rules added in order: /api/v1/, /api/v2/, /api/v3/, /api/v4/, /api/v5/, /signoz/ - each with changeOrigin:true and secure:false"
+      - "/signoz/ rule has ws:true so WebSocket upgrades work in dev"
+      - "More-specific rules placed BEFORE the existing catch-all /api rule so Vite picks the right target"
+      - "Code comment explains the precedence rule and the env var fallback"
+      - "frontend/src/admin/lib/signozUrl.ts exports TAILNET_SIGNOZ_URL = 'http://100.126.197.92:3003' and TAILNET_SIGNOZ_LOGS_URL = `${TAILNET_SIGNOZ_URL}/logs`"
+      - "signozUrl.ts has a top-of-file comment explaining it is the single source of truth for the tailnet listener URL"
+    success_criteria:
+      - "npm run check passes"
+      - "Manual: npm run dev then curl -i http://localhost:5173/api/v1/services returns 200 from SigNoz (when local SigNoz is running) or 502 (when not) - NOT 404 from the gateway"
+      - "vite.config.ts npm run build succeeds"
+      - "grep -r '100.126.197.92' frontend/src/ returns only signozUrl.ts (no other hard-coding)"
+    handoff:
+      do_not_reinvestigate:
+        - Vite proxy precedence rules
+        - tailnet listener IP
+      required_test_first: null
+      target_files:
+        - frontend/vite.config.ts
+        - frontend/src/admin/lib/signozUrl.ts
+      minimal_change: Edit vite.config.ts + add signozUrl.ts. No other files.
+      acceptance_checks:
+        - "npm run build succeeds"
+        - "vite.config.ts has SIGNOZ_URL constant"
+        - "signozUrl.ts exports both TAILNET_SIGNOZ_URL and TAILNET_SIGNOZ_LOGS_URL"
+
+  - id: w1-t4-saved-views
+    title: Create frontend/src/admin/stores/savedViews.ts - localStorage view persistence
+    description: |
+      localStorage-backed saved views with a stable interface that can
+      be swapped to a SigNoz SavedView backend later (see contract
+      notes). Persists under key ircfiber:admin:logs:views. Caps at
+      50 views (LRU prune on overflow with toast warning).
+    wave: 1
+    agent: gem-implementer
+    status: pending
+    covers:
+      - views (Readable SavedView[]), saveView, loadView, deleteView
+      - LRU prune at 50 entries with toast notification
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/admin/stores/ui.ts
+        description: persisted() factory + toast() helper
+      - path: frontend/src/admin/stores/dashboard.ts
+        description: Store pattern
+    tech_stack:
+      - typescript
+      - svelte/store
+      - vitest
+    test_coverage: |
+      frontend/src/admin/stores/savedViews.test.ts - covers save
+      round-trip, load by id, delete, LRU prune at 50, quota error
+      graceful handling.
+    estimated_files:
+      - frontend/src/admin/stores/savedViews.ts
+      - frontend/src/admin/stores/savedViews.test.ts
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "SavedView type: { id: string, name: string, query: LogsQuery, timeRange: TimeRange, createdAt: number }"
+      - "saveView persists to localStorage and updates views writable"
+      - "loadView(id) returns LogsQuery + TimeRange; throws if not found"
+      - "deleteView(id) removes from store + localStorage"
+      - "Quota exceeded - prune to 50 most-recent + toast warning via toastWarn()"
+    success_criteria:
+      - "npm run test:client passes; savedViews.test.ts 6+ cases"
+      - "No Svelte component imports (store only)"
+    handoff:
+      do_not_reinvestigate:
+        - localStorage quotas
+        - LRU semantics
+      required_test_first: frontend/src/admin/stores/savedViews.test.ts
+      target_files:
+        - frontend/src/admin/stores/savedViews.ts
+      minimal_change: Add one file + one test. No changes to existing files.
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/stores/savedViews.test.ts exits 0"
+
+  - id: w1-t5-deploy-assertion
+    title: Smoke-test the deploy stack - Caddy + dev-proxy + SIGNOZ-API-KEY all reachable
+    description: |
+      Gate between Wave 1 and Wave 2: prove the deploy stack works
+      end-to-end so Wave 2 UI work is not built on top of a broken
+      proxy chain. Checks:
+
+      1. Production Caddy proxies /api/v1/services with SIGNOZ-API-KEY
+         (returns 200 with valid JSON body) via
+         curl -sS -m 10 https://ircfiber.com/api/v1/services
+      2. Production Caddy proxies /signoz/* (returns 200 or 401, NOT
+         404) via curl -sS -m 10 https://ircfiber.com/signoz/api/v1/services
+      3. Vite dev proxy routes /api/v1..5/* and /signoz/* - manual
+         npm run dev then curl localhost:5173/api/v1/services returns
+         200 (SigNoz up) or 502 (SigNoz down) but NEVER 404
+      4. /api/v1/user responds with orgId (validates auth + WS URL
+         construction works)
+
+      On any failure: print specific remediation. "VITE_SIGNOZ_URL
+      unset - set to http://127.0.0.1:8080 (local) or tailnet URL".
+      "ircfiber-caddy missing SIGNOZ_API_KEY - run signoz_mcp role first".
+      "Caddyfile.j2 /signoz/* handle_path block missing - check
+      deploy/roles/caddy/templates/Caddyfile.j2:60-79".
+
+      This is a verification task, not code work. Output captured to
+      docs/plan/20260630-admin-signoz-logs-panel/deploy-assertion.log.
+    wave: 1
+    agent: gem-implementer
+    status: pending
+    covers:
+      - End-to-end deploy verification (prod + dev)
+      - Specific remediation messages on failure
+      - Captured log for future audits
+    dependencies:
+      - w1-t3-vite-dev-proxy
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/caddy/templates/Caddyfile.j2
+        description: Prod Caddyfile /signoz/* handle_path block (lines 60-79)
+      - path: frontend/vite.config.ts
+        description: Dev proxy rules added by w1-t3
+    tech_stack:
+      - bash
+      - curl
+    test_coverage: null
+    estimated_files:
+      - docs/plan/20260630-admin-signoz-logs-panel/deploy-assertion.sh
+      - docs/plan/20260630-admin-signoz-logs-panel/deploy-assertion.log
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "deploy-assertion.sh exits 0 when all four checks pass"
+      - "curl https://ircfiber.com/api/v1/services returns 200 with JSON body containing services array"
+      - "curl https://ircfiber.com/signoz/api/v1/services returns 200 or 401 (NOT 404)"
+      - "On 404 / refused: prints 'VITE_SIGNOZ_URL unset OR ircfiber-caddy missing SIGNOZ_API_KEY OR /signoz/* handle_path missing'"
+      - "deploy-assertion.log contains timestamped PASS/FAIL per check"
+    success_criteria:
+      - "deploy-assertion.sh exits 0 against a healthy OVH environment"
+      - "deploy-assertion.log exists with PASS for all four checks"
+    handoff:
+      do_not_reinvestigate:
+        - Caddy SIGNOZ-API-KEY injection
+        - Vite proxy rules
+      required_test_first: null
+      target_files:
+        - docs/plan/20260630-admin-signoz-logs-panel/deploy-assertion.sh
+      minimal_change: One verification script. No production code modified.
+      acceptance_checks:
+        - "deploy-assertion.sh exits 0 on healthy stack"
+        - "deploy-assertion.log shows PASS for all checks"
+
+  - id: w1-t6-test-spike
+    title: Wave-1 gate - run full test suite, confirm Wave 1 did not regress existing tests
+    description: |
+      Wave-gate: run the entire frontend test suite (lib + client) to
+      confirm Wave 1 work (signoz.ts, logsStore.ts, savedViews.ts,
+      vite.config.ts, signozUrl.ts) did not break any existing test.
+      Required before Wave 2 begins.
+
+      Output captured to docs/plan/20260630-admin-signoz-logs-panel/
+      test-spike.log. If any test fails, the failing test names +
+      reason printed for debugging. Exit code 0 = green light for
+      Wave 2; non-zero = block Wave 2 until fixed.
+
+      This task is pure verification - no code changes. Running
+      'npm test' from frontend/ is the only required action.
+    wave: 1
+    agent: gem-implementer
+    status: pending
+    covers:
+      - Full test suite run (lib + client projects)
+      - Wave-1 gate go/no-go signal
+    dependencies:
+      - w1-t1-signoz-lib
+      - w1-t2-logs-store
+      - w1-t3-vite-dev-proxy
+      - w1-t4-saved-views
+      - w1-t5-deploy-assertion
+    conflicts_with: []
+    context_files: []
+    tech_stack:
+      - bash
+      - vitest
+    test_coverage: null
+    estimated_files:
+      - docs/plan/20260630-admin-signoz-logs-panel/test-spike.log
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "cd frontend && npm test exits 0 (lib + client projects both green)"
+      - "test-spike.log contains vitest output with all passing tests"
+      - "If any test fails: failing test name + reason printed"
+    success_criteria:
+      - "All existing + new (Wave 1) tests pass"
+      - "test-spike.log exists with green output"
+    handoff:
+      do_not_reinvestigate:
+        - test framework setup
+        - test configuration
+      required_test_first: null
+      target_files:
+        - docs/plan/20260630-admin-signoz-logs-panel/test-spike.log
+      minimal_change: No code changes. Pure verification.
+      acceptance_checks:
+        - "npm test exits 0"
+        - "test-spike.log exists with green vitest output"
+
+  # ─── Wave 2 — UI: row, table, toolbar, cheatsheet, page ─────────────────
+  - id: w2-t1-log-row-table
+    title: Create LogRow.svelte + LogTable.svelte (offset virtualization) + JsonDrawer.svelte (overlay expand)
+    description: |
+      LogRow renders one row with timestamp / severity chip / service /
+      truncated body / trace_id link + an expand toggle (signals intent
+      but does NOT inline-expand).
+
+      LogTable is the virtualized list: fixed row height (32px), renders
+      only the visible window + 20-row overscan, scrollTop -> startIndex
+      derivation. Emits expand(rowId, anchorRect) when a row is clicked;
+      owns the expandedRowId state but never changes its own height.
+
+      JsonDrawer.svelte is the expand UI: absolutely-positioned overlay
+      card with backdrop, anchored to the clicked row's viewport
+      position. Renders pretty-printed JSON with syntax highlighting on
+      keys. Dismissable via Esc keypress, backdrop click, or X button.
+      Lives in its own stacking context so it does not affect
+      LogTable's virtualization math.
+
+      This three-component split (LogRow + LogTable + JsonDrawer) is a
+      reviewer-mandated fix. The previous inline-expand plan broke the
+      32px row-height invariant the moment any expanded row's pretty-
+      printed JSON exceeded 32px, throwing off the 20-row overscan
+      offset calculation.
+    wave: 2
+    agent: gem-implementer
+    status: pending
+    covers:
+      - LogRow component (props: row, expanded, onToggle)
+      - LogTable component (virtualized list, props: rows, onToggleRow)
+      - JsonDrawer.svelte overlay (props: row, anchorRect, onClose)
+      - Offset-based virtualization; no new npm dep
+    dependencies:
+      - w1-t2-logs-store
+      - w1-t6-test-spike
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/admin/lib/format.ts
+        description: truncate(), relative() helpers
+      - path: frontend/src/components/MessageList.svelte
+        description: Existing scroll-windowing reference (heavier; do not copy)
+      - path: frontend/src/admin/components/ConfirmDialog.svelte
+        description: Modal overlay pattern (focus trap, backdrop)
+    tech_stack:
+      - typescript
+      - svelte5-runes
+      - vitest
+    test_coverage: |
+      LogRow.svelte.test.ts - covers severity chip class per level,
+      trace_id renders as link when present, onToggle called on click.
+      LogTable.svelte.test.ts - covers render slice based on scrollTop,
+      expand emits (rowId, anchorRect), LogTable height is invariant
+      under expand-collapse cycles (no inline expansion).
+      JsonDrawer.svelte.test.ts - covers Esc closes, backdrop click
+      closes, X button closes, renders JSON with key highlighting.
+    estimated_files:
+      - frontend/src/admin/components/logs/LogRow.svelte
+      - frontend/src/admin/components/logs/LogTable.svelte
+      - frontend/src/admin/components/logs/JsonDrawer.svelte
+      - frontend/src/admin/components/logs/LogRow.svelte.test.ts
+      - frontend/src/admin/components/logs/LogTable.svelte.test.ts
+      - frontend/src/admin/components/logs/JsonDrawer.svelte.test.ts
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: true
+    acceptance_criteria:
+      - "LogRow renders timestamp in local TZ (ms precision), severity chip with tone class (debug/info/warn/error/fatal), service.name, truncated body (max 200ch), trace_id link when present"
+      - "LogTable uses fixed 32px row height + offset virtualization: renders only rows [startIndex, startIndex + viewportRows + 20]"
+      - "LogTable height stays invariant under expand-collapse cycles (the test asserts this explicitly)"
+      - "Click on a row -> LogTable emits expand(rowId, anchorRect); LogTable itself does not render expanded content"
+      - "JsonDrawer.svelte receives (row, anchorRect, onClose) and renders pretty-printed JSON with key syntax highlighting"
+      - "JsonDrawer dismisses on Esc, backdrop click, or X button"
+      - "All three components use Svelte 5 runes ($state, $derived, $props)"
+    success_criteria:
+      - "npm run test:client passes for all three test files"
+      - "Manual: load 10k mock rows; scroll smoothly at 60fps; only ~50 DOM rows at any time; expanding a row shows the drawer without shifting table offsets"
+      - "npm run check reports 0 errors in all three .svelte files"
+    handoff:
+      do_not_reinvestigate:
+        - virtualization math
+        - JSON pretty-print library choice
+      required_test_first:
+        - frontend/src/admin/components/logs/LogRow.svelte.test.ts
+        - frontend/src/admin/components/logs/LogTable.svelte.test.ts
+        - frontend/src/admin/components/logs/JsonDrawer.svelte.test.ts
+      target_files:
+        - frontend/src/admin/components/logs/LogRow.svelte
+        - frontend/src/admin/components/logs/LogTable.svelte
+        - frontend/src/admin/components/logs/JsonDrawer.svelte
+      minimal_change: Three new files + three new tests. No changes to existing components.
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/components/logs/ exits 0"
+        - "npm run check reports 0 errors in new files"
+        - "LogTable.svelte.test.ts has a test asserting height is invariant under expand-collapse"
+
+  - id: w2-t2-logs-toolbar
+    title: Create LogsToolbar.svelte - query bar + service multi-select + severity chips + time picker + live toggle + cURL export
+    description: |
+      Toolbar layout (left -> right): query text input (placeholder hints
+      valid filters), service multi-select dropdown (populated from
+      signoz.services()), severity chips (5 toggleable, default WARN+ERROR),
+      time-range picker (5m / 15m / 1h / 3h / 24h / custom -> datetime
+      range), live toggle (when on, hides time picker and switches to WS),
+      copy-as-cURL button on the currently rendered query.
+    wave: 2
+    agent: gem-implementer
+    status: pending
+    covers:
+      - LogsToolbar component composing query controls
+      - Service multi-select dropdown (lazy load from /api/v1/services)
+      - Time-range picker with 5 presets + custom
+    dependencies:
+      - w1-t1-signoz-lib
+      - w1-t2-logs-store
+      - w1-t4-saved-views
+      - w1-t6-test-spike
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/admin/components/Card.svelte
+        description: Card pattern for sub-sections
+      - path: frontend/src/admin/lib/format.ts
+        description: relative(), truncate()
+    tech_stack:
+      - typescript
+      - svelte5-runes
+      - vitest
+    test_coverage: |
+      LogsToolbar.svelte.test.ts - covers: typing in query input updates
+      store after debounce, severity chip click toggles, time picker
+      preset click emits fresh query, live toggle calls toggleLive(),
+      copy-as-cURL button writes cURL command to clipboard.
+    estimated_files:
+      - frontend/src/admin/components/logs/LogsToolbar.svelte
+      - frontend/src/admin/components/logs/LogsToolbar.svelte.test.ts
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: true
+    acceptance_criteria:
+      - "Query input binds to logsStore via $bindable or stores subscription"
+      - "Service dropdown lazily loads services on first open (not on mount)"
+      - "Severity chips default to WARN + ERROR; click toggles membership"
+      - "Time picker presets emit start/end unix-ms pair via store"
+      - "Live toggle button calls logsStore.toggleLive(); hidden while in live mode"
+      - "Copy-as-cURL button generates curl -sS -X POST <origin>/api/v5/query_range -H Content-Type: application/json -d <body> and copies to clipboard via navigator.clipboard.writeText"
+    success_criteria:
+      - "npm run test:client passes; LogsToolbar.svelte.test.ts 8+ cases"
+      - "Manual: clicking severity chip flips state; query input debounces"
+      - "npm run check reports 0 errors"
+    handoff:
+      do_not_reinvestigate:
+        - "dropdown UI library - use native <select multiple> + custom chip overlay"
+      required_test_first: frontend/src/admin/components/logs/LogsToolbar.svelte.test.ts
+      target_files:
+        - frontend/src/admin/components/logs/LogsToolbar.svelte
+      minimal_change: One new file + one new test.
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/components/logs/LogsToolbar.svelte.test.ts exits 0"
+
+  - id: w2-t3-filter-cheatsheet
+    title: Create FilterCheatsheet.svelte - ? modal listing supported filter fields
+    description: |
+      Modal overlay listing every supported SigNoz log filter field
+      with an example expression each (severity_text, body, service.name,
+      trace_id, resource.*, attribute.*). Triggered by ? keypress
+      when Logs page is focused. Esc closes. Closes on backdrop click.
+    wave: 2
+    agent: gem-implementer
+    status: pending
+    covers:
+      - FilterCheatsheet modal component
+      - List of supported filter fields + example
+      - Open/close via ? and Esc
+    dependencies:
+      - w1-t6-test-spike
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/admin/components/ConfirmDialog.svelte
+        description: Modal pattern
+    tech_stack:
+      - typescript
+      - svelte5-runes
+    test_coverage: |
+      FilterCheatsheet.svelte.test.ts - covers open on ?, close on
+      Esc, close on backdrop click, renders all 6 example filters.
+    estimated_files:
+      - frontend/src/admin/components/logs/FilterCheatsheet.svelte
+      - frontend/src/admin/components/logs/FilterCheatsheet.svelte.test.ts
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "Modal lists 6+ filter examples: severity_text, body CONTAINS, service.name IN, trace_id, resource.* wildcard, attribute.* wildcard"
+      - "Opens when ? keydown received while no input has focus"
+      - "Closes on Esc keypress OR backdrop click"
+      - "Each example shown in a monospace block with explanation in plain English"
+    success_criteria:
+      - "npm run test:client passes; 5+ cases"
+      - "Modal accessible (role=dialog, aria-modal=true, focus trap)"
+      - "npm run check reports 0 errors"
+    handoff:
+      do_not_reinvestigate:
+        - "modal focus-trap library - implement minimal focus trap in-component"
+      required_test_first: frontend/src/admin/components/logs/FilterCheatsheet.svelte.test.ts
+      target_files:
+        - frontend/src/admin/components/logs/FilterCheatsheet.svelte
+      minimal_change: One new file + one new test.
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/components/logs/FilterCheatsheet.svelte.test.ts exits 0"
+
+  - id: w2-t4-logs-page
+    title: Rewrite frontend/src/admin/pages/Logs.svelte - header + toolbar + table + states (uses signozUrl.ts)
+    description: |
+      Replace the current placeholder Logs.svelte (which only links to
+      the tailnet listener) with a full page hosting:
+      - PageHeader with title + Open SigNoz link -> imported from
+        signozUrl.ts (TAILNET_SIGNOZ_LOGS_URL), NOT hard-coded
+      - View dropdown (loads from savedViews) + Save view button
+      - LogsToolbar (w2-t2)
+      - LogTable (w2-t1) inside a Card + JsonDrawer overlay (w2-t1)
+      - Empty state (no rows) with reset button (logsStore.resetFilters)
+      - Loading skeleton (use a small inline variant - NOT the IRCCloud
+        main-spin which is full-page)
+      - Error state with toast on auth failure
+    wave: 2
+    agent: gem-implementer
+    status: pending
+    covers:
+      - Logs.svelte full rewrite
+      - Header, view dropdown, save-view button, toolbar, table, drawer, states
+    dependencies:
+      - w1-t1-signoz-lib
+      - w1-t2-logs-store
+      - w1-t4-saved-views
+      - w1-t6-test-spike
+      - w2-t1-log-row-table
+      - w2-t2-logs-toolbar
+      - w2-t3-filter-cheatsheet
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/admin/pages/Logs.svelte
+        description: Current placeholder (only link to tailnet listener)
+      - path: frontend/src/admin/components/PageHeader.svelte
+        description: PageHeader pattern
+      - path: frontend/src/admin/components/Card.svelte
+        description: Card pattern for table container
+      - path: frontend/src/admin/components/EmptyState.svelte
+        description: EmptyState pattern
+      - path: frontend/src/admin/stores/ui.ts
+        description: toastError helper for auth-failure toast
+      - path: frontend/src/admin/lib/signozUrl.ts
+        description: Centralised URL constants (created in w1-t3)
+    tech_stack:
+      - typescript
+      - svelte5-runes
+      - vitest
+    test_coverage: |
+      Logs.svelte.test.ts - covers: mount -> header + Open SigNoz link
+      visible with target /logs, query-change triggers debounced refetch,
+      severity chip toggle updates store, time-picker preset emits fresh
+      query, expanded row opens JsonDrawer overlay (not inline).
+    estimated_files:
+      - frontend/src/admin/pages/Logs.svelte
+      - frontend/src/admin/pages/Logs.svelte.test.ts
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: true
+    acceptance_criteria:
+      - "Logs.svelte imports TAILNET_SIGNOZ_LOGS_URL from '$lib/admin/lib/signozUrl' (or relative path) - NO hard-coded IP"
+      - "PageHeader renders title 'Logs (SigNoz)' + Open SigNoz anchor whose href ends with /logs"
+      - "View dropdown loads savedViews on mount; Save view button prompts for name and calls savedViews.saveView"
+      - "LogsToolbar embedded; LogTable embedded in Card with EmptyState when no rows"
+      - "JsonDrawer overlay wired to LogTable's expand event - row click opens drawer, NOT inline expansion"
+      - "Empty state has a reset button that calls logsStore.resetFilters()"
+      - "Loading skeleton (inline, 32px height rows x 8) shown while $loading && results.length===0"
+      - "On auth failure (ApiError status 401/403), call toastError('SigNoz API key may have been rotated - page reload may help', 6000)"
+      - "Component uses Svelte 5 runes; no $state.raw outside of performance hot paths"
+    success_criteria:
+      - "npm run test:client passes for Logs.svelte.test.ts 6+ cases"
+      - "npm run check reports 0 errors in Logs.svelte"
+      - "Manual: visit /admin#/logs; toolbar visible; query input debounces; severity chips toggle; time picker emits; save view + load view works; row click opens JsonDrawer overlay"
+      - "grep -r '100.126.197.92' frontend/src/ returns only signozUrl.ts"
+    handoff:
+      do_not_reinvestigate:
+        - page layout
+        - header structure
+        - tailnet listener IP
+      required_test_first: frontend/src/admin/pages/Logs.svelte.test.ts
+      target_files:
+        - frontend/src/admin/pages/Logs.svelte
+      minimal_change: Replace the existing file (don't append).
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/pages/Logs.svelte.test.ts exits 0"
+        - "Logs.svelte has no leftover iframe markup or 'cloud-icon' comment"
+        - "'Open SigNoz' link href ends with /logs (not /)"
+        - "Logs.svelte imports TAILNET_SIGNOZ_LOGS_URL - no hard-coded IP"
+
+  # ─── Wave 3 — WS preflight + Live tail + Caddy WS audit ───────────────
+  - id: w3-t0-ws-preflight
+    title: BLOCKER preflight - verify /signoz/ws/logs/v5/{orgId} against live SigNoz before building logsLiveTail
+    description: |
+      BLOCKER-grade preflight: confirm the live SigNoz instance actually
+      serves the /signoz/ws/logs/v5/{orgId} WebSocket endpoint BEFORE
+      logsLiveTail.ts is built. Building on top of an unverified endpoint
+      would waste weeks of work when the implementer later hits
+      "connected, zero messages" or "404 not found".
+
+      Procedure (script: ws-preflight.sh):
+      1. Fetch orgId from https://ircfiber.com/api/v1/user (validates
+         Caddy SIGNOZ-API-KEY injection + org discovery together)
+      2. curl -i -H 'Connection: Upgrade' -H 'Upgrade: websocket'
+         -H 'Sec-WebSocket-Version: 13'
+         -H 'Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw=='
+         https://ircfiber.com/signoz/ws/logs/v5/{orgId}
+      3. Expect HTTP 101 Switching Protocols
+      4. On non-101: identify failure mode and print specific
+         remediation
+
+      Failure-mode messaging (this is the whole point of the task):
+      - connection refused / timeout:
+        "VITE_SIGNOZ_URL unset OR ircfiber-caddy missing SIGNOZ_API_KEY -
+         check deploy/roles/signoz_mcp + caddy env vars"
+      - HTTP 404:
+        "/signoz/ws/logs/* path not in Caddyfile.j2 - check
+         deploy/roles/caddy/templates/Caddyfile.j2:60-79 handle_path block"
+      - HTTP 502:
+        "signoz-signoz container not reachable - check
+         docker compose ps on ircfiber-ovh-1"
+      - HTTP 401:
+        "SIGNOZ_API_KEY invalid - rotate via signoz_mcp role"
+
+      This task is a "do not merge" gate - logsLiveTail.ts work (w3-t1)
+      cannot proceed if the WS endpoint is not reachable.
+    wave: 3
+    agent: gem-implementer
+    status: pending
+    covers:
+      - WS endpoint live verification (curl + Sec-WebSocket-Key)
+      - Org-ID discovery validation
+      - Specific remediation message generation per failure mode
+    dependencies:
+      - w1-t3-vite-dev-proxy
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/caddy/templates/Caddyfile.j2
+        description: /signoz/* handle_path block (lines 60-79) + SIGNOZ_API_KEY env var
+      - path: deploy/roles/signoz_mcp/tasks/main.yml
+        description: Provisions the EDITOR API key used by Caddy
+    tech_stack:
+      - bash
+      - curl
+    test_coverage: null
+    estimated_files:
+      - docs/plan/20260630-admin-signoz-logs-panel/ws-preflight.sh
+      - docs/plan/20260630-admin-signoz-logs-panel/ws-preflight.log
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "ws-preflight.sh exits 0 only when HTTP 101 Switching Protocols is received"
+      - "curl with Sec-WebSocket-Key against /signoz/ws/logs/v5/{orgId} returns 101"
+      - "On connection refused: prints 'VITE_SIGNOZ_URL unset OR ircfiber-caddy missing SIGNOZ_API_KEY'"
+      - "On 404: prints '/signoz/ws/logs/* not in Caddyfile.j2 handle_path block'"
+      - "On 502: prints 'signoz-signoz container not reachable'"
+      - "ws-preflight.log records timestamp + result + (on failure) the remediation message"
+    success_criteria:
+      - "ws-preflight.sh exits 0 against a healthy OVH environment"
+      - "ws-preflight.log shows '101 Switching Protocols' with timestamp"
+      - "w3-t1-live-tail-store cannot start until this task has logged 101"
+    handoff:
+      do_not_reinvestigate:
+        - WS protocol framing (RFC 6455)
+        - Caddyfile.j2 /signoz/* block (already known-good per 287d089)
+      required_test_first: null
+      target_files:
+        - docs/plan/20260630-admin-signoz-logs-panel/ws-preflight.sh
+        - docs/plan/20260630-admin-signoz-logs-panel/ws-preflight.log
+      minimal_change: One verification script + one log file. No production code modified.
+      acceptance_checks:
+        - "ws-preflight.log shows 101 Switching Protocols"
+        - "ws-preflight.sh exits 0"
+
+  - id: w3-t1-live-tail-store
+    title: Create frontend/src/admin/stores/logsLiveTail.ts - WS connect + exponential backoff + status state machine
+    description: |
+      Manages a single WebSocket connection to /signoz/ws/logs/v5/{orgId}
+      (orgId discovered via signoz.currentUser() on first connect; falls
+      back to 'default' with toast warning). Parses incoming rows into
+      the LogRow shape used by the table. Implements exponential
+      backoff: 1s, 2s, 4s, 8s, 16s, 30s cap with +/-20 percent jitter.
+      After 10 consecutive failures, surfaces a permanent error toast
+      and stops retrying.
+
+      The status writable is a strict 5-state machine that the toolbar
+      status pill renders verbatim - the implementer does not need to
+      guess:
+      - 'idle'         - startLiveTail not yet called, or stopLiveTail called
+      - 'connecting'   - WS opening handshake in flight
+      - 'open'         - WS open, rows streaming
+      - 'reconnecting' - WS closed, backoff timer running, attempt N of cap
+      - 'closed'       - 10-failure cap reached, permanent error
+
+      Depends on w3-t0-ws-preflight having returned 101 against the live
+      SigNoz instance.
+    wave: 3
+    agent: gem-implementer
+    status: pending
+    covers:
+      - logsLiveTail.ts: startLiveTail, stopLiveTail, ready store, error store, status store
+      - Exponential backoff with jitter
+      - 5-state status machine (idle | connecting | open | reconnecting | closed)
+    dependencies:
+      - w1-t1-signoz-lib
+      - w1-t2-logs-store
+      - w3-t0-ws-preflight
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/admin/stores/dashboard.ts
+        description: Store pattern
+      - path: source/conn_holder/main.d
+        description: Existing reconnect-with-backoff pattern reference
+    tech_stack:
+      - typescript
+      - svelte/store
+      - vitest
+    test_coverage: |
+      logsLiveTail.test.ts - covers: start opens WS (status: idle ->
+      connecting -> open), stop closes WS (status: open -> idle),
+      message handler appends row to logsStore, exponential backoff
+      triggers on close (1s, 2s, 4s, 8s - capped at 30s, status:
+      reconnecting with attempt counter), 10 failures stops retry and
+      sets status: closed + error store, orgId discovery failure falls
+      back to 'default'.
+    estimated_files:
+      - frontend/src/admin/stores/logsLiveTail.ts
+      - frontend/src/admin/stores/logsLiveTail.test.ts
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "startLiveTail(filter) is idempotent - second call is a no-op if already in 'connecting' or 'open'"
+      - "stopLiveTail() closes the WS, clears the reconnect timer, status -> 'idle'"
+      - "Status writable is a string literal union: 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed' (TypeScript exhaustive)"
+      - "Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (capped) with +/-20 percent jitter"
+      - "10 consecutive failures -> status: 'closed', no further retries, error store set"
+      - "Org ID discovery via /api/v1/user on first connect; fallback to 'default' with toastWarn if fetch fails"
+      - "WS URL built via signoz.wsUrl(orgId); frontend code uses path-only URLs"
+    success_criteria:
+      - "npm run test:client passes; logsLiveTail.test.ts 8+ cases"
+      - "No real WS opened in tests (mock global WebSocket)"
+      - "npm run check reports 0 errors"
+      - "ws-preflight.log (from w3-t0) shows 101 before this task starts"
+    handoff:
+      do_not_reinvestigate:
+        - WebSocket protocol
+        - retry math
+        - "status state enumeration: locked to 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'"
+      required_test_first: frontend/src/admin/stores/logsLiveTail.test.ts
+      target_files:
+        - frontend/src/admin/stores/logsLiveTail.ts
+      minimal_change: One new file + one new test.
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/stores/logsLiveTail.test.ts exits 0"
+        - "logsLiveTail.ts status type is a string literal union, not enum"
+
+  - id: w3-t2-wire-live-toggle
+    title: Wire LogsToolbar live toggle to logsLiveTail + show WS status pill
+    description: |
+      Connect the toolbar's live toggle to logsLiveTail.startLiveTail
+      /stopLiveTail. Show a status pill next to the toggle: 'Live'
+      (green dot when ready), 'Reconnecting' (amber with retry count
+      when backoff active), 'Live unavailable' (red with reason when
+      permanent error). On permanent error, auto-toggle the live switch
+      off and surface a toast.
+    wave: 3
+    agent: gem-implementer
+    status: pending
+    covers:
+      - Wire live toggle to logsLiveTail
+      - Status pill UI (Live / Reconnecting / Live unavailable)
+    dependencies:
+      - w2-t2-logs-toolbar
+      - w3-t1-live-tail-store
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/admin/components/logs/LogsToolbar.svelte
+        description: Modified in w2-t2
+      - path: frontend/src/admin/components/StatusBadge.svelte
+        description: StatusBadge component for the status pill
+    tech_stack:
+      - typescript
+      - svelte5-runes
+    test_coverage: |
+      Add cases to LogsToolbar.svelte.test.ts - toggle on calls
+      startLiveTail, toggle off calls stopLiveTail, status pill
+      reflects ready/error store values.
+    estimated_files:
+      - frontend/src/admin/components/logs/LogsToolbar.svelte
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "Toggle on -> startLiveTail(filter from store); toggle off -> stopLiveTail()"
+      - "Status pill renders one of: 'Live' / 'Reconnecting (attempt N)' / 'Live unavailable'"
+      - "Permanent error -> auto-toggle off + toastError"
+      - "When live is on, time-range picker is hidden (not just disabled)"
+    success_criteria:
+      - "npm run test:client passes; new cases in LogsToolbar.svelte.test.ts 4+"
+      - "npm run check reports 0 errors"
+    handoff:
+      do_not_reinvestigate:
+        - WS URL
+        - retry math
+      required_test_first: frontend/src/admin/stores/logsLiveTail.test.ts (must exist before this task)
+      target_files:
+        - frontend/src/admin/components/logs/LogsToolbar.svelte
+      minimal_change: Edit LogsToolbar.svelte (created in w2-t2). No new files.
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/components/logs/LogsToolbar.svelte.test.ts exits 0"
+        - "Manual: toggle live -> WS connection attempts; toggle off -> WS closed cleanly"
+
+  - id: w3-t3-caddy-ws-audit
+    title: Audit Caddy WebSocket handling on /signoz/ws/logs/* - confirm or patch
+    description: |
+      Verify that the existing Caddyfile.j2 /signoz/* handle_path
+      block transparently upgrades WebSocket connections to
+      signoz-signoz:8080. Test via:
+      curl -i -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H
+      'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw=='
+      https://ircfiber.com/signoz/ws/logs/v5/{orgId}
+      Expected: 101 Switching Protocols. If NOT 101, add a dedicated
+      handle_path /signoz/ws/logs/* block before the catch-all
+      /signoz/* handler with reverse_proxy plus flush_interval -1.
+    wave: 3
+    agent: gem-devops
+    status: pending
+    covers:
+      - Caddyfile.j2 audit + optional WS-specific block
+      - Ansible playbook re-render of Caddyfile (no new task; existing flow)
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: deploy/roles/caddy/templates/Caddyfile.j2
+        description: Current /signoz/* handle block (lines 60-79)
+      - path: AGENTS.md
+        description: '"Admin -> SigNoz logs integration" section'
+    tech_stack:
+      - ansible
+      - caddy
+      - curl
+    test_coverage: null
+    estimated_files:
+      - deploy/roles/caddy/templates/Caddyfile.j2
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "Audit command documented in task: curl test against /signoz/ws/logs/v5/{orgId}"
+      - "If 101 received: Caddyfile.j2 unchanged; task doc records the audit timestamp + result"
+      - "If NOT 101: add handle_path /signoz/ws/logs/* with reverse_proxy signoz-signoz:8080 plus SIGNOZ-API-KEY header_up plus transport http flush_interval -1 BEFORE the existing /signoz/* block"
+      - "After any change: ansible-playbook --tags caddy playbooks/site.yml -l ircfiber-ovh-1 --check succeeds; manual deploy via make update"
+    success_criteria:
+      - "curl test result recorded in deploy/roles/caddy/templates/Caddyfile.j2 code comment header (audit-trail)"
+      - "If patched: live WS connection from /admin#/logs succeeds"
+      - "No other Caddyfile behavior changed"
+    handoff:
+      do_not_reinvestigate:
+        - "Caddy v2 reverse_proxy WS behavior - already known to auto-handle in standard config"
+      required_test_first: null
+      target_files:
+        - deploy/roles/caddy/templates/Caddyfile.j2
+      minimal_change: One file. Possibly zero net changes if audit passes.
+      acceptance_checks:
+        - "Audit timestamp + curl result present in Caddyfile.j2 header comment"
+        - "ansible-playbook --check --tags caddy playbooks/site.yml exits 0"
+
+  # ─── Wave 4 — Polish, shortcuts, cURL, docs ────────────────────────────
+  - id: w4-t1-keyboard-shortcuts
+    title: Add /, Esc, ? keyboard shortcuts to Logs.svelte
+    description: |
+      Implement three keyboard shortcuts scoped to the Logs page:
+      - / (when no input has focus) -> focus the query input
+      - Esc (when query input is focused) -> clear the query
+      - ? (when no input has focus) -> open FilterCheatsheet modal
+      Use <svelte:window onkeydown={handler} /> (matches existing
+      SnippetsPanel/NetworkForm pattern). Handler skips when target is
+      an input/textarea/select.
+    wave: 4
+    agent: gem-implementer
+    status: pending
+    covers:
+      - Keyboard shortcut handler in Logs.svelte
+      - /, Esc, ? with focus-aware guards
+    dependencies:
+      - w2-t3-filter-cheatsheet
+      - w2-t4-logs-page
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/components/NetworkForm.svelte
+        description: Existing onkeydown pattern with focus guard
+      - path: frontend/src/components/ChannelSwitcher.svelte
+        description: svelte:window onkeydown pattern
+    tech_stack:
+      - typescript
+      - svelte5-runes
+    test_coverage: |
+      Add cases to Logs.svelte.test.ts - typing / focuses query
+      input; typing Esc with input focused clears query; typing ?
+      opens FilterCheatsheet modal.
+    estimated_files:
+      - frontend/src/admin/pages/Logs.svelte
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "/ keypress with body not in an input -> focuses query input"
+      - "Esc keypress with query input focused -> clears query"
+      - "? keypress with body not in an input -> opens FilterCheatsheet"
+      - "All three skip when target is input/textarea/select/contenteditable"
+    success_criteria:
+      - "npm run test:client passes; new cases 3+ in Logs.svelte.test.ts"
+      - "npm run check reports 0 errors"
+      - "Manual: pressing / focuses the query input from anywhere on the page"
+    handoff:
+      do_not_reinvestigate:
+        - keyboard event handling
+        - focus API
+      required_test_first: frontend/src/admin/pages/Logs.svelte.test.ts
+      target_files:
+        - frontend/src/admin/pages/Logs.svelte
+      minimal_change: Edit Logs.svelte (created in w2-t4). No new files.
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/pages/Logs.svelte.test.ts exits 0"
+
+  - id: w4-t2-empty-loading-error-states
+    title: Polish empty / loading / error states in Logs.svelte and LogTable.svelte
+    description: |
+      Final pass on UX:
+      - Empty state copy: "No logs in window - try widening the time range
+        or removing filters" + a button to reset filters to default
+      - Loading skeleton: inline 8 rows of 32px grey bars (not the
+        IRCCloud main-spin which is full-page)
+      - Error state: red banner above the table with the error message
+        + a Retry button that calls runQuery()
+      - Auto-scroll on first live emit; debounce scroll restoration so
+        user can scroll up to read older rows
+    wave: 4
+    agent: gem-implementer
+    status: pending
+    covers:
+      - Empty / loading / error state polish
+      - Auto-scroll + scroll-restoration debounce in LogTable
+    dependencies:
+      - w2-t4-logs-page
+    conflicts_with: []
+    context_files:
+      - path: frontend/src/admin/components/EmptyState.svelte
+        description: EmptyState component
+    tech_stack:
+      - typescript
+      - svelte5-runes
+    test_coverage: |
+      Add cases to Logs.svelte.test.ts and LogTable.svelte.test.ts -
+      empty state shows reset button; loading skeleton renders during
+      initial load; error state renders on ApiError; reset filters
+      restores default.
+    estimated_files:
+      - frontend/src/admin/pages/Logs.svelte
+      - frontend/src/admin/components/logs/LogTable.svelte
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: true
+    acceptance_criteria:
+      - "Empty state has reset button that calls logsStore.resetFilters()"
+      - "Loading skeleton renders 8 inline rows (not the full-page main-spin)"
+      - "Error state shows error message + Retry button calling runQuery()"
+      - "Live-tail auto-scroll: smooth scroll to top on first emit; subsequent emits don't fight user's scroll position"
+    success_criteria:
+      - "npm run test:client passes; new cases 4+"
+      - "npm run check reports 0 errors"
+    handoff:
+      do_not_reinvestigate:
+        - loading skeleton shape
+      required_test_first: frontend/src/admin/pages/Logs.svelte.test.ts
+      target_files:
+        - frontend/src/admin/pages/Logs.svelte
+        - frontend/src/admin/components/logs/LogTable.svelte
+      minimal_change: Edit two files. No new files.
+      acceptance_checks:
+        - "npx vitest run --project=client src/admin/pages/Logs.svelte.test.ts src/admin/components/logs/LogTable.svelte.test.ts exits 0"
+
+  - id: w4-t3-curl-export
+    title: Add Copy-as-cURL button - exports the currently rendered query
+    description: |
+      Button in LogsToolbar (already wired in w2-t2) generates a
+      complete cURL command for the last /api/v5/query_range request
+      body and copies it to the clipboard via navigator.clipboard.
+      Format:
+      curl -sS -X POST <origin>/api/v5/query_range
+        -H 'Content-Type: application/json'
+        -d '<JSON body single-line>'
+      The host is window.location.origin (production frontend talks
+      to the same origin). The SIGNOZ-API-KEY is NOT included
+      (Caddy injects server-side; never expose to browser).
+    wave: 4
+    agent: gem-implementer
+    status: pending
+    covers:
+      - Copy-as-cURL implementation + clipboard integration
+      - Toast confirmation on copy
+    dependencies:
+      - w2-t2-logs-toolbar
+      - w2-t4-logs-page
+    conflicts_with: []
+    context_files: []
+    tech_stack:
+      - typescript
+      - svelte5-runes
+    test_coverage: |
+      Add case to LogsToolbar.svelte.test.ts - clicking Copy-as-cURL
+      calls navigator.clipboard.writeText with a cURL string that
+      contains the request body.
+    estimated_files:
+      - frontend/src/admin/components/logs/LogsToolbar.svelte
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "Button visible only after at least one query has run (when lastQueryBody is non-null)"
+      - "On click: builds cURL string, calls navigator.clipboard.writeText, shows toastSuccess('cURL copied to clipboard')"
+      - "cURL string contains NO SIGNOZ-API-KEY header (server-side only)"
+      - "cURL body is JSON.stringify(lastQueryBody) (compact, single-line)"
+    success_criteria:
+      - "npm run test:client passes; new case 1+"
+      - "Manual: copy cURL, paste in terminal, run against the same URL - succeeds (when SigNoz is reachable)"
+    handoff:
+      do_not_reinvestigate:
+        - clipboard API
+        - cURL format
+      required_test_first: frontend/src/admin/components/logs/LogsToolbar.svelte.test.ts
+      target_files:
+        - frontend/src/admin/components/logs/LogsToolbar.svelte
+      minimal_change: Edit LogsToolbar.svelte. No new files.
+      acceptance_checks:
+        - "Manual: button disabled until first query; click copies cURL to clipboard"
+
+  - id: w4-t4-agents-md-update
+    title: Update AGENTS.md "Admin -> SigNoz logs integration" section
+    description: |
+      Replace the current iframe-centric description with the new
+      native-panel architecture. Cover:
+      - File layout under frontend/src/lib/signoz.ts,
+        frontend/src/admin/stores/{logsStore,logsLiveTail,savedViews}.ts,
+        frontend/src/admin/components/logs/*,
+        frontend/src/admin/pages/Logs.svelte
+      - Dev proxy rule in vite.config.ts (VITE_SIGNOZ_URL)
+      - Caddy /api/v1..5/* + /signoz/* proxy unchanged
+      - Tailnet fallback link at /logs (not just /)
+      - LocalStorage saved views at ircfiber:admin:logs:views
+      - Reference to plan: docs/plan/20260630-admin-signoz-logs-panel/plan.yaml
+    wave: 4
+    agent: gem-documentation-writer
+    status: pending
+    covers:
+      - AGENTS.md "Admin -> SigNoz logs integration" section rewrite
+    dependencies:
+      - w1-t1-signoz-lib
+      - w2-t4-logs-page
+      - w3-t3-caddy-ws-audit
+    conflicts_with: []
+    context_files:
+      - path: AGENTS.md
+        description: Current section (referenced from CLAUDE.md)
+    tech_stack:
+      - markdown
+    test_coverage: null
+    estimated_files:
+      - AGENTS.md
+    flags:
+      flaky: false
+      retries_used: 0
+      requires_design_validation: false
+    acceptance_criteria:
+      - "Section lists every new file path under frontend/src/"
+      - "Section lists every new dev-proxy rule + env var"
+      - "Section explains the architecture choice (Option D: native panel + tailnet fallback) and WHY the iframe was abandoned (failed Caddy-side fixes at 7795a73 + 287d089; SigNoz v0.130 React bundle bootstraps session JWT that cannot be header-replayed)"
+      - "Section references the plan file path"
+    success_criteria:
+      - "Manual: read AGENTS.md section - every claim is verifiable from the codebase"
+      - "No orphan file paths (all listed files exist)"
+    handoff:
+      do_not_reinvestigate:
+        - AGENTS.md conventions
+      required_test_first: null
+      target_files:
+        - AGENTS.md
+      minimal_change: Edit one section of AGENTS.md. No new files.
+      acceptance_checks:
+        - "grep -c 'Logs.svelte' AGENTS.md returns >=2 (mentioned in section + plan reference)"

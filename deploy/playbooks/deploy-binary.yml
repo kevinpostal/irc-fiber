@@ -1,0 +1,131 @@
+---
+# Fast deploy using Docker BuildKit incremental builds.
+#
+# The Containerfile now uses `RUN --mount=type=cache,target=/build/.dub`
+# which preserves dub's package cache and .o files across Docker builds.
+# Subsequent builds only recompile changed source files — as fast as a
+# native incremental dub build but without installing LDC on the host.
+#
+# Workflow:
+#   1. rsync source to server (fast)
+#   2. DOCKER_BUILDKIT=1 docker build --target builder on server
+#      (LDC layer + .dub/ cache both persisted)
+#   3. Extract binary from builder stage
+#   4. docker cp + restart
+#
+# Usage:
+#   make update
+
+- name: Build + deploy
+  hosts: "{{ target | default('ircfiber_gw') }}"
+  become: true
+  gather_facts: false
+  tags:
+    - always
+  vars:
+    src_root: /opt/ircfiber-src
+    container_name: "{{ gateway_container_name | default('ircfiber-gateway') }}"
+    host_binary_dir: /opt/ircfiber/bin
+    host_binary: "{{ host_binary_dir }}/irc-fiber"
+    container_binary: /app/irc-fiber
+    engine_container: "{{ 'ircfiber-engine-' ~ ircfiber_engine_id }}"
+    host_engine_binary: "{{ host_binary_dir }}/irc-fiber-engine"
+  tasks:
+    - name: Ensure source directory exists
+      ansible.builtin.file:
+        path: "{{ src_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0777"
+
+    - name: rsync source to server
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../../"
+        dest: "{{ src_root }}"
+        delete: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.dub"
+          - "--exclude=*.o"
+          - "--exclude=irc-fiber"
+          - "--exclude=irc-fiber-engine"
+          - "--exclude=frontend/node_modules"
+          
+
+    - name: Build gateway via Docker BuildKit (cached LDC + incremental dub)
+      ansible.builtin.shell: |
+        DOCKER_BUILDKIT=1 docker build \
+          --target builder \
+          -t ircfiber-builder \
+          -f Containerfile \
+          . 2>&1
+      args:
+        chdir: "{{ src_root }}"
+        executable: /bin/bash
+      register: build
+      changed_when: "'Successfully built' in build.stdout"
+      timeout: 900
+
+    - name: Extract compiled binary from builder image
+      ansible.builtin.shell: |
+        mkdir -p {{ host_binary_dir }}
+        CID=$(docker create ircfiber-builder)
+        docker cp "$CID":/build/irc-fiber {{ host_binary }}
+        docker cp "$CID":/build/irc-fiber-engine {{ host_engine_binary }} 2>/dev/null || true
+        chmod 0755 {{ host_binary }} {{ host_engine_binary }} 2>/dev/null || true
+        docker rm "$CID" >/dev/null 2>&1 || true
+      args:
+        executable: /bin/bash
+
+    - name: Build frontend
+      ansible.builtin.command:
+        cmd: "{{ item }}"
+        chdir: "{{ src_root }}/frontend"
+      loop:
+        - npm ci
+        - npm run build
+      register: npm_out
+      changed_when: "'built in' in npm_out.stdout"
+      timeout: 120
+
+    - name: Build gateway replica list
+      ansible.builtin.set_fact:
+        _gw_replicas: "{{ ['ircfiber-gateway'] if (gateway_replica_count | default(1) | int) == 1 else (range(gateway_replica_count | default(1) | int) | map('regex_replace', '^', 'ircfiber-gateway-') | list) }}"
+
+    - name: Stop gateway replicas (clean state for cp)
+      community.docker.docker_container:
+        name: "{{ item }}"
+        state: stopped
+      loop: "{{ _gw_replicas }}"
+      ignore_errors: true
+
+    - name: Inject gateway binary into replicas
+      ansible.builtin.shell: |
+        docker cp {{ host_binary }} {{ item }}:{{ container_binary }}
+      loop: "{{ _gw_replicas }}"
+
+    - name: Restart gateway replicas
+      community.docker.docker_container:
+        name: "{{ item }}"
+        state: started
+        restart: true
+      loop: "{{ _gw_replicas }}"
+
+    - name: Stop engine container
+      community.docker.docker_container:
+        name: "{{ engine_container }}"
+        state: stopped
+      ignore_errors: true
+
+    - name: Inject engine binary
+      ansible.builtin.shell: |
+        docker cp {{ host_engine_binary }} {{ engine_container }}:/app/irc-fiber-engine
+
+    - name: Restart engine
+      community.docker.docker_container:
+        name: "{{ engine_container }}"
+        state: started
+        restart: true

@@ -1,0 +1,4 @@
+---
+- name: Refresh facts
+  ansible.builtin.setup:
+    filter: ansible_facts.tailscale0

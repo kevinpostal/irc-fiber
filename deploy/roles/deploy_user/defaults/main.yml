@@ -1,0 +1,34 @@
+---
+# Default variables for the deploy_user role.
+# This role is run ONCE per host (or whenever you change SSH keys / sudo config)
+# to provision a non-root user for Ansible to use going forward.
+
+deploy_user_name: deploy
+deploy_user_uid: ""                # empty = let the OS pick
+deploy_user_shell: /bin/bash
+deploy_user_home: "/home/{{ deploy_user_name }}"
+deploy_user_groups:
+  - sudo
+  - docker
+  - systemd-journal
+
+# Passwordless sudo — required because Ansible non-interactive mode can't
+# respond to password prompts. We use a drop-in under /etc/sudoers.d/ so
+# the host's main sudoers file stays untouched and `visudo -c` still passes.
+deploy_user_passwordless: true
+
+# Lock the account password (SSH key only) for an extra layer of defense.
+deploy_user_lock_password: true
+
+# Where to look for SSH public keys to install for the deploy user.
+# Priority: deploy_user_ssh_public_key > /root/.ssh/authorized_keys
+deploy_user_ssh_public_key: ""
+deploy_user_ssh_public_key_file: ""
+
+# Authorized keys to install (list of strings). If empty, falls back to
+# the ssh_public_key or ssh_public_key_file sources above.
+deploy_user_authorized_keys: []
+
+# If true, remove the root password / lock root after creating deploy user.
+# Recommended for "root" should not be reachable by password at all.
+deploy_user_disable_root_password: false

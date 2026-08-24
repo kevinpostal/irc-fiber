@@ -1,0 +1,54 @@
+---
+- name: Preflight — verify OS
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family in ['Debian']
+      - (ansible_distribution == 'Ubuntu' and ansible_distribution_version in ['22.04', '24.04', '26.04']) or
+        (ansible_distribution == 'Debian' and ansible_distribution_major_version in ['11', '12'])
+    fail_msg: "IRC Fiber playbooks require Ubuntu 22.04/24.04/26.04 or Debian 11/12. Detected: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+- name: Set timezone
+  community.general.timezone:
+    name: "{{ common_timezone }}"
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Upgrade all packages (optional, off by default)
+  ansible.builtin.apt:
+    upgrade: dist
+  when: common_upgrade | bool
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ common_apt_packages }}"
+    state: present
+
+- name: Install optional convenience packages
+  ansible.builtin.apt:
+    name: "{{ common_apt_packages_optional }}"
+    state: present
+
+- name: Enable and start chrony
+  ansible.builtin.service:
+    name: chrony
+    state: started
+    enabled: true
+
+- name: Ensure /etc/ircfiber exists
+  ansible.builtin.file:
+    path: /etc/ircfiber
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create /var/backups/ircfiber
+  ansible.builtin.file:
+    path: "{{ backup_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"

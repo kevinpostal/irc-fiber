@@ -1,0 +1,21 @@
+---
+# Cloudflare Tunnel (cloudflared) — defaults
+# cloudflared runs as a Docker container, connects outbound to Cloudflare's
+# edge, and forwards tunnel traffic to Caddy on the ircfiber Docker network.
+#
+# Prerequisites:
+#   1. Create a named tunnel in Cloudflare Zero Trust dashboard:
+#        https://one.dash.cloudflare.com/ → Networks → Tunnels
+#   2. Copy the tunnel token and put it in the vault:
+#        ansible-vault edit inventories/production/group_vars/vault.yml
+#      as vault_cloudflared_tunnel_token
+#   3. Configure the tunnel's Public Hostnames in the dashboard:
+#        - ircfiber.com        → http://ircfiber-caddy:80
+#        - www.ircfiber.com    → http://ircfiber-caddy:80
+#   4. Run:  ansible-playbook playbooks/cloudflared.yml
+
+cloudflared_image: "cloudflare/cloudflared:latest"
+cloudflared_container_name: "ircfiber-cloudflared"
+cloudflared_tunnel_token: "{{ vault_cloudflared_tunnel_token | default('') }}"
+cloudflared_no_autoupdate: true
+cloudflared_restart_policy: "unless-stopped"

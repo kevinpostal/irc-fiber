@@ -1,0 +1,7 @@
+---
+- name: Deploy Caddy reverse proxy
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  roles:
+    - role: caddy

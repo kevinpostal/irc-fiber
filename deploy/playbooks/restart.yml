@@ -1,0 +1,106 @@
+---
+# Restart a subset of irc-fiber components.
+# Usage:
+#   ansible-playbook playbooks/restart.yml -e components=gateway,engine
+#   ansible-playbook playbooks/restart.yml -e components=mongo,redis,gateway
+#   ansible-playbook playbooks/restart.yml            # restart everything
+#
+# Valid components: caddy, cloudflared, gateway, engine, mongo, redis, holder
+
+- name: Restart irc-fiber components
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    components: "caddy,cloudflared,gateway,engine,mongo,redis"
+  tasks:
+    - name: Show plan
+      ansible.builtin.debug:
+        msg: "Will restart these components: {{ components | split(',') | map('trim') | reject('equalto', '') | list }}"
+
+    - name: Validate component list
+      ansible.builtin.assert:
+        that:
+          - item in ['caddy', 'cloudflared', 'gateway', 'engine', 'holder', 'mongo', 'redis']
+        fail_msg: "Unknown component '{{ item }}'. Valid: caddy, cloudflared, gateway, engine, holder, mongo, redis"
+      loop: "{{ components | split(',') | map('trim') | reject('equalto', '') | list }}"
+
+    - name: Restart Caddy
+      community.docker.docker_container:
+        name: ircfiber-caddy
+        restart: true
+      when: "'caddy' in (components | split(',') | map('trim') | list)"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['ircfiber_backend'] | default([]) }}"
+      loop_control:
+        loop_var: item
+
+    - name: Restart Cloudflare Tunnel
+      community.docker.docker_container:
+        name: "{{ cloudflared_container_name | default('ircfiber-cloudflared') }}"
+        restart: true
+      when: "'cloudflared' in (components | split(',') | map('trim') | list)"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['ircfiber_backend'] | default([]) }}"
+      loop_control:
+        loop_var: item
+
+    - name: Restart Gateway replicas
+      ansible.builtin.shell: |
+        set -o pipefail
+        for ctr in $(docker ps -a --filter name='ircfiber-gateway' --format '{{.Names}}' | sort); do
+          docker restart "$ctr" >/dev/null
+          echo "Restarted $ctr"
+        done
+      when: "'gateway' in (components | split(',') | map('trim') | list)"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['ircfiber_gw'] | default([]) }}"
+      loop_control:
+        loop_var: item
+
+    - name: Restart Engines
+      ansible.builtin.shell: |
+        ctr="ircfiber-engine-{{ ircfiber_engine_id }}"
+        if [ -n "$(docker ps -a -q --filter name="$ctr")" ]; then
+          echo "Restarting $ctr"
+          docker restart --time 10 "$ctr" >/dev/null
+          echo "RESTART_OK"
+        else
+          echo "Container $ctr does not exist — skipping"
+          echo "RESTART_SKIPPED"
+        fi
+      when: "'engine' in (components | split(',') | map('trim') | list)"
+      loop: "{{ groups['ircfiber_engines'] | default([]) }}"
+      loop_control:
+        loop_var: item
+
+    - name: Restart Connection Holder
+      community.docker.docker_container:
+        name: "ircfiber-holder-{{ hostvars[item].ircfiber_engine_id | default(inventory_hostname_short) }}"
+        restart: true
+      ignore_errors: true
+      when: "'holder' in (components | split(',') | map('trim') | list)"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['ircfiber_backend'] | default([]) }}"
+      loop_control:
+        loop_var: item
+
+    - name: Restart Mongo
+      community.docker.docker_container:
+        name: ircfiber-mongo
+        restart: true
+      when: "'mongo' in (components | split(',') | map('trim') | list)"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['ircfiber_backend'] | default([]) }}"
+      loop_control:
+        loop_var: item
+
+    - name: Restart Redis
+      community.docker.docker_container:
+        name: ircfiber-redis
+        restart: true
+      when: "'redis' in (components | split(',') | map('trim') | list)"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['ircfiber_backend'] | default([]) }}"
+      loop_control:
+        loop_var: item

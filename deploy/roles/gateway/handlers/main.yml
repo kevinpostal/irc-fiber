@@ -1,0 +1,6 @@
+---
+- name: Restart gateway replicas
+  community.docker.docker_container:
+    name: "{{ item }}"
+    restart: true
+  loop: "{{ ['ircfiber-gateway'] if (gateway_replica_count | default(1) | int) == 1 else (range(gateway_replica_count | default(1) | int) | map('regex_replace', '^', 'ircfiber-gateway-') | list) }}"

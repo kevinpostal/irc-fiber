@@ -1,0 +1,13 @@
+---
+# Deploy pre-built New Relic-style SigNoz dashboards.
+# Usage:
+#   ansible-playbook playbooks/signoz_dashboards.yml
+#   -e 'vault_signoz_admin_password=YOUR_PASSWORD'
+
+- name: Deploy New Relic-style SigNoz dashboards
+  hosts: ircfiber-ovh-1
+  become: true
+  gather_facts: false
+  roles:
+    - role: signoz_dashboards
+      tags: [signoz_dashboards]

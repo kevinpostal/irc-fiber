@@ -1,0 +1,52 @@
+---
+# Cloudflare Tunnel (cloudflared) — setup
+#
+# Runs cloudflared as a Docker container that connects outbound to
+# Cloudflare's edge and forwards traffic for your public hostnames
+# to Caddy on the internal ircfiber Docker network.
+#
+# First-time setup:
+#   1. Create a named tunnel in Cloudflare Zero Trust dashboard:
+#        https://one.dash.cloudflare.com/ → Networks → Tunnels →
+#        "Add a tunnel" → named tunnel (e.g. "ircfiber-prod-1")
+#   2. Copy the tunnel token.
+#   3. Put the token in the encrypted vault:
+#        ansible-vault edit inventories/production/group_vars/vault.yml
+#      Set vault_cloudflared_tunnel_token.
+#   4. In the Cloudflare dashboard, add Public Hostnames to your tunnel:
+#        - ircfiber.com        → http://ircfiber-caddy:80
+#        - www.ircfiber.com    → http://ircfiber-caddy:80
+#      (Both will create CNAME records automatically in Cloudflare DNS.
+#       You can delete the old A records for these hostnames.)
+#   5. Run:
+#        ansible-playbook playbooks/cloudflared.yml --ask-vault-pass
+#
+# After tunnel is confirmed working, optionally close firewall ports
+# 80/443 to the public internet (keep them open to the Tailscale subnet
+# for direct tailnet access if desired).
+
+- name: Preflight — ensure vault variables are defined
+  hosts: ircfiber
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+    - name: Verify cloudflared vault variables are present
+      ansible.builtin.assert:
+        that:
+          - vault_cloudflared_tunnel_token is defined
+          - vault_cloudflared_tunnel_token | length > 0
+        fail_msg: |
+          vault_cloudflared_tunnel_token is missing or empty. Run:
+            ansible-vault edit inventories/production/group_vars/vault.yml
+          and add it. The token is available in Cloudflare Zero Trust dashboard
+          → Networks → Tunnels → your tunnel → Configure → Copy token.
+
+- name: Deploy cloudflared tunnel container
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: cloudflared

@@ -1,0 +1,17 @@
+---
+- name: Create ircfiber Docker network
+  community.docker.docker_network:
+    name: "{{ docker_ircfiber_network }}"
+    driver: bridge
+    ipam_config:
+      - subnet: "{{ docker_ircfiber_subnet }}"
+    state: present
+
+- name: Show network info
+  community.docker.docker_network_info:
+    name: "{{ docker_ircfiber_network }}"
+  register: ircfiber_net_info
+
+- name: Print network info
+  ansible.builtin.debug:
+    var: ircfiber_net_info.network

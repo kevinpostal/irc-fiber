@@ -1,0 +1,125 @@
+---
+- name: Ensure Caddy directories exist
+  ansible.builtin.file:
+    path: "{{ caddy_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure Caddy data & config volumes exist
+  community.docker.docker_volume:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - "{{ caddy_data_volume }}"
+    - "{{ caddy_config_volume }}"
+
+- name: Detect tailscaled.sock (for Caddy Tailscale cert manager)
+  ansible.builtin.stat:
+    path: "{{ caddy_tailscale_socket }}"
+  register: caddy_tailscale_socket_stat
+  when: caddy_tailscale_socket | length > 0
+
+- name: Detect SigNoz service-account API key
+  ansible.builtin.stat:
+    path: "{{ caddy_signoz_api_key_path }}"
+  register: caddy_signoz_api_key_stat
+  when: caddy_signoz_route_enabled | bool
+
+- name: Read SigNoz API key (when present)
+  ansible.builtin.slurp:
+    src: "{{ caddy_signoz_api_key_path }}"
+  register: caddy_signoz_api_key_b64
+  no_log: true
+  when:
+    - caddy_signoz_route_enabled | bool
+    - caddy_signoz_api_key_stat.stat.exists | default(false)
+
+- name: Set SigNoz API key fact
+  ansible.builtin.set_fact:
+    caddy_signoz_api_key: >-
+      {{
+        (caddy_signoz_api_key_b64.content | b64decode | trim)
+        if (caddy_signoz_api_key_stat.stat.exists | default(false))
+        else ''
+      }}
+  no_log: true
+
+- name: Render Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ caddy_config_dir }}/Caddyfile"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart caddy
+
+- name: Run ircfiber-caddy
+  community.docker.docker_container:
+    name: "{{ caddy_container_name }}"
+    image: "{{ caddy_image }}"
+    state: started
+    restart_policy: unless-stopped
+    # Caddy joins the ircfiber_net bridge so it can resolve
+    # 'ircfiber-gateway' (the gateway container's DNS alias on that net).
+    # It also joins ircfiber_logging so it can reach Grafana and SigNoz.
+    networks:
+      - name: "{{ docker_ircfiber_network }}"
+      - name: ircfiber_logging
+    networks_cli_compatible: true
+    command:
+      - "caddy"
+      - "run"
+      - "--environ"
+      - "--config"
+      - "/etc/caddy/Caddyfile"
+    # SigNoz API key is read from /etc/ircfiber/signoz-mcp/.api_key on
+    # the host and exposed to Caddy as SIGNOZ_API_KEY. The Caddyfile
+    # uses {$SIGNOZ_API_KEY} to inject the header on /signoz/* requests.
+    # Absent the key file the env var is empty and the /signoz route
+    # is skipped at template render time.
+    env:
+      SIGNOZ_API_KEY: "{{ caddy_signoz_api_key | default('') }}"
+    ports: >-
+      {{
+        ["80:80", "443:443"]
+        + ([caddy_tailscale_logging_address ~ ":" ~ (caddy_tailscale_logging_port | default(3443)) ~ ":" ~ (caddy_tailscale_logging_port | default(3443))] if (caddy_tailscale_logging_enabled | default(false) | bool) else [])
+        + ([caddy_tailscale_logging_address ~ ":" ~ (caddy_tailscale_signoz_port | default(3003)) ~ ":" ~ (caddy_tailscale_signoz_port | default(3003))] if (caddy_tailscale_signoz_enabled | default(false) | bool) else [])
+      }}
+    # Bind-mount tailscaled.sock so the built-in caddytls.Tailscale cert
+    # manager can fetch real certs for *.ts.net hostnames. Mounted at the
+    # same path inside the container (Caddy looks there by default).
+    volumes: "{{ caddy_volumes }}"
+    capabilities:
+      - NET_BIND_SERVICE
+    security_opts:
+      - "no-new-privileges:true"
+    healthcheck:
+      # Use the docker-network DNS name so this works inside the
+      # container without depending on host DNS.
+      # Hit the plain-HTTP tunnel port + /health endpoint to avoid
+      # TLS redirect loops when Caddy has tls internal configured.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    labels:
+      com.ircfiber.component: "caddy"
+      com.ircfiber.version: "{{ ircfiber_version }}"
+  vars:
+    caddy_volumes: >-
+      {{
+        [
+          (caddy_config_dir + '/Caddyfile:/etc/caddy/Caddyfile:ro'),
+          (caddy_data_volume + ':/data'),
+          (caddy_config_volume + ':/config')
+        ]
+        +
+        (
+          [(caddy_tailscale_socket + ':/var/run/tailscale/tailscaled.sock')]
+          if (caddy_tailscale_socket | length > 0
+              and (caddy_tailscale_socket_stat.stat.exists | default(false)))
+          else []
+        )
+      }}
