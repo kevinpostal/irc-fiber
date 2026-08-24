@@ -7,7 +7,7 @@ Persistent IRC bouncer with a web client. Stay connected to multiple networks, r
 ![Svelte 5](https://img.shields.io/badge/Frontend-Svelte%205-FF3E00)
 ![Docker](https://img.shields.io/badge/Docker-BuildKit-2496ED)
 
-<img src="public/app-screenshot.png" alt="IRC Fiber web UI" width="800" />
+<video src="https://github.com/kevinpostal/irc-fiber/releases/download/v0.3.0-demo/irc-fiber-final-minimal.mp4" width="800" autoplay loop muted controls></video>
 
 ## Features
 
