@@ -19,6 +19,12 @@ Persistent IRC bouncer with a web client. Stay connected to multiple networks, r
   <a href="https://github.com/stats-organization/github-stats-extended"><img src="https://github-stats-extended.vercel.app/api/top-langs/?username=kevinpostal&layout=compact&langs_count=8&theme=tokyonight&hide_border=true" alt="Top langs" /></a>
 </p>
 
+<p align="center">
+  <a href="https://skillicons.dev">
+    <img src="https://skillicons.dev/icons?i=py,js,ts,go,docker,kubernetes,aws,gcp,postgres,mongodb,redis,git,svelte,vite&perline=9" alt="Skills" />
+  </a>
+</p>
+
 ## Features
 
 - **Always-on bouncer** — Engine holds IRC TCP/TLS, rejoins and replays via `CHATHISTORY` on reconnect
