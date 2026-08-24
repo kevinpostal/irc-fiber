@@ -7,6 +7,8 @@ Persistent IRC bouncer with a web client. Stay connected to multiple networks, r
 ![Svelte 5](https://img.shields.io/badge/Frontend-Svelte%205-FF3E00)
 ![Docker](https://img.shields.io/badge/Docker-BuildKit-2496ED)
 [![Hits](https://hits.dwyl.com/kevinpostal/irc-fiber.svg)](https://hits.dwyl.com/kevinpostal/irc-fiber)
+[![Gmail](https://img.shields.io/badge/Gmail-333333?style=for-the-badge&logo=gmail&logoColor=red)](mailto:kevindpostal@gmail.com)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://linkedin.com/in/kevinpostal)
 
 <p align="center">
   <a href="https://github.com/user-attachments/assets/6720acd2-4c81-476f-ade8-c144bf9ada23">
@@ -15,7 +17,7 @@ Persistent IRC bouncer with a web client. Stay connected to multiple networks, r
 </p>
 
 <p align="center">
-  <a href="https://github.com/stats-organization/github-stats-extended"><img src="https://github-stats-extended.vercel.app/api?username=kevinpostal&show_icons=true&theme=tokyonight&hide_border=true&include_all_commits=true&count_private=true" alt="GitHub stats" /></a>
+  <a href="https://github.com/stats-organization/github-stats-extended"><img src="https://github-stats-extended.vercel.app/api?username=kevinpostal&show_icons=true&theme=tokyonight&hide_border=true&include_all_commits=true&count_private=true&hide_rank=true" alt="GitHub stats" /></a>
   <a href="https://github.com/stats-organization/github-stats-extended"><img src="https://github-stats-extended.vercel.app/api/top-langs/?username=kevinpostal&layout=compact&langs_count=8&theme=tokyonight&hide_border=true" alt="Top langs" /></a>
 </p>
 
