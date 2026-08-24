@@ -7,7 +7,11 @@ Persistent IRC bouncer with a web client. Stay connected to multiple networks, r
 ![Svelte 5](https://img.shields.io/badge/Frontend-Svelte%205-FF3E00)
 ![Docker](https://img.shields.io/badge/Docker-BuildKit-2496ED)
 
-<video src="https://github.com/user-attachments/assets/6720acd2-4c81-476f-ade8-c144bf9ada23" width="800" autoplay loop muted controls></video>
+<p align="center">
+  <a href="https://github.com/user-attachments/assets/6720acd2-4c81-476f-ade8-c144bf9ada23">
+    <img src="https://github.com/kevinpostal/irc-fiber/releases/download/v0.3.0-demo/irc-fiber-final-minimal.gif" width="800" alt="IRC Fiber demo — splash → #autism 5s → #zod 5s, click for video" />
+  </a>
+</p>
 
 ## Features
 
