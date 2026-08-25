@@ -1,0 +1,29 @@
+name: Bump submodules
+
+on:
+  repository_dispatch:
+    types: [bump-common, bump-site, bump-engine]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'  # daily drift check
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update submodules to latest main
+        run: |
+          git submodule update --remote site engine common
+          git add site engine common
+          if git diff --cached --quiet; then
+            echo "No submodule updates"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: bump submodules to latest main [skip ci]"
+          git push
