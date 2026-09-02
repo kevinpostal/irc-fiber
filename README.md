@@ -29,39 +29,43 @@ Persistent IRC bouncer with a web client. Stay connected to multiple networks, r
 
 ## Features
 
-- **Always-on bouncer** — Engine holds IRC TCP/TLS, rejoins and replays via `CHATHISTORY` on reconnect
-- **Web client** — Svelte 5 + Vite, IRCCloud-inspired layout, WebSocket live updates, member list, typing indicators
+- **Always-on bouncer** — Engine holds IRC TCP/TLS, rejoins and replays via `CHATHISTORY` on reconnect; `LastSeenRepository` (Redis `irc:lastseen:<userId>`) tracks per-buffer read markers advance-only
+- **Bouncer wire** (`site/backend/source/ircfiber/bnc/`) — `bnc:<password>` / `bnc@<clientId>:<password>` auth, per-network password tokens (Mongo `networks.bncPassword`), `/api/admin/bnc` revoke + disconnect, `CHATHISTORY LATEST/BEFORE/AFTER/TARGETS` windowed via `MessageRepository.getWindow()` (chat-only `PRIVMSG/NOTICE` limit)
+- **Web client** — Svelte 5 + Vite, IRCCloud-inspired layout, WebSocket live updates, member list, typing indicators, rewritten `MessageList` scroll/batching (removed `LoadMore`/`scrollAnchor`)
 - **History** — MongoDB-backed scrollback with Redis dedup, lazy load and search
-- **Multi-network** — One engine process per host, sharded by network, horizontal via `ServerRegistry`
-- **Ops** — Admin SPA (`/admin`), SigNoz observability (traces/metrics/logs), Ansible deploys
+- **Multi-network** — One engine process per host, sharded by network, horizontal via `ServerRegistry`; InspIRCd split into `inspircd.conf`/`modules.conf`/`nickserv.conf`/`opers.conf`/`services.conf` + `inspircd_hmac.py` cloak
+- **Ops** — Admin SPA (`/admin`), SigNoz observability (traces/metrics/logs), Ansible deploys + k8s `site/deploy/k8s/ircfiber` (gateway/engine/mongo-stateful/mullvad) and `signoz`
 
 ## Architecture
 
 ```mermaid
 flowchart LR
   Browser -- WebSocket --> Gateway
-  Gateway -- Redis pub/sub --> Engine
-  Engine -- TCP/TLS --> IRC[IRC Networks]
+  Gateway -- "bnc:<password> / CHATHISTORY" --> Bouncer
+  Bouncer -- Redis pub/sub --> Engine
+  Engine -- TCP/TLS --> IRC[IRC Networks / InspIRCd]
   Gateway --> Mongo[(MongoDB)]
   Gateway --> Redis[(Redis)]
   Engine --> Redis
   Gateway --> SigNoz
+  Engine --> SigNoz
 ```
 
-- **Gateway** (`site/backend`): vibe.d HTTP/WS, auth, sessions (Redis 14d), static `public/dist`
-- **Engine** (`engine`): D daemon, `connection.d` + `manager.d`, SASL, `CHATHISTORY`, reconnect backoff, `EngineJanitor` TTL
-- **Common** (`site/common` + `engine/common` duplicated, `common/` reference): `redis/protocol.d`, `models/*`, `db/*`, `storage/*` — inter-service contract
+- **Gateway** (`site/backend`): vibe.d HTTP/WS, auth, sessions (Redis 14d), `bnc/listener.d` + `bnc/wire.d` + `bnc/client.d`, static `public/dist`
+- **Engine** (`engine`): D daemon, `connection.d` (JOIN recovery, NickServ) + `reconnect.d` (backoff) + `processor.d`, `CHATHISTORY` window `getWindow()`, reconnect backoff, `EngineJanitor` TTL
+- **Common** (`common/` canonical, `site/common` + `engine/common` mirrored): `db/lastseen.d`, `db/messages.d` window helpers, `redis/protocol.d`, `storage/*` — inter-service contract versioned `~>0.3.0`
 
 ## Repository layout
 
-This is a **superproject**. Clone once with submodules:
+This is a **superproject** (`irc-fiber`). Clone once with submodules:
 
 ```bash
-git clone --recursive https://github.com/kevinpostal/IRC_FIBER.git
-cd IRC_FIBER
+git clone --recursive https://github.com/kevinpostal/irc-fiber.git
+cd irc-fiber          # or local: ~/LocalWork/ircfiber/ircfiber-infra
 ls site/   # kevinpostal/ircfiber-site   — frontend + gateway
 ls engine/ # kevinpostal/ircfiber-engine — irc daemon
 ls common/ # kevinpostal/ircfiber-common — shared lib (also inlined in site/engine)
+ls deploy/ # canonical Ansible + local compose (k8s lives in site/deploy/k8s/)
 git submodule update --init --recursive
 git pull --recurse-submodules && git submodule update --remote
 ```
@@ -71,9 +75,11 @@ git pull --recurse-submodules && git submodule update --remote
 | `ircfiber-site` | `frontend/`, `backend/`, `public/`, `common/` | `Containerfile.site` → `runtime-gateway` |
 | `ircfiber-engine` | `engine/`, `common/`, `backend/dub.sdl` stub | `Containerfile.engine` → `runtime-engine` |
 | `ircfiber-common` | `source/ircfiber/*`, `dub.sdl` | library |
-| `IRC_FIBER` (this) | `site` + `engine` + `common` submodules, top-level `deploy/` | orchestration |
+| `irc-fiber` (this) | `site` + `engine` + `common` submodules, top-level `deploy/` | orchestration — `deploy/playbooks/*`, `deploy/roles/*`, `site/deploy/k8s/ircfiber` |
 
-`common/` is duplicated inline in `site`/`engine` (Option A). Drift guard: `site/scripts/check-common-drift.sh --fetch` fails CI on drift. Future: `common` as versioned dub package `~>0.3.0`.
+`common/` is mirrored inline in `site`/`engine` (`rsync -a site/common/ engine/common/ && rsync -a site/common/ common/`). Drift guard: `site/scripts/check-common-drift.sh --fetch` fails CI on drift. Now versioned as dub package `~>0.3.0`.
+
+**Split-workspace** (`~/LocalWork/ircfiber/`): `site/`, `engine/`, `common/` are independent clones for fast local `make debug` / `make engine-start`; `ircfiber-infra/` is a clone of this superproject (`irc-fiber`) and holds the canonical `deploy/` + submodule pins. Keep `deploy/` edits in `ircfiber-infra/deploy/` (or `site/deploy/k8s/`), then bump submodules here.
 
 Monorepo history preserved at `pre-split-main` + tag `pre-split-2026-08-23`.
 
@@ -115,17 +121,25 @@ echo "my-vault-password" > deploy/.vault_pass.txt  # gitignored
 
 ## Deployment
 
-Decoupled — site never restarts engine (holds TCP/TLS):
+Decoupled — site never restarts engine (holds TCP/TLS). Canonical playbooks live in this superproject's `deploy/` (Ansible) and `site/deploy/k8s/` (k8s):
 
 ```bash
-# site (gateway + frontend) — no engine touch
-cd site && ansible-playbook deploy/playbooks/deploy-site.yml -l vps-efb4b52d
+# Ansible (via superproject — single source, no duplication)
+ansible-playbook deploy/playbooks/deploy-site.yml -l vps-efb4b52d
+ansible-playbook deploy/playbooks/deploy-engine.yml -l vps-efb4b52d
+ansible-playbook deploy/playbooks/ircd.yml            # InspIRCd split confs
+ansible-playbook deploy/playbooks/signoz_bridge.yml   # SigNoz
 
-# engine — no gateway touch
-cd engine && ansible-playbook deploy/playbooks/deploy-engine.yml -l vps-efb4b52d
+# legacy split-workspace (still works)
+# cd site && ansible-playbook deploy/playbooks/deploy-site.yml -l vps-efb4b52d
+# cd engine && ansible-playbook deploy/playbooks/deploy-engine.yml -l vps-efb4b52d
+
+# k8s (ubuntu-docker single-node, Tailscale 100.94.116.56)
+make -C site -f Makefile.k8s k8s-up   # build → push → deploy
+make -C site -f Makefile.k8s k8s-status k8s-logs
 ```
 
-Host: `vps-efb4b52d` → `/opt/ircfiber-site` (`Containerfile.site`) + `/opt/ircfiber-engine` (`Containerfile.engine`), gateway `Up` + `engine PID 7` stable. See `site/deploy/playbooks/deploy-site.yml` for BuildKit + `GIT_HASH` injection.
+Host: `vps-efb4b52d` → `/opt/ircfiber-site` (`Containerfile.site`) + `/opt/ircfiber-engine` (`Containerfile.engine`), gateway `Up` + `engine PID 7` stable. See `deploy/playbooks/deploy-site.yml` for BuildKit + `GIT_HASH` injection. `k3s-ubuntu.yaml` (kubeconfig with client cert) is **not** committed — keep local or `KUBECONFIG=~/LocalWork/ircfiber/k3s-ubuntu.yaml`.
 
 ## Development
 
