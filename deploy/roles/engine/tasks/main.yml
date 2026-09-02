@@ -48,6 +48,53 @@
     group: root
     mode: "0750"
 
+- name: Configure per-user IPv6 (host-level, idempotent)
+  when: ircfiber_ipv6_prefix is defined and ircfiber_ipv6_prefix | length > 0
+  block:
+    - name: Enable IPv6 non-local bind (allows binding any IID in the routed prefix)
+      ansible.posix.sysctl:
+        name: net.ipv6.ip_nonlocal_bind
+        value: "1"
+        sysctl_set: true
+        state: present
+        reload: true
+
+    - name: Derive IPv6 prefix without CIDR for local route
+      ansible.builtin.set_fact:
+        _ipv6_prefix_nocidr: "{{ ircfiber_ipv6_prefix.split('/')[0] }}"
+        _ipv6_prefix_len: "{{ ircfiber_ipv6_prefix.split('/')[1] | default('64') }}"
+
+    - name: Add local route for the per-user IPv6 prefix (makes every IID bindable)
+      ansible.builtin.command: >
+        ip -6 route add local {{ _ipv6_prefix_nocidr }}/{{ _ipv6_prefix_len }} dev lo
+      register: _ipv6_route_add
+      changed_when: _ipv6_route_add.rc == 0
+      failed_when: _ipv6_route_add.rc != 0 and 'File exists' not in _ipv6_route_add.stderr
+
+    - name: Persist IPv6 local route via systemd (survives reboot)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ircfiber-ipv6-route.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=IRC Fiber per-user IPv6 local route ({{ ircfiber_ipv6_prefix }})
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/sbin/ip -6 route add local {{ _ipv6_prefix_nocidr }}/{{ _ipv6_prefix_len }} dev lo
+          ExecStop=/sbin/ip -6 route del local {{ _ipv6_prefix_nocidr }}/{{ _ipv6_prefix_len }} dev lo
+          [Install]
+          WantedBy=multi-user.target
+      register: _ipv6_route_service
+
+    - name: Enable IPv6 route service
+      ansible.builtin.systemd:
+        name: ircfiber-ipv6-route.service
+        enabled: true
+        daemon_reload: "{{ _ipv6_route_service.changed }}"
+
 - name: Render engine env file
   ansible.builtin.template:
     src: env.j2
@@ -102,7 +149,8 @@
   loop_control:
     label: "{{ item.name }}"
 
-- name: Run ircfiber-engine
+- name: Run ircfiber-engine (bridge mode, default when IPv6 per-user disabled)
+  when: ircfiber_ipv6_prefix is not defined or ircfiber_ipv6_prefix | length == 0
   community.docker.docker_container:
     name: "{{ engine_container_name }}"
     image: "{{ ircfiber_engine_image_full }}"
@@ -111,9 +159,38 @@
     command: ["/usr/local/bin/ircfiber-engine-entrypoint.sh"]
     networks:
       - name: "{{ docker_ircfiber_network }}"
-      # Join the logging network so the engine can push OTLP traces to
-      # the otel-collector. Required for distributed tracing.
       - name: ircfiber_logging
+    env: "{{ _engine_env }}"
+    volumes: []
+    security_opts:
+      - "no-new-privileges:true"
+    ulimits:
+      - "nofile:65536:65536"
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/local/bin/ircfiber-engine-healthcheck.sh"]
+      interval: "{{ engine_healthcheck_interval }}"
+      timeout: "{{ engine_healthcheck_timeout }}"
+      retries: "{{ engine_healthcheck_retries }}"
+      start_period: "{{ engine_healthcheck_start_period }}"
+    labels:
+      com.ircfiber.component: "engine"
+      com.ircfiber.version: "{{ ircfiber_version }}"
+      com.ircfiber.engine_id: "{{ ircfiber_engine_id }}"
+
+- name: Run ircfiber-engine (host mode, for per-user IPv6 — preserves source IP)
+  when: ircfiber_ipv6_prefix is defined and ircfiber_ipv6_prefix | length > 0
+  community.docker.docker_container:
+    name: "{{ engine_container_name }}"
+    image: "{{ ircfiber_engine_image_full }}"
+    state: started
+    restart_policy: unless-stopped
+    command: ["/usr/local/bin/ircfiber-engine-entrypoint.sh"]
+    network_mode: host
+    # In host mode the container shares the host's network namespace, so the
+    # per-user IPv6 source addresses (ip -6 route add local <prefix>/64 dev lo)
+    # are directly bindable and the IRC server sees the real per-user /128
+    # instead of a NAT'd bridge IP. DNS for irc.ircfiber.com resolves via
+    # public IP → host-published 6667/6697 (hairpin), which is correct.
     env: "{{ _engine_env }}"
     volumes: []
     security_opts:
