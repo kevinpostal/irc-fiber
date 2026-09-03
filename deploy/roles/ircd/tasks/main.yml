@@ -1,5 +1,20 @@
 ---
-# IRC Fiber — Deploy Ergo IRC daemon
+# IRC Fiber — STALE ROLE (Ergo). DO NOT USE.
+#
+# irc.ircfiber.com runs InspIRCd 4 + Anope 2 via
+# site/deploy/roles/ircd (see site/deploy/playbooks/ircd.yml). This role
+# still deploys Ergo and would replace InspIRCd, orphaning NickServ state
+# and breaking every engine/client connection. It fails closed until it
+# is either ported to InspIRCd or deleted.
+
+- name: Fail closed — superproject ircd role is stale (Ergo)
+  ansible.builtin.fail:
+    msg: >-
+      Refusing to deploy Ergo over irc.ircfiber.com, which runs
+      InspIRCd 4 + Anope 2. Deploy from site/deploy instead:
+      ansible-playbook playbooks/ircd.yml -l <host>
+      (run from ircfiber-infra/site/deploy/). See
+      site/deploy/roles/ircd/tasks/main.yml.
 
 - name: Preflight — vault_ircd_oper_password must be set
   ansible.builtin.assert:
