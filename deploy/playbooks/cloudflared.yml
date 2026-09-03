@@ -16,6 +16,8 @@
 #   4. In the Cloudflare dashboard, add Public Hostnames to your tunnel:
 #        - ircfiber.com        → http://ircfiber-caddy:80
 #        - www.ircfiber.com    → http://ircfiber-caddy:80
+#        - guru.ircfiber.com   → https://irc3.tail544547.ts.net   (irc3 GURU on k3s via Tailscale VIP;
+#          originServerName/httpHostHeader = irc3.tail544547.ts.net, proxied CNAME → <tunnel-id>.cfargotunnel.com)
 #      (Both will create CNAME records automatically in Cloudflare DNS.
 #       You can delete the old A records for these hostnames.)
 #   5. Run:

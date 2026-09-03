@@ -12,6 +12,8 @@
 #   3. Configure the tunnel's Public Hostnames in the dashboard:
 #        - ircfiber.com        → http://ircfiber-caddy:80
 #        - www.ircfiber.com    → http://ircfiber-caddy:80
+#        - guru.ircfiber.com   → https://irc3.tail544547.ts.net   (irc3 GURU on k3s via Tailscale VIP;
+#          originServerName/httpHostHeader = irc3.tail544547.ts.net, proxied CNAME → <tunnel-id>.cfargotunnel.com)
 #   4. Run:  ansible-playbook playbooks/cloudflared.yml
 
 cloudflared_image: "cloudflare/cloudflared:latest"
