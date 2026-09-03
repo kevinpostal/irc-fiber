@@ -1,20 +1,13 @@
 ---
-# IRC Fiber — Deploy IRC daemon (Ergo)
+# IRC Fiber — Deploy IRC daemon (RETIRED in this tree)
 #
-# Standalone playbook. Run from the deploy/ directory:
+# Do not use: run the canonical playbook from the site tree instead:
 #
-#   ansible-playbook playbooks/ircd.yml -l ircfiber-ovh-1
+#   cd site/deploy && ansible-playbook playbooks/ircd.yml -l vps-efb4b52d
 #
-# Sets up:
-#   - Ergo IRC daemon container (ircfiber-ircd)
-#   - Ports 6667 (plain) and 6697 (TLS) exposed
-#   - Persistent data volume for accounts + channels
-#   - NickServ, ChanServ, HostServ, MemoServ built-in services
-#   - Admin oper account from vault
-#   - Cloudflare DNS A record for irc.ircfiber.com
-#   - UFW firewall rules for IRC ports
-#
-# Prerequisites: site.yml has been run (Docker, Tailscale, firewall base).
+# The Ergo-based role that used to live here was removed; the live stack is
+# InspIRCd 4 + Anope 2 (site/deploy/roles/ircd/). The play below fails
+# loudly rather than deploying the wrong daemon.
 
 - name: Preflight — vault variables
   hosts: ircfiber
@@ -50,11 +43,14 @@
         - cloudflare_target_ip is defined
         - cloudflare_target_ip | length > 0
 
-- name: Deploy IRC daemon
+- name: Deploy IRC daemon (retired here — see site/deploy/playbooks/ircd.yml)
   hosts: ircfiber_backend
   become: true
-  gather_facts: true
-  vars_files:
-    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
-  roles:
-    - role: ircd
+  gather_facts: false
+  tasks:
+    - name: Refuse — ircd lives in the site tree now
+      ansible.builtin.fail:
+        msg: >-
+          The top-level ircd role (Ergo) was retired. The live stack is
+          InspIRCd 4 + Anope 2, deployed from site/deploy:
+          cd site/deploy && ansible-playbook playbooks/ircd.yml

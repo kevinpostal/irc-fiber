@@ -158,11 +158,14 @@
   roles:
     - role: engine
 
-- name: Deploy IRC daemon (Ergo)
+- name: Deploy IRC daemon (retired here — see site/deploy/playbooks/ircd.yml)
   hosts: ircfiber_backend
   become: true
-  gather_facts: true
-  vars_files:
-    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
-  roles:
-    - role: ircd
+  gather_facts: false
+  tasks:
+    - name: Refuse — ircd lives in the site tree now
+      ansible.builtin.fail:
+        msg: >-
+          The top-level ircd role (Ergo) was retired. The live stack is
+          InspIRCd 4 + Anope 2, deployed from site/deploy:
+          cd site/deploy && ansible-playbook playbooks/ircd.yml
