@@ -107,6 +107,16 @@ swap: ## Swap only: run blue/green playbook (image already built on host)
 rollback: ## Roll back gateway to :blue-prev image (health-checked swap, engine untouched)
 	@printf '\n$(Y)$(WR) Rollback gateway → irc-fiber-gateway:blue-prev on $(TARGET)$(R)\n'
 	@$(SSH) 'sudo docker inspect irc-fiber-gateway:blue-prev >/dev/null 2>&1 || { echo "✗ no :blue-prev image on host — deploy-blue tags it first"; exit 1; }'
+	@# An anchor identical to what is running is not an anchor. tag-prev runs
+	@# BEFORE the build, so if a previous deploy failed between tag-prev and the
+	@# swap, :blue-prev == the live image and "rolling back" would silently
+	@# redeploy the broken version while reporting success. Refuse that.
+	@$(SSH) 'prev=$$(sudo docker inspect -f "{{.Id}}" irc-fiber-gateway:blue-prev); \
+	  live=$$(sudo docker inspect -f "{{.Image}}" ircfiber-gateway); \
+	  if [ "$$prev" = "$$live" ]; then \
+	    echo "✗ :blue-prev is the image already running ($${live%%*}) — there is nothing to roll back to"; exit 1; \
+	  fi; \
+	  echo "rolling back: live=$$live → prev=$$prev"'
 	@$(PLAY) playbooks/gateway-bluegreen.yml -e ircfiber_gateway_image_full=irc-fiber-gateway:blue-prev 2>&1 | tail -15
 	@printf '%b\n' "$(BG)$(OK) Rolled back to :blue-prev — verify: make health$(R)"
 
