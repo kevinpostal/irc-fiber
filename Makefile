@@ -87,12 +87,22 @@ deploy-blue: tag-prev ## Full blue/green gateway deploy (tag-prev → build → 
 	@printf '\n$(BG)$(OK) Blue/green gateway deploy → $(TARGET) (engine untouched)$(R)\n'
 	@$(MAKE) -C site -f Makefile.site update-gateway-bluegreen TARGET=$(TARGET) VAULT_PASS_FILE=$(VAULT_PASS_FILE)
 
-# engine/deploy has no .vault_pass.txt — default to site's (absolute, since
-# the sub-make cd's into engine/deploy). A CLI VAULT_PASS_FILE=... still wins.
+# engine/deploy has no .vault_pass.txt or inventory of its own — both are
+# gitignored and are copied from site/deploy on demand below. A CLI
+# VAULT_PASS_FILE=... still wins.
 _ENGINE_VAULT = $(if $(filter file,$(origin VAULT_PASS_FILE)),$(CURDIR)/site/deploy/.vault_pass.txt,$(VAULT_PASS_FILE))
+# The playbook is invoked directly instead of `$(MAKE) -C engine … update`:
+# that target still depends on a `frontend-build` from the monorepo era, so
+# in the split workspace it dies on engine/frontend/package.json missing.
+# site's own engine targets are just as stale (site/ has no engine/ package),
+# so this playbook — which builds the engine on the target with BuildKit and
+# recreates ircfiber-engine-ovh — is the only working path.
 deploy-engine: ## Engine deploy (hard restart, brief IRC reconnect — NOT zero-downtime)
 	@printf '\n$(Y)$(WR) Engine deploy → $(TARGET) (hard restart, brief IRC disconnect)$(R)\n'
-	@$(MAKE) -C engine -f Makefile.engine update TARGET=$(TARGET) VAULT_PASS_FILE=$(_ENGINE_VAULT)
+	@cp -n site/deploy/inventories/production/hosts.ini engine/deploy/inventories/production/hosts.ini 2>/dev/null || true
+	@cp -n $(_ENGINE_VAULT) engine/deploy/.vault_pass.txt 2>/dev/null || true
+	@chmod 600 engine/deploy/.vault_pass.txt 2>/dev/null || true
+	@cd engine/deploy && ansible-playbook --vault-password-file .vault_pass.txt playbooks/deploy-engine.yml -l $(TARGET)
 
 tag-prev: ## Tag running gateway image as :blue-prev (rollback anchor)
 	@printf '%b\n' "$(C)$(AR) tagging live gateway image → irc-fiber-gateway:blue-prev on $(TARGET)$(R)"
