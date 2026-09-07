@@ -123,12 +123,18 @@ define SHIP_SH
 set -euo pipefail
 cd "$$ROOT"
 
-# 1. Refuse a dirty tree: the image is built from the commit, never the worktree.
+# 1. Refuse a dirty tree: the image is built from the commit, never the
+#    worktree. ALLOW_DIRTY=1 ships anyway after printing what is being left
+#    behind — needed when an unrelated file is mid-edit in another session
+#    and the change to deploy is already committed.
 dirty=$$( { git -C "$$SRC" diff --name-only HEAD; git -C "$$SRC" ls-files --others --exclude-standard; } )
 if [ -n "$$dirty" ]; then
-  printf '%b\n' "$(Y)$(WR) $$SRC/ working tree is dirty — commit first; these would NOT be deployed:$(R)"
+  printf '%b\n' "$(Y)$(WR) $$SRC/ working tree is dirty — these are NOT in the image:$(R)"
   printf '  %s\n' $$dirty
-  exit 1
+  if [ -z "$(ALLOW_DIRTY)" ]; then
+    printf '%b\n' "$(Y)  commit them, or re-run with ALLOW_DIRTY=1 to ship HEAD as-is$(R)"
+    exit 1
+  fi
 fi
 
 # 2. Identity of the commit being shipped.
