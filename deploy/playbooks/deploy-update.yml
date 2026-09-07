@@ -120,7 +120,7 @@
         DOCKER_BUILDKIT=1 docker build \
           --target builder \
           --build-arg LDC_VERSION={{ ldc_version }} \
-          --build-arg CACHE_BUST=$(date +%s) \
+          --build-arg CACHE_BUST={{ _local_git_hash.stdout | default('unknown') }} \
           --build-arg GIT_HASH={{ _local_git_hash.stdout | default('unknown') }} \
           --build-arg GIT_SHORT={{ _local_git_short.stdout | default('unknown') }} \
           --build-arg GIT_DESCRIBE={{ _local_git_describe.stdout | default('unknown') }} \
