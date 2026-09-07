@@ -1,18 +1,29 @@
 # ============================================================================
-# IRC Fiber Infra — Blue/Green Deployments (repo root)
+# IRC Fiber Infra — Deploys (repo root)
 # ============================================================================
 # There was never a Makefile here (nothing was deleted — git history has no
 # root Makefile; `site/` is a submodule whose wrapper is site/Makefile).
-# This file is the single entry point for zero-downtime deploys.
+# This file is the single entry point for deploys.
 #
-# Scope: GATEWAY ONLY (gateway + frontend). The engine (IRC daemon) holds
-# TCP/TLS + JOIN state and deploys by hard restart BY DESIGN — see
-# AGENTS.md "Engine Lifecycle". Do not blue/green the engine.
+# Pipeline (gateway and engine alike):
+#   laptop  --git push-->  builder (ubuntu-docker: buildx, warm dub/npm cache)
+#   builder --buildx --push-->  GHCR  (tag sha-<short>; digest captured)
+#   laptop  --ansible-->  prod pulls BY DIGEST, swaps, asserts the running
+#                         image id == requested, laptop gates on /api/version
+#   builder --imagetools-->  GHCR :prod  (promoted only after the swap held)
+# The laptop never carries image bytes. A frontend-only change never
+# recompiles D; a D-only change never runs vite (see site/Containerfile).
+#
+# Gateway swaps are blue/green (zero downtime). The engine (IRC daemon) holds
+# TCP/TLS + JOIN state and deploys by hard restart BY DESIGN — see AGENTS.md
+# "Engine Lifecycle". Do not blue/green the engine.
 #
 # Two fleets:
 #   OVH prod (docker over ansible) — targets without prefix
-#     make deploy-blue    # full: tag-prev → build → swap → verify
-#     make swap           # swap only (image already built on host)
+#     make ship           # gateway: tag-prev → build+push → swap by digest → gate → promote :prod
+#     make ship-engine    # engine:  build+push → restart by digest → gate → promote :prod
+#     make warm           # pre-build HEAD on the builder in the background (no deploy)
+#     make swap           # redeploy $(GW_REPO):prod (no build)
 #     make rollback       # swap back to :blue-prev (health-checked)
 #     make status|health|logs|engine-status
 #   k3s dev (kubectl) — k8s-* targets
@@ -21,7 +32,7 @@
 #     make k8s-rollback   # flip Service back to blue
 #     make k8s-status|k8s-clean-green
 #
-# Overrides: TARGET=host  VAULT_PASS_FILE=path  GREEN_TAG=tag
+# Overrides: TARGET=host  VAULT_PASS_FILE=path  BUILDER=user@host  GREEN_TAG=tag
 #            KUBE_CONTEXT=ctx  KUBE_NS=ns  GREEN_IMAGE=img
 # ============================================================================
 
@@ -38,6 +49,16 @@ _SSH_HOST       = $(or $(TARGET_SSH),$(shell grep -m1 'ansible_host=' site/deplo
 VAULT_PASS_FILE ?= .vault_pass.txt
 SSH_KEY         ?= $(HOME)/.ssh/id_ed25519_ircfiber
 
+# Builder + registry. The builder keeps a bare-ish clone per repo that the
+# laptop force-pushes HEAD into (refs/heads/ship); its BuildKit cache holds
+# the warm dub/npm mounts, so a one-file change is an incremental compile.
+BUILDER        ?= ubuntu@ubuntu-docker
+BUILDER_SITE   ?= /home/ubuntu/ircfiber-build/site
+BUILDER_ENGINE ?= /home/ubuntu/ircfiber-build/engine
+GW_REPO        ?= ghcr.io/kevinpostal/irc-fiber-gateway
+EN_REPO        ?= ghcr.io/kevinpostal/ircfiber-engine
+SITE_URL       ?= https://ircfiber.com
+
 KUBE_CONTEXT    ?= ubuntu-docker
 KUBE_NS         ?= ircfiber
 GREEN_TAG       ?= green
@@ -49,7 +70,11 @@ GREEN_DEPLOY    ?= ircfiber-gateway-green
 # ----------------------------------------------------------------------------
 # Helpers (recursive so TARGET_SSH resolves at use time)
 # ----------------------------------------------------------------------------
-SSH    = ssh -F /dev/null -o IdentitiesOnly=yes -i $(SSH_KEY) -o StrictHostKeyChecking=no deploy@$(_SSH_HOST)
+# One multiplexed ssh session per host for the whole deploy: each hop is a
+# DERP-relayed tailnet link, so every un-muxed connection pays a full setup.
+SSH_MUX = -o ControlMaster=auto -o ControlPath=/tmp/ircfiber-%r@%h:%p -o ControlPersist=180s
+SSH    = ssh $(SSH_MUX) -F /dev/null -o IdentitiesOnly=yes -i $(SSH_KEY) -o StrictHostKeyChecking=no deploy@$(_SSH_HOST)
+BSSH   = ssh $(SSH_MUX) -o StrictHostKeyChecking=no -o ConnectTimeout=20 $(BUILDER)
 PLAY   = cd site/deploy && ansible-playbook -l $(TARGET) --vault-password-file $(VAULT_PASS_FILE)
 KUBECTL = kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS)
 
@@ -70,49 +95,136 @@ AR := →
 # ----------------------------------------------------------------------------
 .PHONY: help
 help: ## Show this help
-	@printf '\n$(B)IRC Fiber Infra — Blue/Green Deploys$(R) $(D)(gateway only; engine deploys by hard restart, see AGENTS.md)$(R)\n'
+	@printf '\n$(B)IRC Fiber Infra — Deploys$(R) $(D)(build on $(BUILDER), deliver via GHCR by digest; engine deploys by hard restart, see AGENTS.md)$(R)\n'
 	@printf '$(D)============================================================$(R)\n'
 	@printf '\n$(B)OVH prod (ansible/docker)$(R)\n'
 	@awk 'BEGIN{FS=":.*##[ \t]*"} /^[a-zA-Z0-9_.-]+:.*##/{t=$$1; c=$$2; if (t !~ /^k8s/) {printf "  $(G)make %-*s$(R) %s\n", 18, t, c}}' $(MAKEFILE_LIST)
 	@printf '\n$(B)k3s dev (kubectl)$(R)\n'
 	@awk 'BEGIN{FS=":.*##[ \t]*"} /^k8s-[a-zA-Z0-9_.-]+:.*##/{printf "  $(C)make %-*s$(R) %s\n", 18, $$1, $$2}' $(MAKEFILE_LIST)
-	@printf '\n$(D)Defaults: TARGET=$(TARGET)  GREEN_TAG=$(GREEN_TAG)  KUBE_CONTEXT=$(KUBE_CONTEXT)/$(KUBE_NS)$(R)\n\n'
+	@printf '\n$(D)Defaults: TARGET=$(TARGET)  BUILDER=$(BUILDER)  GREEN_TAG=$(GREEN_TAG)  KUBE_CONTEXT=$(KUBE_CONTEXT)/$(KUBE_NS)$(R)\n\n'
 
 # ============================================================================
-# OVH prod — ansible/docker blue/green (engine untouched)
+# OVH prod — build on the builder, deliver via GHCR, swap by digest
 # ============================================================================
-.PHONY: deploy-blue deploy-engine deploy-ircd rehash-ircd tag-prev swap rollback status health logs engine-status
+.PHONY: ship ship-engine warm deploy-ircd rehash-ircd tag-prev swap rollback status health logs engine-status
 
-deploy-blue: tag-prev ## Full blue/green gateway deploy (tag-prev → build → swap → verify)
-	@printf '\n$(BG)$(OK) Blue/green gateway deploy → $(TARGET) (engine untouched)$(R)\n'
-	@$(MAKE) -C site -f Makefile.site update-gateway-bluegreen TARGET=$(TARGET) VAULT_PASS_FILE=$(VAULT_PASS_FILE)
+# One script for gateway and engine; the per-target knobs come in as env.
+# Every step is a plain command under `set -euo pipefail` — nothing ends in
+# `| tail`. The old path once reported success while prod ran the old binary
+# because a `| tail -N` made the recipe's exit status tail's (always 0).
+#
+#   SRC     submodule dir (site | engine)          BDIR   its clone on the builder
+#   CF      Containerfile                          STAGE  buildx --target
+#   REPO    GHCR repository                         META   buildx --metadata-file on the builder
+#   PLAYBOOK / REFVAR                              which playbook, and the -e var carrying the digest ref
+#   GATE    gateway | engine                       how the laptop proves the served commit
+#   MODE    ship | warm                            warm = steps 1–5 only, build detached, no deploy/promote
+define SHIP_SH
+set -euo pipefail
+cd "$$ROOT"
 
-# engine/deploy has no .vault_pass.txt or inventory of its own — both are
-# gitignored and are copied from site/deploy on demand below. A CLI
-# VAULT_PASS_FILE=... still wins.
-_ENGINE_VAULT = $(if $(filter file,$(origin VAULT_PASS_FILE)),$(CURDIR)/site/deploy/.vault_pass.txt,$(VAULT_PASS_FILE))
-# The playbook is invoked directly instead of `$(MAKE) -C engine … update`:
-# that target still depends on a `frontend-build` from the monorepo era, so
-# in the split workspace it dies on engine/frontend/package.json missing.
-# site's own engine targets are just as stale (site/ has no engine/ package),
-# so this playbook — which builds the engine on the target with BuildKit and
-# recreates ircfiber-engine-ovh — is the only working path.
-deploy-engine: ## Engine deploy (hard restart, brief IRC reconnect — NOT zero-downtime)
-	@printf '\n$(Y)$(WR) Engine deploy → $(TARGET) (hard restart, brief IRC disconnect)$(R)\n'
-	@cp -n site/deploy/inventories/production/hosts.ini engine/deploy/inventories/production/hosts.ini 2>/dev/null || true
-	@cp -n $(_ENGINE_VAULT) engine/deploy/.vault_pass.txt 2>/dev/null || true
-	@chmod 600 engine/deploy/.vault_pass.txt 2>/dev/null || true
-	@cd engine/deploy && ansible-playbook --vault-password-file .vault_pass.txt playbooks/deploy-engine.yml -l $(TARGET)
+# 1. Refuse a dirty tree: the image is built from the commit, never the worktree.
+dirty=$$( { git -C "$$SRC" diff --name-only HEAD; git -C "$$SRC" ls-files --others --exclude-standard; } )
+if [ -n "$$dirty" ]; then
+  printf '%b\n' "$(Y)$(WR) $$SRC/ working tree is dirty — commit first; these would NOT be deployed:$(R)"
+  printf '  %s\n' $$dirty
+  exit 1
+fi
+
+# 2. Identity of the commit being shipped.
+SHA=$$(git -C "$$SRC" rev-parse HEAD)
+SHORT=$$(git -C "$$SRC" rev-parse --short=12 HEAD)
+DESCRIBE=$$(git -C "$$SRC" describe --always --long)
+BRANCH=$$(git -C "$$SRC" rev-parse --abbrev-ref HEAD)
+MSG=$$(git -C "$$SRC" log -1 --pretty=%s | tr -d "'\"")
+BUILT=$$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '%b\n' "$(C)$(AR) $$MODE $$SRC @ $$SHORT ($$DESCRIBE) — $$MSG$(R)"
+
+# 3. Feed the builder: git moves only missing objects (kilobytes after the
+#    first push), instead of re-walking a 14 MB tree with rsync.
+GIT_SSH_COMMAND="ssh $(SSH_MUX) -o StrictHostKeyChecking=no" \
+  git -C "$$SRC" push --force --quiet "ssh://$(BUILDER)$$BDIR" HEAD:refs/heads/ship
+
+# 4. Check it out there and assert the builder holds exactly this commit.
+got=$$($(BSSH) "cd $$BDIR && git checkout -q --detach --force ship && git clean -xdfq && git rev-parse HEAD")
+if [ "$$got" != "$$SHA" ]; then echo "✗ builder has $$got, expected $$SHA" >&2; exit 1; fi
+
+# 5. Build and push the sha- tag. :prod is promoted in step 9, after the swap
+#    has held, so a failed deploy never moves :prod.
+build="cd $$BDIR && docker buildx build --target $$STAGE -f $$CF \
+  --build-arg GIT_HASH=$$SHA --build-arg GIT_SHORT=$$SHORT \
+  --build-arg GIT_DESCRIBE=$$DESCRIBE --build-arg GIT_BRANCH=$$BRANCH \
+  --build-arg BUILD_TIME=$$BUILT --build-arg GIT_MESSAGE=$$(printf '%q' "$$MSG") \
+  --tag $$REPO:sha-$$SHORT --push --metadata-file $$META ."
+if [ "$$MODE" = warm ]; then
+  $(BSSH) -n "nohup bash -c $$(printf '%q' "$$build") >$$META.log 2>&1 &"
+  printf '%b\n' "$(BG)$(OK) warming $$REPO:sha-$$SHORT on $(BUILDER) — log: $$META.log$(R)"
+  exit 0
+fi
+$(BSSH) "$$build"
+
+# 6. The digest is what prod pulls — never a mutable tag.
+DIGEST=$$($(BSSH) "jq -r '.\"containerimage.digest\"' $$META")
+case "$$DIGEST" in sha256:[0-9a-f]*) [ $${#DIGEST} -eq 71 ] ;; *) false ;; esac \
+  || { echo "✗ bad digest from buildx metadata: '$$DIGEST'" >&2; exit 1; }
+printf '%b\n' "$(C)$(AR) pushed $$REPO@$$DIGEST$(R)"
+
+# 7. Pull by digest, swap, and assert the running container is that image id.
+( cd site/deploy && ansible-playbook -l $(TARGET) --vault-password-file $(VAULT_PASS_FILE) \
+    playbooks/$$PLAYBOOK -e $$REFVAR=$$REPO@$$DIGEST )
+
+# 8. Gate from outside: the in-play assertion proves the container, this
+#    proves the served process.
+case "$$GATE" in
+  gateway)
+    # /api/version intermittently truncates at 121 bytes (vibe.d writeJsonBody);
+    # an unparseable body is retried, a parseable *other* commit fails at once.
+    for i in $$(seq 1 15); do
+      served=$$(curl -fsS -H 'Cache-Control: no-cache' "$(SITE_URL)/api/version" | jq -r .commit 2>/dev/null || true)
+      [ "$$served" = "$$SHA" ] && break
+      if [ -n "$$served" ]; then echo "✗ $(SITE_URL) serves $$served, expected $$SHA" >&2; exit 1; fi
+      [ "$$i" -lt 15 ] || { echo "✗ $(SITE_URL)/api/version unreadable after 15 tries" >&2; exit 1; }
+      sleep 1
+    done
+    ;;
+  engine)
+    # The engine re-registers in Redis on boot; give it up to 60 s.
+    for i in $$(seq 1 60); do
+      if curl -fsS -H 'Cache-Control: no-cache' "$(SITE_URL)/api/version" \
+           | jq -r '.engines[].gitShort' 2>/dev/null | grep -qx "$$SHORT"; then break; fi
+      [ "$$i" -lt 60 ] || { echo "✗ no engine reports $$SHORT after 60s" >&2; exit 1; }
+      sleep 1
+    done
+    ;;
+esac
+
+# 9. Promote: a manifest-only registry write, no bytes re-uploaded.
+$(BSSH) "docker buildx imagetools create -t $$REPO:prod $$REPO@$$DIGEST"
+printf '%b\n' "$(BG)$(OK) $$SRC $$SHORT live on $(TARGET); $$REPO:prod → $$DIGEST$(R)"
+endef
+export SHIP_SH
+
+_GW_ENV = ROOT=$(CURDIR) SRC=site   BDIR=$(BUILDER_SITE)   CF=Containerfile        STAGE=runtime-gateway REPO=$(GW_REPO) META=/tmp/gw-meta.json PLAYBOOK=gateway-deploy.yml REFVAR=gateway_image_ref GATE=gateway
+_EN_ENV = ROOT=$(CURDIR) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-engine  REPO=$(EN_REPO) META=/tmp/en-meta.json PLAYBOOK=engine-deploy.yml  REFVAR=engine_image_ref  GATE=engine
+
+ship: tag-prev ## Gateway: tag-prev → build on builder → push GHCR → blue/green swap by digest → gate → promote :prod
+	@printf '\n$(BG)$(OK) Ship gateway → $(TARGET) (engine untouched)$(R)\n'
+	@$(_GW_ENV) MODE=ship bash -c "$$SHIP_SH"
+
+ship-engine: ## Engine: build on builder → push GHCR → restart by digest (brief IRC reconnect) → gate → promote :prod
+	@printf '\n$(Y)$(WR) Ship engine → $(TARGET) (hard restart, brief IRC disconnect)$(R)\n'
+	@$(_EN_ENV) MODE=ship bash -c "$$SHIP_SH"
+
+warm: ## Pre-build the gateway image for HEAD on the builder in the background (never promotes :prod)
+	@$(_GW_ENV) MODE=warm bash -c "$$SHIP_SH"
 
 tag-prev: ## Tag running gateway image as :blue-prev (rollback anchor)
 	@printf '%b\n' "$(C)$(AR) tagging live gateway image → irc-fiber-gateway:blue-prev on $(TARGET)$(R)"
 	@$(SSH) 'img=$$(sudo docker inspect -f "{{.Image}}" ircfiber-gateway 2>/dev/null) && sudo docker tag "$$img" irc-fiber-gateway:blue-prev && echo "blue-prev=$$img"'
 
-swap: ## Swap only: run blue/green playbook (image already built on host)
-	@printf '\n$(BG)$(OK) Blue/green swap → $(TARGET) (no build)$(R)\n'
-	@$(SSH) 'sudo docker tag kevindpostal/irc-fiber-gateway:0.3.0 irc-fiber-gateway:latest 2>/dev/null || true'
-	@$(PLAY) playbooks/caddy.yml 2>&1 | tail -5
-	@$(PLAY) playbooks/gateway-bluegreen.yml 2>&1 | tail -15
+swap: ## Redeploy $(GW_REPO):prod (the last promoted image) — no build
+	@printf '\n$(BG)$(OK) Blue/green swap → $(TARGET) from $(GW_REPO):prod (no build)$(R)\n'
+	@$(PLAY) playbooks/gateway-deploy.yml
 
 rollback: ## Roll back gateway to :blue-prev image (health-checked swap, engine untouched)
 	@printf '\n$(Y)$(WR) Rollback gateway → irc-fiber-gateway:blue-prev on $(TARGET)$(R)\n'
@@ -127,10 +239,10 @@ rollback: ## Roll back gateway to :blue-prev image (health-checked swap, engine 
 	    echo "✗ :blue-prev is the image already running ($${live%%*}) — there is nothing to roll back to"; exit 1; \
 	  fi; \
 	  echo "rolling back: live=$$live → prev=$$prev"'
-	@$(PLAY) playbooks/gateway-bluegreen.yml -e ircfiber_gateway_image_full=irc-fiber-gateway:blue-prev 2>&1 | tail -15
+	@$(PLAY) playbooks/gateway-deploy.yml -e gateway_image_ref=irc-fiber-gateway:blue-prev
 	@printf '%b\n' "$(BG)$(OK) Rolled back to :blue-prev — verify: make health$(R)"
 
-status: ## Remote container + deploy-hash status
+status: ## Remote container status (playbook)
 	@$(PLAY) playbooks/status.yml 2>&1 | tail -20
 
 health: ## Gateway /health + Caddy proxy check via playbook
