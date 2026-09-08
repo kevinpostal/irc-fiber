@@ -58,6 +58,7 @@ BUILDER_SITE   ?= /home/ubuntu/ircfiber-build/site
 BUILDER_ENGINE ?= /home/ubuntu/ircfiber-build/engine
 GW_REPO        ?= ghcr.io/kevinpostal/irc-fiber-gateway
 EN_REPO        ?= ghcr.io/kevinpostal/ircfiber-engine
+IRCD_REPO      ?= ghcr.io/kevinpostal/irc-fiber-ircd
 SITE_URL       ?= https://ircfiber.com
 
 KUBE_CONTEXT    ?= ubuntu-docker
@@ -107,7 +108,7 @@ help: ## Show this help
 # ============================================================================
 # OVH prod — build on the builder, deliver via GHCR, swap by digest
 # ============================================================================
-.PHONY: ship ship-engine warm deploy-ircd deploy-ircd-k8s deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status
+.PHONY: ship ship-engine ship-ircd warm deploy-ircd deploy-ircd-k8s deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status
 
 # One script for gateway and engine; the per-target knobs come in as env.
 # Every step is a plain command under `set -euo pipefail` — nothing ends in
@@ -118,7 +119,7 @@ help: ## Show this help
 #   CF      Containerfile                          STAGE  buildx --target
 #   REPO    GHCR repository                         META   buildx --metadata-file on the builder
 #   PLAYBOOK / REFVAR                              which playbook, and the -e var carrying the digest ref
-#   GATE    gateway | engine                       how the laptop proves the served commit
+#   GATE    gateway | engine | ircd                how the laptop proves the served process
 #   MODE    ship | warm                            warm = steps 1–5 only, build detached, no deploy/promote
 define SHIP_SH
 set -euo pipefail
@@ -203,6 +204,16 @@ case "$$GATE" in
       sleep 1
     done
     ;;
+  ircd)
+    # The in-play assertion proved the container runs the digest; this
+    # proves the module shipped in it and loaded (or, before the tag is in
+    # modules.conf, at least did not error).
+    $(SSH) 'sudo docker exec ircfiber-ircd test -f /inspircd/modules/m_motdpool.so' \
+      || { echo "✗ ircfiber-ircd has no /inspircd/modules/m_motdpool.so" >&2; exit 1; }
+    if $(SSH) 'sudo docker logs --since 3m ircfiber-ircd 2>&1' | grep -Ei 'motdpool.*(unable|error)'; then
+      echo "✗ motdpool errors in ircfiber-ircd log" >&2; exit 1
+    fi
+    ;;
 esac
 
 # 9. Promote: a manifest-only registry write, no bytes re-uploaded.
@@ -213,6 +224,7 @@ export SHIP_SH
 
 _GW_ENV = ROOT=$(CURDIR) SRC=site   BDIR=$(BUILDER_SITE)   CF=Containerfile        STAGE=runtime-gateway REPO=$(GW_REPO) META=/tmp/gw-meta.json PLAYBOOK=gateway-deploy.yml REFVAR=gateway_image_ref GATE=gateway
 _EN_ENV = ROOT=$(CURDIR) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-engine  REPO=$(EN_REPO) META=/tmp/en-meta.json PLAYBOOK=engine-deploy.yml  REFVAR=engine_image_ref  GATE=engine
+_IRCD_ENV = ROOT=$(CURDIR) SRC=site BDIR=$(BUILDER_SITE) CF=deploy/roles/ircd/files/Containerfile.ircd STAGE=runtime-ircd REPO=$(IRCD_REPO) META=/tmp/ircd-meta.json PLAYBOOK=ircd-deploy.yml REFVAR=ircd_image_ref GATE=ircd
 
 ship: tag-prev ## Gateway: tag-prev → build on builder → push GHCR → blue/green swap by digest → gate → promote :prod
 	@printf '\n$(BG)$(OK) Ship gateway → $(TARGET) (engine untouched)$(R)\n'
@@ -221,6 +233,16 @@ ship: tag-prev ## Gateway: tag-prev → build on builder → push GHCR → blue/
 ship-engine: ## Engine: build on builder → push GHCR → restart by digest (brief IRC reconnect) → gate → promote :prod
 	@printf '\n$(Y)$(WR) Ship engine → $(TARGET) (hard restart, brief IRC disconnect)$(R)\n'
 	@$(_EN_ENV) MODE=ship bash -c "$$SHIP_SH"
+
+# The ircd image is upstream InspIRCd plus our motdpool module
+# (site/deploy/roles/ircd/files/Containerfile.ircd). Config changes never
+# need this — `make deploy-ircd` rehashes in place. A new IMAGE recreates
+# the container: every IRC client drops and Anope relinks. Run it in a quiet
+# window, then roll the k3s leaf to the same digest (make deploy-ircd-k8s
+# after setting the image in k8s/ircfiber-prod/deployment-ircd-leaf.yaml).
+ship-ircd: ## IRCd image: build on builder → push GHCR → RECREATE ircd by digest (all IRC clients drop) → gate → promote :prod
+	@printf '\n$(Y)$(WR) Ship ircd image → $(TARGET) (container recreate: every IRC client disconnects, Anope relinks)$(R)\n'
+	@$(_IRCD_ENV) MODE=ship bash -c "$$SHIP_SH"
 
 warm: ## Pre-build the gateway image for HEAD on the builder in the background (never promotes :prod)
 	@$(_GW_ENV) MODE=warm bash -c "$$SHIP_SH"
