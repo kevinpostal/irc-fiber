@@ -30,6 +30,7 @@
 #     make k8s-deploy     # build+push :green → green Deployment → wait
 #     make k8s-promote    # flip Service to green, park blue (replicas=0)
 #     make k8s-rollback   # flip Service back to blue
+#     make deploy-ircd-k8s # InspIRCd leaf pod on k3s, linked to the OVH hub
 #     make k8s-status|k8s-clean-green
 #
 # Overrides: TARGET=host  VAULT_PASS_FILE=path  BUILDER=user@host  GREEN_TAG=tag
@@ -106,7 +107,7 @@ help: ## Show this help
 # ============================================================================
 # OVH prod — build on the builder, deliver via GHCR, swap by digest
 # ============================================================================
-.PHONY: ship ship-engine warm deploy-ircd rehash-ircd tag-prev swap rollback status health logs engine-status
+.PHONY: ship ship-engine warm deploy-ircd deploy-ircd-k8s deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status
 
 # One script for gateway and engine; the per-target knobs come in as env.
 # Every step is a plain command under `set -euo pipefail` — nothing ends in
@@ -270,6 +271,23 @@ deploy-ircd: ## Render ircd configs + SIGHUP rehash (no socket drops; only Anope
 rehash-ircd: ## SIGHUP live ircd only, no repo push (exceptional: remote side fixed, nothing changed here)
 	@printf '%b\n' "$(C)$(AR) rehashing ircfiber-ircd on $(TARGET)$(R)"
 	@$(SSH) 'before=$$(sudo docker inspect -f "{{.State.StartedAt}}" ircfiber-ircd); sudo docker kill --signal=HUP ircfiber-ircd >/dev/null && sleep 3; after=$$(sudo docker inspect -f "{{.State.StartedAt}}" ircfiber-ircd); [ "$$before" = "$$after" ] && echo "OK rehashed, container not restarted (StartedAt $$after)" || { echo "✗ container restarted!"; exit 1; }; sudo docker logs --tail=5 ircfiber-ircd 2>&1 | grep -i -m1 "rehash\|config" || true'
+
+# The InspIRCd spanningtree leaf on k3s. Renders the same templates as the OVH
+# hub in leaf mode onto the node (hostPath: no k8s Secret is creatable on that
+# cluster), applies the manifests and rehashes the pod. Run this BEFORE
+# `make deploy-ircd`, so the hub has something to autoconnect to.
+deploy-ircd-k8s: ## Render + apply the InspIRCd k3s leaf (ns ircfiber-prod) and rehash it
+	@printf '\n$(BG)$(OK) IRCd k3s leaf → ubuntu-docker / ircfiber-prod$(R)\n'
+	cd site/deploy && ansible-playbook --vault-password-file $(VAULT_PASS_FILE) playbooks/ircd-k8s-leaf.yml
+
+# kubelet eviction thresholds on the k3s node. Needed because the node's disk
+# is the odysseus host's 1.7T volume: a percentage threshold there is larger
+# than everything the cluster stores, and when it trips kubelet rejects every
+# non-critical pod. Restarts k3s (no systemd on that node), so run it
+# deliberately, not as part of a deploy.
+deploy-k3s-node-tune: ## Apply kubelet eviction tuning on the k3s node (restarts k3s)
+	@printf '\n$(BG)$(OK) kubelet eviction tuning → ubuntu-docker$(R)\n'
+	cd site/deploy && ansible-playbook --vault-password-file $(VAULT_PASS_FILE) playbooks/k3s-node-tune.yml
 
 # ============================================================================
 # k3s dev — kubectl blue/green (Service selector flip, blue parked)
