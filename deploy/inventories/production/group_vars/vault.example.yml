@@ -57,3 +57,9 @@ vault_ircd_oper_password: "REPLACE-WITH-STRONG-PASSWORD"
 # The token is available under the tunnel's "Configure" tab.
 # DO NOT commit the real value — use `ansible-vault edit`.
 vault_cloudflared_tunnel_token: "REPLACE-WITH-CF-TUNNEL-TOKEN"
+
+# --- Cloudflare Tunnel for status.ircfiber.com (dedicated named tunnel) -----
+# Origins differ per host (ircfiber-caddy on prod vs uptime-kuma on the k3s
+# host), so the status page gets its own `ircfiber-status` tunnel instead of
+# a second replica on the prod tunnel. Same dashboard location, Configure tab.
+vault_cloudflared_status_token: "REPLACE-WITH-CF-STATUS-TUNNEL-TOKEN"

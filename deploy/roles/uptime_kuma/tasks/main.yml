@@ -1,0 +1,55 @@
+---
+# Uptime Kuma — off-prod synthetic monitoring (see playbooks/uptime-kuma.yml).
+# Mirrors the cloudflared/caddy role structure: pull → network/volume →
+# container with restart policy + docker healthcheck + component labels.
+
+- name: Pull Uptime Kuma image (latest 1.x)
+  community.docker.docker_image:
+    name: "{{ uptime_kuma_image }}"
+    source: pull
+    state: present
+
+- name: Record resolved image digest
+  ansible.builtin.command: docker inspect --format '{{ "{{ index .RepoDigests 0 }}" }}' {{ uptime_kuma_image }}
+  register: uptime_kuma_digest
+  changed_when: false
+
+- name: Show resolved image digest
+  ansible.builtin.debug:
+    msg: "uptime_kuma resolved digest: {{ uptime_kuma_digest.stdout }}"
+
+- name: Ensure uptime_net bridge network exists
+  community.docker.docker_network:
+    name: "{{ uptime_kuma_network }}"
+    driver: bridge
+    state: present
+
+- name: Ensure uptime-kuma-data volume exists
+  community.docker.docker_volume:
+    name: "{{ uptime_kuma_data_volume }}"
+    state: present
+
+- name: Run uptime-kuma container
+  community.docker.docker_container:
+    name: "{{ uptime_kuma_container_name }}"
+    image: "{{ uptime_kuma_image }}"
+    state: started
+    restart_policy: "{{ uptime_kuma_restart_policy }}"
+    networks:
+      - name: "{{ uptime_kuma_network }}"
+    networks_cli_compatible: true
+    ports: "{{ uptime_kuma_ports }}"
+    volumes:
+      - "{{ uptime_kuma_data_volume }}:/app/data"
+    healthcheck:
+      # No wget/curl in the Kuma image — use its node runtime against
+      # /api/login (200 without auth, proves the app serves).
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3001/api/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: "{{ uptime_kuma_health_interval }}"
+      timeout: 10s
+      retries: "{{ uptime_kuma_health_retries }}"
+    security_opts:
+      - "no-new-privileges:true"
+    labels:
+      com.ircfiber.component: "uptime-kuma"
+      com.ircfiber.version: "{{ ircfiber_version }}"

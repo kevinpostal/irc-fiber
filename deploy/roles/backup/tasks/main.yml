@@ -60,6 +60,29 @@
   when:
     - redis_aof_raw is defined
     - redis_aof_raw.stdout is defined
+- name: Snapshot Uptime Kuma data volume (off-prod monitor host only)
+  when:
+    - groups['ircfiber_k3s'] is defined
+    - inventory_hostname in groups['ircfiber_k3s']
+  block:
+    - name: Check uptime-kuma-data volume exists
+      ansible.builtin.command: docker volume inspect uptime-kuma-data
+      register: kuma_volume_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Tar-snapshot uptime-kuma-data
+      ansible.builtin.command: >
+        docker run --rm
+        -v uptime-kuma-data:/data:ro
+        -v {{ backup_dir }}:/backup
+        alpine tar czf /backup/uptime-kuma-{{ backup_ts }}.tgz /data
+      changed_when: true
+      when: kuma_volume_inspect.rc == 0
+      # Restore: docker run --rm -v uptime-kuma-data:/data
+      #   -v /backup:/backup alpine tar xzf /backup/uptime-kuma-<date>.tgz -C /
+      # Retention: the "Clean up old backups" find below covers backup_dir,
+      # so the tgz rotates with backup_keep_days automatically.
 
 - name: Clean up old backups
   ansible.builtin.find:

@@ -1,6 +1,6 @@
 ---
-- name: Backup MongoDB and Redis
-  hosts: ircfiber_backend
+- name: Backup MongoDB and Redis (+ Uptime Kuma volume on k3s host)
+  hosts: ircfiber_backend:ircfiber_k3s
   become: true
   gather_facts: true
   vars_files:

@@ -1,0 +1,82 @@
+---
+# Uptime Kuma on the off-prod host + status.ircfiber.com via Cloudflare Tunnel.
+#
+# Target: hosts in [ircfiber_k3s] (ubuntu-docker; see hosts.ini.example).
+# Prod ingress is untouched: no Caddy change, no site.yml change. The status
+# tunnel uses its own named tunnel `ircfiber-status` (origins differ per host:
+# ircfiber-caddy on prod vs uptime-kuma here — sharing the prod tunnel would
+# 502 prod traffic landing on this replica), token vault_cloudflared_status_token.
+#
+# After first deploy, one UI session at https://status.ircfiber.com:
+#   1. Setup screen → create admin user (credentials to vault out-of-band).
+#   2. Settings → General: dashboard requires login (default).
+#   3. Status Pages → New: title "IRC Fiber Status", slug "ircfiber"
+#      (canonical URL https://status.ircfiber.com/status/ircfiber); add all
+#      monitors below; set as default/homepage if the Kuma version offers it.
+#   4. Seed monitors (all 60s interval, retry 3, else defaults):
+#        web-apex    HTTP(s) https://ircfiber.com/api/version, expect 200
+#                      (/health and /api/health are Caddy static short-
+#                      circuits — MUST NOT be used, they stay 200 with the
+#                      gateway dead; /api/version reaches the gateway.)
+#        web-www     HTTP(s) https://www.ircfiber.com/api/version, expect 200
+#        irc-plain   TCP Port irc.ircfiber.com:6667 (connect only)
+#        irc-tls     TCP Port irc.ircfiber.com:6697 (connect only)
+#        bnc         TCP Port bnc.ircfiber.com:7000 (connect only)
+#        status-self HTTP(s) https://status.ircfiber.com/status/ircfiber, 200
+#   5. Notifications: one email channel to ops@ircfiber.com (SMTP relay
+#      credentials operator-supplied) on monitors 1-5, alert on down/up.
+#      If no relay is available, ship without it and file a follow-up.
+#   6. Tunnel + DNS (done 2026-09-09 via API, was dashboard-manual):
+#      dedicated tunnel `ircfiber-status` ingress
+#      status.ircfiber.com → http://uptime-kuma:3001 (noTLSVerify,
+#      plain-HTTP origin on private uptime_net); CNAME status.ircfiber.com →
+#      <tunnel-id>.cfargotunnel.com (proxied). Create no manual record in
+#      the cloudflare role — the record is tunnel-owned.
+#
+# Restore (all state is in the uptime-kuma-data volume):
+#   docker run --rm -v uptime-kuma-data:/data -v /backup:/backup alpine \
+#     tar xzf /backup/uptime-kuma-<date>.tgz -C /
+# Run:
+#   ansible-playbook playbooks/uptime-kuma.yml --ask-vault-pass
+
+- name: Preflight — ensure vault variables are defined
+  hosts: ircfiber_k3s
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+    - name: Verify status tunnel token is present
+      ansible.builtin.assert:
+        that:
+          - vault_cloudflared_status_token is defined
+          - vault_cloudflared_status_token | length > 0
+        fail_msg: |
+          vault_cloudflared_status_token is missing or empty. It is the run
+          token for the dedicated `ircfiber-status` tunnel (dashboard →
+          Networks → Tunnels → ircfiber-status → Configure → Copy token),
+          stored via ansible-vault edit inventories/production/group_vars/vault.yml.
+
+- name: Deploy Uptime Kuma monitor container
+  hosts: ircfiber_k3s
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: uptime_kuma
+
+- name: Deploy status tunnel container (dedicated ircfiber-status tunnel)
+  hosts: ircfiber_k3s
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: cloudflared
+      vars:
+        # Host-scoped overrides: dedicated status-tunnel token, distinct
+        # container, attached to uptime_net so the origin dials
+        # http://uptime-kuma:3001. The cloudflared role is untouched.
+        cloudflared_container_name: "ircfiber-cloudflared-status"
+        cloudflared_tunnel_token: "{{ vault_cloudflared_status_token }}"
+        docker_ircfiber_network: "uptime_net"

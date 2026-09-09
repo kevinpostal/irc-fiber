@@ -1,0 +1,22 @@
+---
+# Uptime Kuma (off-prod synthetic monitoring) — defaults
+# Runs on the off-prod host (ubuntu-docker, group [ircfiber_k3s]) so it keeps
+# reporting when the prod VM is down. The only public path is the Cloudflare
+# Tunnel in playbooks/uptime-kuma.yml — no public host-port exposure here.
+#
+# All monitor/state lives in the named volume (no DB dump needed); backup is
+# a volume tar snapshot, see the backup role's Kuma block.
+
+uptime_kuma_image: "louislam/uptime-kuma:1"
+uptime_kuma_container_name: "uptime-kuma"
+uptime_kuma_network: "uptime_net"
+uptime_kuma_data_volume: "uptime-kuma-data"
+uptime_kuma_restart_policy: "unless-stopped"
+# Published on localhost only by default — the tunnel origin dials the
+# container DNS name on uptime_net, never the host port. To also bind the
+# host's Tailscale IP, override per host, e.g.:
+#   uptime_kuma_ports: ["127.0.0.1:3001:3001", "100.94.116.56:3001:3001"]
+uptime_kuma_ports:
+  - "127.0.0.1:3001:3001"
+uptime_kuma_health_interval: "30s"
+uptime_kuma_health_retries: 3
