@@ -14,18 +14,21 @@
 # The laptop never carries image bytes. A frontend-only change never
 # recompiles D; a D-only change never runs vite (see site/Containerfile).
 #
-# Gateway swaps are blue/green (zero downtime). The engine (IRC daemon) holds
-# TCP/TLS + JOIN state and deploys by hard restart BY DESIGN — see AGENTS.md
-# "Engine Lifecycle". Do not blue/green the engine.
+# Gateway swaps are blue/green (zero downtime). The engine (IRC daemon) is a
+# HOT SWAP: the connection holder (ircfiber-holder-<id>) owns every IRC
+# TCP/TLS socket, the old engine detaches on SIGTERM and the new one
+# reattaches — no IRC reconnect. Only `make ship-holder` (rare) and
+# `make engine-decommission` drop IRC sessions. Do not blue/green the engine.
 #
 # Two fleets:
 #   OVH prod (docker over ansible) — targets without prefix
 #     make ship           # gateway: tag-prev → build+push → swap by digest → gate → promote :prod
-#     make ship-engine    # engine:  build+push → restart by digest → gate → promote :prod
+#     make ship-engine    # engine:  build+push → hot swap by digest (IRC sockets kept) → gate → promote :prod
+#     make ship-holder    # holder:  build+push → recreate by digest (FULL IRC RECONNECT) → gate → promote :prod
 #     make warm           # pre-build HEAD on the builder in the background (no deploy)
 #     make swap           # redeploy $(GW_REPO):prod (no build)
 #     make rollback       # swap back to :blue-prev (health-checked)
-#     make status|health|logs|engine-status
+#     make status|health|logs|engine-status|engine-decommission
 #   k3s dev (kubectl) — k8s-* targets
 #     make k8s-deploy     # build+push :green → green Deployment → wait
 #     make k8s-promote    # flip Service to green, park blue (replicas=0)
@@ -58,6 +61,7 @@ BUILDER_SITE   ?= /home/ubuntu/ircfiber-build/site
 BUILDER_ENGINE ?= /home/ubuntu/ircfiber-build/engine
 GW_REPO        ?= ghcr.io/kevinpostal/irc-fiber-gateway
 EN_REPO        ?= ghcr.io/kevinpostal/ircfiber-engine
+HO_REPO        ?= ghcr.io/kevinpostal/ircfiber-holder
 IRCD_REPO      ?= ghcr.io/kevinpostal/irc-fiber-ircd
 SITE_URL       ?= https://ircfiber.com
 
@@ -97,7 +101,7 @@ AR := →
 # ----------------------------------------------------------------------------
 .PHONY: help
 help: ## Show this help
-	@printf '\n$(B)IRC Fiber Infra — Deploys$(R) $(D)(build on $(BUILDER), deliver via GHCR by digest; engine deploys by hard restart, see AGENTS.md)$(R)\n'
+	@printf '\n$(B)IRC Fiber Infra — Deploys$(R) $(D)(build on $(BUILDER), deliver via GHCR by digest; engine deploys are hot swaps, see AGENTS.md)$(R)\n'
 	@printf '$(D)============================================================$(R)\n'
 	@printf '\n$(B)OVH prod (ansible/docker)$(R)\n'
 	@awk 'BEGIN{FS=":.*##[ \t]*"} /^[a-zA-Z0-9_.-]+:.*##/{t=$$1; c=$$2; if (t !~ /^k8s/) {printf "  $(G)make %-*s$(R) %s\n", 18, t, c}}' $(MAKEFILE_LIST)
@@ -108,7 +112,7 @@ help: ## Show this help
 # ============================================================================
 # OVH prod — build on the builder, deliver via GHCR, swap by digest
 # ============================================================================
-.PHONY: ship ship-engine ship-ircd warm deploy-ircd deploy-ircd-k8s deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status
+.PHONY: ship ship-engine ship-holder ship-ircd warm deploy-ircd deploy-ircd-k8s deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status engine-decommission
 
 # One script for gateway and engine; the per-target knobs come in as env.
 # Every step is a plain command under `set -euo pipefail` — nothing ends in
@@ -119,7 +123,7 @@ help: ## Show this help
 #   CF      Containerfile                          STAGE  buildx --target
 #   REPO    GHCR repository                         META   buildx --metadata-file on the builder
 #   PLAYBOOK / REFVAR                              which playbook, and the -e var carrying the digest ref
-#   GATE    gateway | engine | ircd                how the laptop proves the served process
+#   GATE    gateway | engine | holder | ircd   how the laptop proves the served process
 #   MODE    ship | warm                            warm = steps 1–5 only, build detached, no deploy/promote
 define SHIP_SH
 set -euo pipefail
@@ -204,6 +208,16 @@ case "$$GATE" in
       sleep 1
     done
     ;;
+  holder)
+    # The holder reports its own build in STATUS; the in-play assertion
+    # proved the container, this proves the process answering the IPC.
+    for i in $$(seq 1 60); do
+      served=$$($(SSH) 'sudo docker exec ircfiber-holder-ovh /app/irc-fiber-holder --status' 2>/dev/null | jq -r .holder 2>/dev/null || true)
+      [ "$$served" = "$$SHORT" ] && break
+      [ "$$i" -lt 60 ] || { echo "✗ ircfiber-holder-ovh reports '$$served', expected $$SHORT after 60s" >&2; exit 1; }
+      sleep 1
+    done
+    ;;
   ircd)
     # The in-play assertion proved the container runs the digest; this
     # proves the module shipped in it and loaded (or, before the tag is in
@@ -224,15 +238,24 @@ export SHIP_SH
 
 _GW_ENV = ROOT=$(CURDIR) SRC=site   BDIR=$(BUILDER_SITE)   CF=Containerfile        STAGE=runtime-gateway REPO=$(GW_REPO) META=/tmp/gw-meta.json PLAYBOOK=gateway-deploy.yml REFVAR=gateway_image_ref GATE=gateway
 _EN_ENV = ROOT=$(CURDIR) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-engine  REPO=$(EN_REPO) META=/tmp/en-meta.json PLAYBOOK=engine-deploy.yml  REFVAR=engine_image_ref  GATE=engine
+_HO_ENV = ROOT=$(CURDIR) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-holder  REPO=$(HO_REPO) META=/tmp/ho-meta.json PLAYBOOK=holder-deploy.yml  REFVAR=holder_image_ref  GATE=holder
 _IRCD_ENV = ROOT=$(CURDIR) SRC=site BDIR=$(BUILDER_SITE) CF=deploy/roles/ircd/files/Containerfile.ircd STAGE=runtime-ircd REPO=$(IRCD_REPO) META=/tmp/ircd-meta.json PLAYBOOK=ircd-deploy.yml REFVAR=ircd_image_ref GATE=ircd
 
 ship: tag-prev ## Gateway: tag-prev → build on builder → push GHCR → blue/green swap by digest → gate → promote :prod
 	@printf '\n$(BG)$(OK) Ship gateway → $(TARGET) (engine untouched)$(R)\n'
 	@$(_GW_ENV) MODE=ship bash -c "$$SHIP_SH"
 
-ship-engine: ## Engine: build on builder → push GHCR → restart by digest (brief IRC reconnect) → gate → promote :prod
-	@printf '\n$(Y)$(WR) Ship engine → $(TARGET) (hard restart, brief IRC disconnect)$(R)\n'
+ship-engine: ## Engine: build on builder → push GHCR → hot swap by digest (IRC sockets kept) → gate → promote :prod
+	@printf '\n$(BG)$(OK) Ship engine → $(TARGET) (hot swap, IRC sockets kept)$(R)\n'
 	@$(_EN_ENV) MODE=ship bash -c "$$SHIP_SH"
+
+# The holder owns every IRC socket; recreating it is the one engine-side
+# deploy that still drops IRC sessions. Ship it first (once), then engines
+# hot swap against it forever. Rollout order for a new registry grace:
+# make ship (gateway) → make ship-holder → make ship-engine.
+ship-holder: ## Holder: build on builder → push GHCR → RECREATE holder by digest (full IRC reconnect) → gate → promote :prod
+	@printf '\n$(Y)$(WR) Ship holder → $(TARGET) (container recreate: FULL IRC RECONNECT on every network)$(R)\n'
+	@$(_HO_ENV) MODE=ship bash -c "$$SHIP_SH"
 
 # The ircd image is upstream InspIRCd plus our motdpool module
 # (site/deploy/roles/ircd/files/Containerfile.ircd). Config changes never
@@ -280,8 +303,16 @@ health: ## Gateway /health + Caddy proxy check via playbook
 logs: ## Tail remote gateway logs (last 100 lines)
 	@$(PLAY) playbooks/logs.yml -e component=gateway tail=100 2>&1 | tail -30
 
-engine-status: ## Prove engine untouched (PID + uptime, must not change across gateway deploys)
-	@$(SSH) 'sudo docker exec ircfiber-engine-ovh pidof irc-fiber-engine | xargs -I {} echo "engine PID {}"; sudo docker ps --format "{{.Names}} {{.Status}}" | grep -E "engine"'
+engine-status: ## Prove engine + holder state (engine PID/uptime; holder uptime + attached sessions must not change across engine deploys)
+	@$(SSH) 'sudo docker exec ircfiber-engine-ovh pidof irc-fiber-engine | xargs -I {} echo "engine PID {}"; sudo docker ps --format "{{.Names}} {{.Status}}" | grep -E "engine|holder"; sudo docker exec ircfiber-holder-ovh /app/irc-fiber-holder --status'
+
+# Decommission = SIGINT: the engine QUITs every network, unregisters and
+# publishes irc:shutdown so the other engines/gateway reassign at once;
+# then both containers go. SIGTERM (docker stop) would only detach.
+engine-decommission: ## Retire this host's engine: SIGINT (QUIT all, unregister, irc:shutdown) then remove engine + holder containers
+	@printf '\n$(Y)$(WR) Decommission engine + holder on $(TARGET): every IRC network QUITs and is reassigned$(R)\n'
+	@$(SSH) 'sudo docker kill -s INT ircfiber-engine-ovh && sudo docker wait ircfiber-engine-ovh && sudo docker rm ircfiber-engine-ovh && sudo docker rm -f ircfiber-holder-ovh'
+	@printf '%b\n' "$(BG)$(OK) ircfiber-engine-ovh and ircfiber-holder-ovh removed — verify: redis SMEMBERS irc:servers$(R)"
 
 # --- IRCd (InspIRCd + Anope): config applies via SIGHUP rehash — listener
 # and server sockets never drop. deploy-ircd re-renders configs from this
