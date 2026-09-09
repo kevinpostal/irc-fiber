@@ -3,11 +3,10 @@
 # Runs on the off-prod host (ubuntu-docker, group [ircfiber_k3s]) so it keeps
 # reporting when the prod VM is down. The only public path is the Cloudflare
 # Tunnel in playbooks/uptime-kuma.yml — no public host-port exposure here.
-#
+uptime_kuma_image: "louislam/uptime-kuma:2"
 # All monitor/state lives in the named volume (no DB dump needed); backup is
 # a volume tar snapshot, see the backup role's Kuma block.
 
-uptime_kuma_image: "louislam/uptime-kuma:1"
 uptime_kuma_container_name: "uptime-kuma"
 uptime_kuma_network: "uptime_net"
 uptime_kuma_data_volume: "uptime-kuma-data"

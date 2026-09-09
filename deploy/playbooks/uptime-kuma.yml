@@ -13,16 +13,18 @@
 #   3. Status Pages → New: title "IRC Fiber Status", slug "ircfiber"
 #      (canonical URL https://status.ircfiber.com/status/ircfiber); add all
 #      monitors below; set as default/homepage if the Kuma version offers it.
-#   4. Seed monitors (all 60s interval, retry 3, else defaults):
-#        web-apex    HTTP(s) https://ircfiber.com/api/version, expect 200
+#   4. Seed monitors (all 60s interval, retry 3, else defaults; names are
+#      display labels on the status page — status pages reference monitors
+#      by ID, so renaming later is display-safe):
+#        Website     HTTP(s) https://ircfiber.com/api/version, expect 200
 #                      (/health and /api/health are Caddy static short-
 #                      circuits — MUST NOT be used, they stay 200 with the
 #                      gateway dead; /api/version reaches the gateway.)
-#        web-www     HTTP(s) https://www.ircfiber.com/api/version, expect 200
-#        irc-plain   TCP Port irc.ircfiber.com:6667 (connect only)
-#        irc-tls     TCP Port irc.ircfiber.com:6697 (connect only)
-#        bnc         TCP Port bnc.ircfiber.com:7000 (connect only)
-#        status-self HTTP(s) https://status.ircfiber.com/status/ircfiber, 200
+#        Website (www) HTTP(s) https://www.ircfiber.com/api/version, expect 200
+#        IRC (plain) TCP Port irc.ircfiber.com:6667 (connect only)
+#        IRC (TLS)   TCP Port irc.ircfiber.com:6697 (connect only)
+#        Bouncer     TCP Port bnc.ircfiber.com:7000 (connect only)
+#        Status page HTTP(s) https://status.ircfiber.com/status/ircfiber, 200
 #   5. Notifications: one email channel to ops@ircfiber.com (SMTP relay
 #      credentials operator-supplied) on monitors 1-5, alert on down/up.
 #      If no relay is available, ship without it and file a follow-up.
