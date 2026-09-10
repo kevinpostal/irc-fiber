@@ -53,7 +53,7 @@ flowchart LR
 
 - **Gateway** (`site/backend`): vibe.d HTTP/WS, auth, sessions (Redis 14d), `bnc/listener.d` + `bnc/wire.d` + `bnc/client.d`, static `public/dist`
 - **Engine** (`engine`): D daemon, `connection.d` (JOIN recovery, NickServ) + `reconnect.d` (backoff) + `processor.d`, `CHATHISTORY` window `getWindow()`, reconnect backoff, `EngineJanitor` TTL
-- **Common** (`common/` canonical, `site/common` + `engine/common` mirrored): `db/lastseen.d`, `db/messages.d` window helpers, `redis/protocol.d`, `storage/*` — inter-service contract versioned `~>0.3.0`
+- **Common** (`common/` canonical repo of record, `site/common` + `engine/common` mirrors): `db/lastseen.d`, `db/messages.d` window helpers, `redis/protocol.d`, `storage/*` — inter-service contract, dub package `irc-fiber-common` versioned `~>0.3.1`. Each consumer builds from its own in-repo mirror (`site/backend` → `site/common`, `engine/engine` → `engine/common`); nothing builds from the superproject `common/` directly.
 
 ## Repository layout
 
@@ -64,7 +64,7 @@ git clone --recursive https://github.com/kevinpostal/irc-fiber.git
 cd irc-fiber          # or local: ~/LocalWork/ircfiber/ircfiber-infra
 ls site/   # kevinpostal/ircfiber-site   — frontend + gateway
 ls engine/ # kevinpostal/ircfiber-engine — irc daemon
-ls common/ # kevinpostal/ircfiber-common — shared lib (also inlined in site/engine)
+ls common/ # kevinpostal/ircfiber-common — canonical repo of record (mirrored in site/engine; nothing builds from here)
 ls deploy/ # canonical Ansible + local compose (k8s lives in site/deploy/k8s/)
 git submodule update --init --recursive
 git pull --recurse-submodules && git submodule update --remote
@@ -77,9 +77,9 @@ git pull --recurse-submodules && git submodule update --remote
 | `ircfiber-common` | `source/ircfiber/*`, `dub.sdl` | library |
 | `irc-fiber` (this) | `site` + `engine` + `common` submodules, top-level `deploy/` | orchestration — `deploy/playbooks/*`, `deploy/roles/*`, `site/deploy/k8s/ircfiber` |
 
-`common/` is mirrored inline in `site`/`engine` (`rsync -a site/common/ engine/common/ && rsync -a site/common/ common/`). Drift guard: `site/scripts/check-common-drift.sh --fetch` fails CI on drift. Now versioned as dub package `~>0.3.0`.
+`common/` is the canonical repo of record, mirrored inline in `site/common` + `engine/common` via `site/scripts/sync-common.sh` (copies `source/` + `dub.sdl` only). Guards: `site/scripts/check-common-drift.sh --fetch` fails CI on drift; `site/scripts/check-common-version.sh` checks version + dep-string consistency. Versioned as dub package `irc-fiber-common` `~>0.3.1`.
 
-**Split-workspace** (`~/LocalWork/ircfiber/`): `site/`, `engine/`, `common/` are independent clones for fast local `make debug` / `make engine-start`; `ircfiber-infra/` is a clone of this superproject (`irc-fiber`) and holds the canonical `deploy/` + submodule pins. Keep `deploy/` edits in `ircfiber-infra/deploy/` (or `site/deploy/k8s/`), then bump submodules here.
+**Checkout** (`~/LocalWork/ircfiber/ircfiber-infra/`): the single checkout of this superproject (`irc-fiber`); `site/`, `engine/`, `common/` here are submodule pins, not separate checkouts. Keep `deploy/` edits in `ircfiber-infra/deploy/` (or `site/deploy/k8s/` for k8s manifests), then bump submodule pins here.
 
 Monorepo history preserved at `pre-split-main` + tag `pre-split-2026-08-23`.
 
@@ -150,6 +150,7 @@ npm --prefix frontend run test:watch
 cd ../engine
 dub --root=engine test
 ./site/scripts/check-common-drift.sh --fetch  # common drift guard
+./site/scripts/check-common-version.sh        # common version guard
 
 # local stack
 cd site && make debug          # gateway :8090
@@ -158,15 +159,17 @@ cd ../engine && make engine-start  # engine :6667
 
 ## Editing `common/`
 
-Edit in one repo, sync to the others:
+Edit `site/common/` (source of truth), then sync to the mirrors:
 
 ```bash
 # edit site/common/source/...
-rsync -a site/common/ engine/common/
-rsync -a site/common/ common/
-site/scripts/check-common-drift.sh --fetch  # must be ✓
+site/scripts/sync-common.sh                # copies source/ + dub.sdl only into engine/common and common/
+site/scripts/check-common-drift.sh --fetch # must be ✓
+site/scripts/check-common-version.sh       # must be ✓
 git -C site add common && git -C site commit -m "common: ..."
 git -C engine add common && git -C engine commit -m "common: ..."
+git -C common add -A && git -C common commit -m "common: ..."
+git add site engine common && git commit -m "bump common pins"
 ```
 
 ## Security
@@ -177,7 +180,7 @@ git -C engine add common && git -C engine commit -m "common: ..."
 
 ## License
 
-MIT — see `site/backend/dub.sdl`, `site/common/dub.sdl`, `engine/dub.sdl`.
+MIT — see `site/backend/dub.sdl`, `site/common/dub.sdl`, `engine/engine/dub.sdl`, `engine/common/dub.sdl`.
 
 ## Author
 
