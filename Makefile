@@ -112,7 +112,7 @@ help: ## Show this help
 # ============================================================================
 # OVH prod — build on the builder, deliver via GHCR, swap by digest
 # ============================================================================
-.PHONY: ship ship-engine ship-holder ship-ircd warm deploy-ircd deploy-ircd-k8s deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status engine-decommission
+.PHONY: ship ship-engine ship-holder ship-ircd warm deploy-ircd deploy-ircd-k8s deploy-ircd-network ircd-parity deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status engine-decommission
 
 # One script for gateway and engine; the per-target knobs come in as env.
 # Every step is a plain command under `set -euo pipefail` — nothing ends in
@@ -332,6 +332,31 @@ rehash-ircd: ## SIGHUP live ircd only, no repo push (exceptional: remote side fi
 deploy-ircd-k8s: ## Render + apply the InspIRCd k3s leaf (ns ircfiber-prod) and rehash it
 	@printf '\n$(BG)$(OK) IRCd k3s leaf → ubuntu-docker / ircfiber-prod$(R)\n'
 	cd site/deploy && ansible-playbook --vault-password-file $(VAULT_PASS_FILE) playbooks/ircd-k8s-leaf.yml
+
+# Every InspIRCd on the network, in link order (leaf first, then the hub that
+# dials it), followed by a parity check of the server-local files that are NOT
+# replicated over the server link. /RULES and the MOTD are served by
+# m_showfile/m_motdpool from each server's own disk, so a file changed on one
+# server alone leaves users seeing different text depending on which server
+# they happen to be on. This is the target to run after editing
+# roles/ircd/templates/rules.j2 — git is the source of truth for that text.
+deploy-ircd-network: ## Render ircd configs on the k3s leaf AND the hub, then prove /RULES matches on both
+	@$(MAKE) --no-print-directory deploy-ircd-k8s
+	@$(MAKE) --no-print-directory deploy-ircd
+	@$(MAKE) --no-print-directory ircd-parity
+
+ircd-parity: ## Compare the server-local (unreplicated) ircd files across hub + leaf
+	@printf '\n$(C)$(AR) /RULES parity: hub vs k3s leaf$(R)\n'
+	@hub=$$($(SSH) 'sudo sha256sum /etc/ircfiber/ircd/rules.txt' | cut -d" " -f1); \
+	leaf=$$(kubectl --context ubuntu-docker --namespace ircfiber-prod exec deployment/ircfiber-ircd-k8s -- sha256sum /inspircd/conf/rules.txt | cut -d" " -f1); \
+	printf '  hub  %s\n  leaf %s\n' "$$hub" "$$leaf"; \
+	if [ "$$hub" = "$$leaf" ]; then \
+	  printf '%b\n' "$(BG)$(OK) /RULES identical on every server$(R)"; \
+	else \
+	  printf '%b\n' "$(Y)$(WR) /RULES DIFFERS — a user sees different rules depending on the server they land on.$(R)"; \
+	  printf '%b\n' "$(Y)   An admin Config-tab edit only writes the hub; put the text in roles/ircd/templates/rules.j2 and re-run make deploy-ircd-network.$(R)"; \
+	  exit 1; \
+	fi
 
 # kubelet eviction thresholds on the k3s node. Needed because the node's disk
 # is the odysseus host's 1.7T volume: a percentage threshold there is larger
