@@ -112,7 +112,7 @@ help: ## Show this help
 # ============================================================================
 # OVH prod — build on the builder, deliver via GHCR, swap by digest
 # ============================================================================
-.PHONY: ship ship-engine ship-holder ship-ircd warm deploy-ircd deploy-ircd-k8s deploy-ircd-network ircd-parity deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status engine-decommission
+.PHONY: ship ship-engine ship-holder ship-ircd warm deploy-ircd deploy-ircd-k8s deploy-ircd-network ircd-parity ircd-leaf-on ircd-leaf-off ircd-leaf-status deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status engine-decommission
 
 # One script for gateway and engine; the per-target knobs come in as env.
 # Every step is a plain command under `set -euo pipefail` — nothing ends in
@@ -332,6 +332,39 @@ rehash-ircd: ## SIGHUP live ircd only, no repo push (exceptional: remote side fi
 deploy-ircd-k8s: ## Render + apply the InspIRCd k3s leaf (ns ircfiber-prod) and rehash it
 	@printf '\n$(BG)$(OK) IRCd k3s leaf → ubuntu-docker / ircfiber-prod$(R)\n'
 	cd site/deploy && ansible-playbook --vault-password-file $(VAULT_PASS_FILE) playbooks/ircd-k8s-leaf.yml
+
+# Leaf ON/OFF. `ircd_k8s_link_enabled` in the production group_vars is the
+# single source of truth — the hub renders <link>/<autoconnect> for
+# k8s.ircfiber.com only when it is true — so both targets flip that line,
+# commit-ready, and then rehash the hub (SIGHUP, no client drops). OFF also
+# scales the Deployment to 0: with the k3s node in DiskPressure the pod is
+# evicted as fast as it is created, and the hub's 16s autoconnect turns every
+# failure into a REMOTELINK snotice on every linked network.
+IRCD_LEAF_VARS = site/deploy/inventories/production/group_vars/all/vars.yml
+
+ircd-leaf-off: ## Leaf OFF: hub stops dialing k8s.ircfiber.com, k8s Deployment → 0
+	@sed -i.bak -E 's/^ircd_k8s_link_enabled:.*/ircd_k8s_link_enabled: false/' $(IRCD_LEAF_VARS) && rm -f $(IRCD_LEAF_VARS).bak
+	@grep -qx 'ircd_k8s_link_enabled: false' $(IRCD_LEAF_VARS) || { printf '%b\n' "$(Y)$(WR) $(IRCD_LEAF_VARS): ircd_k8s_link_enabled not flipped$(R)"; exit 1; }
+	@kubectl --context ubuntu-docker --namespace ircfiber-prod scale deployment/ircfiber-ircd-k8s --replicas=0
+	@$(MAKE) --no-print-directory deploy-ircd
+	@printf '%b\n' "$(BG)$(OK) leaf OFF — hub no longer dials k8s.ircfiber.com; commit $(IRCD_LEAF_VARS)$(R)"
+
+ircd-leaf-on: ## Leaf ON: apply the k3s leaf, then let the hub dial it again
+	@sed -i.bak -E 's/^ircd_k8s_link_enabled:.*/ircd_k8s_link_enabled: true/' $(IRCD_LEAF_VARS) && rm -f $(IRCD_LEAF_VARS).bak
+	@grep -qx 'ircd_k8s_link_enabled: true' $(IRCD_LEAF_VARS) || { printf '%b\n' "$(Y)$(WR) $(IRCD_LEAF_VARS): ircd_k8s_link_enabled not flipped$(R)"; exit 1; }
+	@$(MAKE) --no-print-directory deploy-ircd-k8s
+	@kubectl --context ubuntu-docker --namespace ircfiber-prod rollout status deployment/ircfiber-ircd-k8s --timeout=120s
+	@$(MAKE) --no-print-directory deploy-ircd
+	@printf '%b\n' "$(BG)$(OK) leaf ON — commit $(IRCD_LEAF_VARS)$(R)"
+
+ircd-leaf-status: ## Show the leaf switch, the k3s pod and whether the hub is linked
+	@printf '\n$(C)$(AR) leaf switch$(R)\n'
+	@grep -m1 '^ircd_k8s_link_enabled:' $(IRCD_LEAF_VARS)
+	@printf '$(C)$(AR) k3s node + Deployment$(R)\n'
+	@kubectl --context ubuntu-docker get node ubuntu-docker -o jsonpath='  DiskPressure={range .status.conditions[?(@.type=="DiskPressure")]}{.status}{end}{"\n"}'
+	@kubectl --context ubuntu-docker --namespace ircfiber-prod get deployment/ircfiber-ircd-k8s -o wide 2>/dev/null || echo "  (no Deployment)"
+	@printf '$(C)$(AR) hub links$(R)\n'
+	@$(SSH) 'sudo docker exec ircfiber-ircd grep -c "k8s.ircfiber.com" /inspircd/conf/custom.conf || true; sudo docker logs --since 5m ircfiber-ircd 2>&1 | grep -c "k8s.ircfiber.com" || true'
 
 # Every InspIRCd on the network, in link order (leaf first, then the hub that
 # dials it), followed by a parity check of the server-local files that are NOT
