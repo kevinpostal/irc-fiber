@@ -63,6 +63,7 @@ GW_REPO        ?= ghcr.io/kevinpostal/irc-fiber-gateway
 EN_REPO        ?= ghcr.io/kevinpostal/ircfiber-engine
 HO_REPO        ?= ghcr.io/kevinpostal/ircfiber-holder
 IRCD_REPO      ?= ghcr.io/kevinpostal/irc-fiber-ircd
+ANOPE_REPO     ?= ghcr.io/kevinpostal/irc-fiber-anope
 SITE_URL       ?= https://ircfiber.com
 
 KUBE_CONTEXT    ?= ubuntu-docker
@@ -228,6 +229,20 @@ case "$$GATE" in
       echo "✗ motdpool errors in ircfiber-ircd log" >&2; exit 1
     fi
     ;;
+  bridge)
+    # The in-play assertion proved the container runs the digest. This
+    # proves the bridge module shipped in it (CMake SKIPS a module whose
+    # dependencies it cannot detect rather than failing the build) and that
+    # the process actually reached Discord — a bad token or blocked egress
+    # leaves a healthy container relaying nothing.
+    $(SSH) 'sudo docker exec ircfiber-bridge test -f /anope/modules/bridgeserv.so' \
+      || { echo "✗ ircfiber-bridge has no /anope/modules/bridgeserv.so" >&2; exit 1; }
+    for i in $$(seq 1 60); do
+      $(SSH) 'sudo docker logs --since 5m ircfiber-bridge 2>&1' | grep -q 'connected to Discord' && break
+      [ "$$i" -lt 60 ] || { echo "✗ ircfiber-bridge never logged 'connected to Discord'" >&2; exit 1; }
+      sleep 2
+    done
+    ;;
 esac
 
 # 9. Promote: a manifest-only registry write, no bytes re-uploaded.
@@ -240,6 +255,7 @@ _GW_ENV = ROOT=$(CURDIR) SRC=site   BDIR=$(BUILDER_SITE)   CF=Containerfile     
 _EN_ENV = ROOT=$(CURDIR) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-engine  REPO=$(EN_REPO) META=/tmp/en-meta.json PLAYBOOK=engine-deploy.yml  REFVAR=engine_image_ref  GATE=engine
 _HO_ENV = ROOT=$(CURDIR) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-holder  REPO=$(HO_REPO) META=/tmp/ho-meta.json PLAYBOOK=holder-deploy.yml  REFVAR=holder_image_ref  GATE=holder
 _IRCD_ENV = ROOT=$(CURDIR) SRC=site BDIR=$(BUILDER_SITE) CF=deploy/roles/ircd/files/Containerfile.ircd STAGE=runtime-ircd REPO=$(IRCD_REPO) META=/tmp/ircd-meta.json PLAYBOOK=ircd-deploy.yml REFVAR=ircd_image_ref GATE=ircd
+_ANOPE_ENV = ROOT=$(CURDIR) SRC=site BDIR=$(BUILDER_SITE) CF=deploy/roles/ircd/files/Containerfile.anope STAGE=runtime-anope REPO=$(ANOPE_REPO) META=/tmp/anope-meta.json PLAYBOOK=bridge-deploy.yml REFVAR=ircd_bridge_image_ref GATE=bridge
 
 ship: tag-prev ## Gateway: tag-prev → build on builder → push GHCR → blue/green swap by digest → gate → promote :prod
 	@printf '\n$(BG)$(OK) Ship gateway → $(TARGET) (engine untouched)$(R)\n'
@@ -266,6 +282,14 @@ ship-holder: ## Holder: build on builder → push GHCR → RECREATE holder by di
 ship-ircd: ## IRCd image: build on builder → push GHCR → RECREATE ircd by digest (all IRC clients drop) → gate → promote :prod
 	@printf '\n$(Y)$(WR) Ship ircd image → $(TARGET) (container recreate: every IRC client disconnects, Anope relinks)$(R)\n'
 	@$(_IRCD_ENV) MODE=ship bash -c "$$SHIP_SH"
+
+# The bridge image is Anope 2.1 + the bridgeserv module
+# (site/deploy/roles/ircd/files/Containerfile.anope), run as a sidecar next
+# to the 2.0.20 services container. Recreating it drops the Discord relay
+# for the restart; IRC clients, the ircd and services are untouched.
+ship-bridge: ## Bridge (Anope 2.1 + bridgeserv) image: build on builder → push GHCR → recreate ircfiber-bridge by digest → gate → promote :prod
+	@printf '\n$(C)$(AR) Ship bridge image → $(TARGET) (Discord relay drops for the restart; IRC clients unaffected)$(R)\n'
+	@$(_ANOPE_ENV) MODE=ship bash -c "$$SHIP_SH"
 
 warm: ## Pre-build the gateway image for HEAD on the builder in the background (never promotes :prod)
 	@$(_GW_ENV) MODE=warm bash -c "$$SHIP_SH"
