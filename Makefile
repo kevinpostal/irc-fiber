@@ -29,6 +29,12 @@
 #     make swap           # redeploy $(GW_REPO):prod (no build)
 #     make rollback       # swap back to :blue-prev (health-checked)
 #     make status|health|logs|engine-status|engine-decommission
+#     make builder-df|builder-gc|builder-gc-hard   # builder disk hygiene
+#   Builder out of space (it is a container on a volume shared with tenants
+#   we do not control): every ship checks BUILDER_MIN_FREE_GB first and caps
+#   the BuildKit cache at BUILDER_CACHE_KEEP afterwards. When even that is
+#   not enough, build in GitHub Actions and never touch the builder:
+#     BUILD_ON=ci make ship        # same image, same gate, cold compile
 #   k3s dev (kubectl) — k8s-* targets
 #     make k8s-deploy     # build+push :green → green Deployment → wait
 #     make k8s-promote    # flip Service to green, park blue (replicas=0)
@@ -37,6 +43,7 @@
 #     make k8s-status|k8s-clean-green
 #
 # Overrides: TARGET=host  VAULT_PASS_FILE=path  BUILDER=user@host  GREEN_TAG=tag
+#            BUILD_ON=builder|ci  BUILDER_MIN_FREE_GB=N  BUILDER_CACHE_KEEP=NGB
 #            KUBE_CONTEXT=ctx  KUBE_NS=ns  GREEN_IMAGE=img
 # ============================================================================
 
@@ -59,6 +66,15 @@ SSH_KEY         ?= $(HOME)/.ssh/id_ed25519_ircfiber
 BUILDER        ?= ubuntu@ubuntu-docker
 BUILDER_SITE   ?= /home/ubuntu/ircfiber-build/site
 BUILDER_ENGINE ?= /home/ubuntu/ircfiber-build/engine
+
+# The builder is a container on a 1.7 T volume shared with tenants we do not
+# control; it has hit 0 bytes free mid-deploy. Our footprint is therefore
+# capped rather than left to grow: every ship trims the BuildKit cache back
+# to BUILDER_CACHE_KEEP, and refuses to start unless BUILDER_MIN_FREE_GB is
+# available. BUILD_ON=ci bypasses the builder entirely (GitHub Actions).
+BUILD_ON             ?= builder
+BUILDER_MIN_FREE_GB  ?= 8
+BUILDER_CACHE_KEEP   ?= 6GB
 GW_REPO        ?= ghcr.io/kevinpostal/irc-fiber-gateway
 EN_REPO        ?= ghcr.io/kevinpostal/ircfiber-engine
 HO_REPO        ?= ghcr.io/kevinpostal/ircfiber-holder
@@ -113,7 +129,7 @@ help: ## Show this help
 # ============================================================================
 # OVH prod — build on the builder, deliver via GHCR, swap by digest
 # ============================================================================
-.PHONY: ship ship-engine ship-holder ship-ircd warm deploy-ircd deploy-ircd-k8s deploy-ircd-network ircd-parity ircd-leaf-status deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status engine-decommission
+.PHONY: builder-df builder-gc builder-gc-hard ship ship-engine ship-holder ship-ircd warm deploy-ircd deploy-ircd-k8s deploy-ircd-network ircd-parity ircd-leaf-status deploy-k3s-node-tune rehash-ircd tag-prev swap rollback status health logs engine-status engine-decommission
 
 # One script for gateway and engine; the per-target knobs come in as env.
 # Every step is a plain command under `set -euo pipefail` — nothing ends in
@@ -125,7 +141,8 @@ help: ## Show this help
 #   REPO    GHCR repository                         META   buildx --metadata-file on the builder
 #   PLAYBOOK / REFVAR                              which playbook, and the -e var carrying the digest ref
 #   GATE    gateway | engine | holder | ircd   how the laptop proves the served process
-#   MODE    ship | warm                            warm = steps 1–5 only, build detached, no deploy/promote
+#   MODE    ship | warm                            warm = build only, no deploy/promote
+#   BUILD_ON builder | ci                          where the image bytes are produced
 define SHIP_SH
 set -euo pipefail
 cd "$$ROOT"
@@ -153,33 +170,89 @@ MSG=$$(git -C "$$SRC" log -1 --pretty=%s | tr -d "'\"")
 BUILT=$$(date -u +%Y-%m-%dT%H:%M:%SZ)
 printf '%b\n' "$(C)$(AR) $$MODE $$SRC @ $$SHORT ($$DESCRIBE) — $$MSG$(R)"
 
-# 3. Feed the builder: git moves only missing objects (kilobytes after the
-#    first push), instead of re-walking a 14 MB tree with rsync.
-GIT_SSH_COMMAND="ssh $(SSH_MUX) -o StrictHostKeyChecking=no" \
-  git -C "$$SRC" push --force --quiet "ssh://$(BUILDER)$$BDIR" HEAD:refs/heads/ship
+# 3. Where the bytes are built.
+#      BUILD_ON=builder  ubuntu-docker, warm BuildKit cache mounts, fast.
+#      BUILD_ON=ci       GitHub Actions build-image.yml — touches no builder
+#                        disk at all, cold D compile, use when the builder
+#                        host (a container on a 1.7T volume shared with
+#                        tenants we do not control) is out of space.
+if [ "$$BUILD_ON" = ci ]; then
+  GH_REPO=$$(git -C "$$SRC" remote get-url origin | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$$##')
+  # CI builds what GitHub has, not what is on this laptop.
+  remote=$$(git -C "$$SRC" ls-remote origin "refs/heads/$$BRANCH" | cut -f1)
+  if [ "$$remote" != "$$SHA" ]; then
+    echo "✗ $$GH_REPO $$BRANCH is $$remote, expected $$SHA — push the commit first" >&2; exit 1
+  fi
+  before=$$(gh -R "$$GH_REPO" run list --workflow=build-image.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
+  gh -R "$$GH_REPO" workflow run build-image.yml --ref "$$BRANCH" \
+    -f containerfile="$$CF" -f target="$$STAGE" -f image="$${REPO##*/}"
+  run=$$before
+  for i in $$(seq 1 30); do
+    run=$$(gh -R "$$GH_REPO" run list --workflow=build-image.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
+    [ "$$run" != "$$before" ] && break
+    sleep 2
+  done
+  if [ "$$run" = "$$before" ]; then echo "✗ dispatched run never appeared in $$GH_REPO" >&2; exit 1; fi
+  printf '%b\n' "$(C)$(AR) building in CI: https://github.com/$$GH_REPO/actions/runs/$$run$(R)"
+  gh -R "$$GH_REPO" run watch "$$run" --exit-status
+  [ "$$MODE" = warm ] && exit 0
+  # 4. The digest is what prod pulls — read it back from the registry, so a
+  #    workflow that lied about pushing fails here rather than at the swap.
+  DIGEST=$$(curl -sS -D- -o /dev/null \
+    -H "Authorization: Bearer $$(gh auth token | base64)" \
+    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+    "https://ghcr.io/v2/$${REPO#ghcr.io/}/manifests/sha-$$SHORT" \
+    | awk 'tolower($$1) == "docker-content-digest:" { print $$2 }' | tr -d '\r')
+else
+  # 3a. Disk guard. The builder filling up used to surface as an unrelated
+  #     `git push` failure ("unable to create temporary object directory").
+  #     Check first, reclaim what is ours, and say what to do if that is not
+  #     enough — never start a 5 minute build that cannot finish.
+  free=$$($(BSSH) "df -BG --output=avail / | tail -1 | tr -dc 0-9")
+  if [ "$$free" -lt $(BUILDER_MIN_FREE_GB) ]; then
+    printf '%b\n' "$(Y)$(WR) builder has $${free}G free — reclaiming (cache cap $(BUILDER_CACHE_KEEP))$(R)"
+    $(BSSH) "docker builder prune -f --keep-storage=$(BUILDER_CACHE_KEEP); docker image prune -f; docker volume prune -f" >/dev/null || true
+    free=$$($(BSSH) "df -BG --output=avail / | tail -1 | tr -dc 0-9")
+  fi
+  if [ "$$free" -lt $(BUILDER_MIN_FREE_GB) ]; then
+    echo "✗ builder $(BUILDER) has only $${free}G free, needs $(BUILDER_MIN_FREE_GB)G" >&2
+    echo "  build in CI instead:  BUILD_ON=ci make <target>" >&2
+    echo "  or drop the whole BuildKit cache (cold next build):  make builder-gc-hard" >&2
+    exit 1
+  fi
 
-# 4. Check it out there and assert the builder holds exactly this commit.
-got=$$($(BSSH) "cd $$BDIR && git checkout -q --detach --force ship && git clean -xdfq && git rev-parse HEAD")
-if [ "$$got" != "$$SHA" ]; then echo "✗ builder has $$got, expected $$SHA" >&2; exit 1; fi
+  # 3b. Feed the builder: git moves only missing objects (kilobytes after the
+  #     first push), instead of re-walking a 14 MB tree with rsync.
+  GIT_SSH_COMMAND="ssh $(SSH_MUX) -o StrictHostKeyChecking=no" \
+    git -C "$$SRC" push --force --quiet "ssh://$(BUILDER)$$BDIR" HEAD:refs/heads/ship
 
-# 5. Build and push the sha- tag. :prod is promoted in step 9, after the swap
-#    has held, so a failed deploy never moves :prod.
-build="cd $$BDIR && docker buildx build --target $$STAGE -f $$CF \
-  --build-arg GIT_HASH=$$SHA --build-arg GIT_SHORT=$$SHORT \
-  --build-arg GIT_DESCRIBE=$$DESCRIBE --build-arg GIT_BRANCH=$$BRANCH \
-  --build-arg BUILD_TIME=$$BUILT --build-arg GIT_MESSAGE=$$(printf '%q' "$$MSG") \
-  --tag $$REPO:sha-$$SHORT --push --metadata-file $$META ."
-if [ "$$MODE" = warm ]; then
-  $(BSSH) -n "nohup bash -c $$(printf '%q' "$$build") >$$META.log 2>&1 &"
-  printf '%b\n' "$(BG)$(OK) warming $$REPO:sha-$$SHORT on $(BUILDER) — log: $$META.log$(R)"
-  exit 0
+  # 3c. Check it out there and assert the builder holds exactly this commit.
+  got=$$($(BSSH) "cd $$BDIR && git checkout -q --detach --force ship && git clean -xdfq && git rev-parse HEAD")
+  if [ "$$got" != "$$SHA" ]; then echo "✗ builder has $$got, expected $$SHA" >&2; exit 1; fi
+
+  # 3d. Build and push the sha- tag. :prod is promoted in step 9, after the
+  #     swap has held, so a failed deploy never moves :prod.
+  build="cd $$BDIR && docker buildx build --target $$STAGE -f $$CF \
+    --build-arg GIT_HASH=$$SHA --build-arg GIT_SHORT=$$SHORT \
+    --build-arg GIT_DESCRIBE=$$DESCRIBE --build-arg GIT_BRANCH=$$BRANCH \
+    --build-arg BUILD_TIME=$$BUILT --build-arg GIT_MESSAGE=$$(printf '%q' "$$MSG") \
+    --tag $$REPO:sha-$$SHORT --push --metadata-file $$META ."
+  if [ "$$MODE" = warm ]; then
+    $(BSSH) -n "nohup bash -c $$(printf '%q' "$$build") >$$META.log 2>&1 &"
+    printf '%b\n' "$(BG)$(OK) warming $$REPO:sha-$$SHORT on $(BUILDER) — log: $$META.log$(R)"
+    exit 0
+  fi
+  $(BSSH) "$$build"
+
+  # 3e. Hold the cache to a fixed size. Unbounded, it grew to 9 GB and took
+  #     the shared volume to 0 bytes; capped, a ship's footprint is constant.
+  $(BSSH) "docker builder prune -f --keep-storage=$(BUILDER_CACHE_KEEP)" >/dev/null || true
+
+  # 4. The digest is what prod pulls — never a mutable tag.
+  DIGEST=$$($(BSSH) "jq -r '.\"containerimage.digest\"' $$META")
 fi
-$(BSSH) "$$build"
-
-# 6. The digest is what prod pulls — never a mutable tag.
-DIGEST=$$($(BSSH) "jq -r '.\"containerimage.digest\"' $$META")
 case "$$DIGEST" in sha256:[0-9a-f]*) [ $${#DIGEST} -eq 71 ] ;; *) false ;; esac \
-  || { echo "✗ bad digest from buildx metadata: '$$DIGEST'" >&2; exit 1; }
+  || { echo "✗ bad digest for $$REPO:sha-$$SHORT: '$$DIGEST'" >&2; exit 1; }
 printf '%b\n' "$(C)$(AR) pushed $$REPO@$$DIGEST$(R)"
 
 # 7. Pull by digest, swap, and assert the running container is that image id.
@@ -245,17 +318,34 @@ case "$$GATE" in
     ;;
 esac
 
-# 9. Promote: a manifest-only registry write, no bytes re-uploaded.
-$(BSSH) "docker buildx imagetools create -t $$REPO:prod $$REPO@$$DIGEST"
+# 9. Promote: a manifest-only registry write, no bytes re-uploaded. In CI
+#    mode the builder may be full or unreachable, so promote from here —
+#    `gh auth token` is the same GHCR credential the workflow pushed with.
+if [ "$$BUILD_ON" = ci ]; then
+  gh auth token | docker login ghcr.io -u "$$(gh api user --jq .login)" --password-stdin >/dev/null
+  docker buildx imagetools create -t $$REPO:prod $$REPO@$$DIGEST
+else
+  $(BSSH) "docker buildx imagetools create -t $$REPO:prod $$REPO@$$DIGEST"
+fi
 printf '%b\n' "$(BG)$(OK) $$SRC $$SHORT live on $(TARGET); $$REPO:prod → $$DIGEST$(R)"
 endef
 export SHIP_SH
 
-_GW_ENV = ROOT=$(CURDIR) SRC=site   BDIR=$(BUILDER_SITE)   CF=Containerfile        STAGE=runtime-gateway REPO=$(GW_REPO) META=/tmp/gw-meta.json PLAYBOOK=gateway-deploy.yml REFVAR=gateway_image_ref GATE=gateway
-_EN_ENV = ROOT=$(CURDIR) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-engine  REPO=$(EN_REPO) META=/tmp/en-meta.json PLAYBOOK=engine-deploy.yml  REFVAR=engine_image_ref  GATE=engine
-_HO_ENV = ROOT=$(CURDIR) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-holder  REPO=$(HO_REPO) META=/tmp/ho-meta.json PLAYBOOK=holder-deploy.yml  REFVAR=holder_image_ref  GATE=holder
-_IRCD_ENV = ROOT=$(CURDIR) SRC=site BDIR=$(BUILDER_SITE) CF=deploy/roles/ircd/files/Containerfile.ircd STAGE=runtime-ircd REPO=$(IRCD_REPO) META=/tmp/ircd-meta.json PLAYBOOK=ircd-deploy.yml REFVAR=ircd_image_ref GATE=ircd
-_ANOPE_ENV = ROOT=$(CURDIR) SRC=site BDIR=$(BUILDER_SITE) CF=deploy/roles/ircd/files/Containerfile.anope STAGE=runtime-anope REPO=$(ANOPE_REPO) META=/tmp/anope-meta.json PLAYBOOK=bridge-deploy.yml REFVAR=ircd_bridge_image_ref GATE=bridge
+_GW_ENV = ROOT=$(CURDIR) BUILD_ON=$(BUILD_ON) SRC=site   BDIR=$(BUILDER_SITE)   CF=Containerfile        STAGE=runtime-gateway REPO=$(GW_REPO) META=/tmp/gw-meta.json PLAYBOOK=gateway-deploy.yml REFVAR=gateway_image_ref GATE=gateway
+_EN_ENV = ROOT=$(CURDIR) BUILD_ON=$(BUILD_ON) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-engine  REPO=$(EN_REPO) META=/tmp/en-meta.json PLAYBOOK=engine-deploy.yml  REFVAR=engine_image_ref  GATE=engine
+_HO_ENV = ROOT=$(CURDIR) BUILD_ON=$(BUILD_ON) SRC=engine BDIR=$(BUILDER_ENGINE) CF=Containerfile.engine STAGE=runtime-holder  REPO=$(HO_REPO) META=/tmp/ho-meta.json PLAYBOOK=holder-deploy.yml  REFVAR=holder_image_ref  GATE=holder
+_IRCD_ENV = ROOT=$(CURDIR) BUILD_ON=$(BUILD_ON) SRC=site BDIR=$(BUILDER_SITE) CF=deploy/roles/ircd/files/Containerfile.ircd STAGE=runtime-ircd REPO=$(IRCD_REPO) META=/tmp/ircd-meta.json PLAYBOOK=ircd-deploy.yml REFVAR=ircd_image_ref GATE=ircd
+_ANOPE_ENV = ROOT=$(CURDIR) BUILD_ON=$(BUILD_ON) SRC=site BDIR=$(BUILDER_SITE) CF=deploy/roles/ircd/files/Containerfile.anope STAGE=runtime-anope REPO=$(ANOPE_REPO) META=/tmp/anope-meta.json PLAYBOOK=bridge-deploy.yml REFVAR=ircd_bridge_image_ref GATE=bridge
+
+builder-df: ## Builder disk: free space + what our docker is holding
+	@$(BSSH) 'df -h / | tail -1; docker system df'
+
+builder-gc: ## Builder: trim BuildKit cache to BUILDER_CACHE_KEEP, drop dangling images/volumes
+	@$(BSSH) 'docker builder prune -f --keep-storage=$(BUILDER_CACHE_KEEP); docker image prune -f; docker volume prune -f; df -h / | tail -1'
+
+builder-gc-hard: ## Builder: drop the ENTIRE BuildKit cache (next build is cold, ~10 min)
+	@printf '%b\n' "$(Y)$(WR) dropping all BuildKit cache on $(BUILDER) — next build recompiles from scratch$(R)"
+	@$(BSSH) 'docker buildx prune -af; docker image prune -f; docker volume prune -f; df -h / | tail -1'
 
 ship: tag-prev ## Gateway: tag-prev → build on builder → push GHCR → blue/green swap by digest → gate → promote :prod
 	@printf '\n$(BG)$(OK) Ship gateway → $(TARGET) (engine untouched)$(R)\n'
