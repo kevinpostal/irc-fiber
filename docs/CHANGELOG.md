@@ -2,6 +2,11 @@
 
 All notable changes to IRC Fiber are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/): newest first, grouped by Added / Changed / Fixed / Removed. Versions date-stamped; unreleased work lives under `[Unreleased]`.
 
+## [Unreleased] - Forced nick renames no longer stick across reconnects
+
+### Fixed
+- **A services-forced rename (`Guest12345`, UID) became the engine's persisted nick.** The self-NICK handler in `engine/source/ircfiber/irc/connection.d` called `persistNick` on *both* self-rename paths, so when NickServ enforcement renamed an unidentified session the engine remembered the Guest nick as "the nick the user chose". The next reconnect requested `Guest12345`, hit 433 against its own still-quitting session, walked the `_`/`__`/`___` chain and landed in the random-suffix escape hatch (`remott_07693`) — which is also persisted, so the real nick never came back. Now only the optimistic path (a NICK the user actually sent through `sendRaw`) persists; a server-initiated rename updates `sessionNick` and logs `forced_nick_change` but leaves the persisted nick alone, so the next reconnect (SASL-identified) retries what the user wanted. Incident 2026-09-17: 36 IRC Fiber engine sessions renamed at once when the merged Anope 2.1 services linked — the old `bridge.ircfiber.com` Anope instance had been wiping `accountname` on the ircd for every user on each of its restarts (its protocol module sends `SendLogout` for any account it does not know), so every session older than the bridge's last restart was unidentified on the ircd side and got the 60 s `PROTECT` collide.
+
 ## [Unreleased] - Server-log nick attribution & network ownership
 
 ### Fixed
