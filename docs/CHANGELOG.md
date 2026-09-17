@@ -2,6 +2,11 @@
 
 All notable changes to IRC Fiber are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/): newest first, grouped by Added / Changed / Fixed / Removed. Versions date-stamped; unreleased work lives under `[Unreleased]`.
 
+## [Unreleased] - Support tickets notify by e-mail
+
+### Added
+- **Help & Feedback changes are e-mailed, not only announced in `#support`.** New module `site/backend/source/ircfiber/support/mail.d`, hooked next to every `pushSupportEvent` call (`api/rest.d` create + follow-up, `web/admin/support.d` triage + public reply). An admin's public reply or status change mails the reporter with the change quoted, the new status and a Help & Feedback link; a new report or reporter follow-up mails the assignee, or every admin with a well-formed address when unassigned, with the admin deep link (`/admin#/support/<id>`). Internal notes and the actor's own actions never mail. Delivery runs on its own fiber after the request has answered via the existing `ircfiber.mail` provider (`log`/`resend`/`sender`) and records a `support_notice` row per recipient in the mail-event log, so a provider rejection is visible on the admin Emails page and in `#staff` without failing the comment. Pure recipient policy and mail bodies are unit-tested in `tests/support_format_test.d`.
+
 ## [Unreleased] - Forced nick renames no longer stick across reconnects
 
 ### Fixed
