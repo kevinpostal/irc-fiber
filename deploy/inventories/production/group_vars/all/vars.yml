@@ -5,6 +5,7 @@
 # --- Versions -----------------------------------------------------------------
 ircfiber_version: "0.3.0"
 ircfiber_session_ttl_days: 90
+ircfiber_message_retention_days: 30
 
 # --- Image registry ------------------------------------------------------------
 # Docker Hub: set url to "docker.io" (or ""), namespace to your Docker Hub username.
