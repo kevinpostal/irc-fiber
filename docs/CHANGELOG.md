@@ -2,6 +2,12 @@
 
 All notable changes to IRC Fiber are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/): newest first, grouped by Added / Changed / Fixed / Removed. Versions date-stamped; unreleased work lives under `[Unreleased]`.
 
+## [Unreleased] - /part no longer undone by the sync poll
+
+### Fixed
+- **The client rejoined a channel seconds after `/part` (support #11).** `App.svelte` polls `requestSync()` every 10 s; the `sync` handler calls `checkRoute()`, which re-resolves the URL through `switchToBuffer` → `maybeAutoJoinChannel`. `/part` leaves the parted channel active and the URL untouched, so each poll re-issued `JOIN` — a timer synthesising a "navigation" that never happened. Same loop silently rejoined after a kick and retried a JOIN the server had already refused (471/473/474/475), forever, every 10 s. `switchToBuffer` now calls `maybeAutoJoinChannel` only when the buffer actually changed (the `isSameBuffer` check that already gated `loadBufferHistory`).
+- **Walking back into a parted channel re-joined it.** Auto-join on navigation (W7-T01) could not tell "I never joined this" from "I left on purpose": the sync payload flattens the engine's `NetworkConfig.partedChannels` into plain `isJoined:false` buffers (`websocket.d` `performStateDump`). New session-scoped `userPartedChannels` set in `ircStore.svelte.ts`, keyed like `pendingJoins`: added on the self-PART echo and optimistically by `/part` and the context-menu Leave, retracted by the self-JOIN echo and by `initiateRejoin`. `maybeAutoJoinChannel` skips channels in it; Rejoin, `/join`, `/cycle` and typing a message all still work and all clear the mark. Deliberately not cleared by `resetPendingState` — a WebSocket blip must not resurrect a channel the user left.
+
 ## [Unreleased] - Support tickets notify by e-mail
 
 ### Added
