@@ -304,12 +304,13 @@ case "$$GATE" in
     ;;
   services)
     # The in-play assertion proved the container runs the digest. This
-    # proves the modules the gateway and the bridge depend on shipped in it
-    # (CMake SKIPS a module whose dependencies it cannot detect rather than
-    # failing the build), that the database loaded, that the link to the
-    # ircd came up, and that BridgeServ actually reached Discord — a bad
-    # token or blocked egress leaves a healthy container relaying nothing.
-    for m in bridgeserv rpc_registered rpc_user rpc_data jsonrpc db_json; do
+    # proves the modules the gateway, the bridge and the ts6link sidecar
+    # depend on shipped in it (CMake SKIPS a module whose dependencies it
+    # cannot detect rather than failing the build), that the database
+    # loaded, that the link to the ircd came up, and that BridgeServ
+    # actually reached Discord — a bad token or blocked egress leaves a
+    # healthy container relaying nothing.
+    for m in bridgeserv rpc_registered rpc_user rpc_data jsonrpc db_json ts6link ssl_openssl; do
       $(SSH) "sudo docker exec ircfiber-services test -f /anope/modules/$$m.so" \
         || { echo "✗ ircfiber-services has no /anope/modules/$$m.so" >&2; exit 1; }
     done
