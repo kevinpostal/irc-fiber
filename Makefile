@@ -296,7 +296,7 @@ case "$$GATE" in
     # The in-play assertion proved the container runs the digest; this
     # proves the module shipped in it and loaded (or, before the tag is in
     # modules.conf, at least did not error).
-    for m in motdpool messageredaction; do \
+    for m in motdpool messageredaction editmessage; do \
       $(SSH) "sudo docker exec ircfiber-ircd test -f /inspircd/modules/m_$$m.so" \
         || { echo "✗ ircfiber-ircd has no /inspircd/modules/m_$$m.so" >&2; exit 1; }; \
       if $(SSH) 'sudo docker logs --since 3m ircfiber-ircd 2>&1' | grep -Ei "$$m.*(unable|error)"; then \
@@ -372,8 +372,8 @@ ship-holder: ## Holder: build on builder → push GHCR → RECREATE holder by di
 	@printf '\n$(Y)$(WR) Ship holder → $(TARGET) (container recreate: FULL IRC RECONNECT on every network)$(R)\n'
 	@$(_HO_ENV) MODE=ship bash -c "$$SHIP_SH"
 
-# The ircd image is upstream InspIRCd plus our motdpool and messageredaction
-# modules (site/deploy/roles/ircd/files/Containerfile.ircd). Config changes never
+# The ircd image is upstream InspIRCd plus our motdpool, messageredaction and
+# editmessage modules (site/deploy/roles/ircd/files/Containerfile.ircd). Config changes never
 # need this — `make deploy-ircd` rehashes in place. A new IMAGE recreates
 # the container: every IRC client drops and Anope relinks. Run it in a quiet
 # window, then roll the k3s leaf to the same digest (make deploy-ircd-k8s
